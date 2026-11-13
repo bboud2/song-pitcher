@@ -5,22 +5,38 @@ import { Session, summarize } from '../src/core/session.ts';
 import { DEFAULT_SETTINGS, normalizeSettings, updateSetting, type Settings } from '../src/core/settings.ts';
 import { STAR_SPANGLED_BANNER as SSB } from '../src/core/songs.ts';
 
-/** Synthetic detector output: a steady tone (or silence when midi is null) every 20 ms. */
+/**
+ * Synthetic detector output every 20 ms:
+ *  sing()  — a sustained tone at a steady level (a voice)
+ *  pluck() — a level jump then a free exponential decay (~15 dB/s), steady pitch (a string)
+ *  quiet() — silence
+ */
 class Clock {
   t = 0;
-  feed(s: Session, midi: number | null, ms: number, opts: { cents?: number; rms?: number } = {}): boolean {
-    let advanced = false;
-    const end = this.t + ms / 1000;
-    while (this.t < end - 1e-9) {
-      this.t += 0.02;
-      const f: PitchFrame = midi === null
-        ? { t: this.t, freq: 0, clarity: 0, rms: 0.0001 }
-        : { t: this.t, freq: midiToFreq(midi + (opts.cents ?? 0) / 100), clarity: 0.97, rms: opts.rms ?? 0.1 };
-      if (s.pitch(f)) advanced = true;
-    }
-    return advanced;
+  private frame(s: Session, f: Omit<PitchFrame, 't'>): boolean {
+    this.t += 0.02;
+    return s.pitch({ t: this.t, ...f });
   }
-  wait(ms: number) { this.t += ms / 1000; }
+  quiet(s: Session, ms: number): boolean {
+    let adv = false;
+    for (let k = 0; k < Math.round(ms / 20); k++) adv = this.frame(s, { freq: 0, clarity: 0, rms: 0.0001 }) || adv;
+    return adv;
+  }
+  sing(s: Session, midi: number, ms: number, opts: { cents?: number; rms?: number } = {}): boolean {
+    let adv = false;
+    for (let k = 0; k < Math.round(ms / 20); k++) {
+      adv = this.frame(s, { freq: midiToFreq(midi + (opts.cents ?? 0) / 100), clarity: 0.97, rms: opts.rms ?? 0.1 }) || adv;
+    }
+    return adv;
+  }
+  pluck(s: Session, midi: number, ms: number, opts: { cents?: number; peak?: number } = {}): boolean {
+    let adv = false;
+    for (let k = 0; k < Math.round(ms / 20); k++) {
+      const rms = (opts.peak ?? 0.2) * Math.pow(10, (-15 * k * 0.02) / 20);
+      adv = this.frame(s, { freq: midiToFreq(midi + (opts.cents ?? 0) / 100), clarity: 0.97, rms }) || adv;
+    }
+    return adv;
+  }
 }
 
 const make = (over: Partial<Settings> = {}) => new Session(SSB, 48, { ...DEFAULT_SETTINGS, ...over });
@@ -32,31 +48,52 @@ describe('session state machine', () => {
     s.start();
     expect(s.view().phase).toBe('listen');
     expect(s.view().targetMidi).toBe(55); // G3
-    expect(c.feed(s, 55, 2000)).toBe(false); // would be a pass, but we're listening
+    expect(c.sing(s, 55, 2000)).toBe(false); // would be a pass, but we're listening
     expect(s.view().phase).toBe('listen');
     s.listenDone(c.t);
     expect(s.view().phase).toBe('sing');
+    expect(s.listeningPath()).toBe('voice');
   });
 
-  it('sing passes in any octave after ~500 ms hold, then play needs the exact octave', () => {
+  it('sing passes in any octave after ~500 ms, then play needs a pluck in the exact octave', () => {
     const s = make();
     const c = new Clock();
     s.start();
     s.listenDone(c.t);
-    expect(c.feed(s, 55 + 12, 300)).toBe(false); // G4 — right pitch class, not held long enough
-    expect(c.feed(s, 55 + 12, 400)).toBe(true);
+    expect(c.sing(s, 55 + 12, 300)).toBe(false); // G4 — right pitch class, not held long enough
+    expect(c.sing(s, 55 + 12, 400)).toBe(true);
     expect(s.view().phase).toBe('play');
-    expect(c.feed(s, 67, 1500)).toBe(false); // guitar in the wrong octave never passes
-    expect(c.feed(s, 56, 1000)).toBe(false); // semitone off
-    c.feed(s, null, 200);
-    expect(c.feed(s, 55, 300)).toBe(true);
+    expect(s.listeningPath()).toBe('guitar');
+    c.quiet(s, 200);
+    expect(c.pluck(s, 67, 1200)).toBe(false); // right note, wrong octave
+    c.quiet(s, 200);
+    expect(c.pluck(s, 56, 1000)).toBe(false); // semitone off
+    c.quiet(s, 200);
+    expect(c.pluck(s, 55, 600)).toBe(true);
     const v = s.view();
     expect(v.phase).toBe('listen');
     expect(v.index).toBe(1);
     expect(v.stats[0].singAttempts).toBe(1);
-    expect(v.stats[0].playAttempts).toBe(3); // G4 and G#3 held = two wrong attempts, then the pass
+    expect(v.stats[0].playAttempts).toBe(3); // G4 and G#3 plucked = two wrong attempts, then the pass
     expect(v.stats[0].playMs).toBeGreaterThan(2500);
     expect(v.stats[0].playCents).toBeCloseTo(0, 3);
+  });
+
+  it('a sustained (sung) note never passes the guitar step; a pluck never passes the singing step', () => {
+    const s = make();
+    const c = new Clock();
+    s.start();
+    s.listenDone(0);
+    c.quiet(s, 200);
+    expect(c.pluck(s, 55, 2000)).toBe(false); // a decaying pluck is not singing
+    c.quiet(s, 200);
+    expect(c.sing(s, 55, 800)).toBe(true);
+    // voice keeps going into the guitar step, stops, starts again: still not a pluck
+    expect(c.sing(s, 55, 600)).toBe(false);
+    c.quiet(s, 300);
+    expect(c.sing(s, 55, 1500)).toBe(false);
+    c.quiet(s, 300);
+    expect(c.pluck(s, 55, 500)).toBe(true);
   });
 
   it('respects the singing tolerance setting', () => {
@@ -65,8 +102,20 @@ describe('session state machine', () => {
       const c = new Clock();
       s.start();
       s.listenDone(0);
-      expect(c.feed(s, 55, 1500, { cents })).toBe(pass);
+      c.quiet(s, 100);
+      expect(c.sing(s, 55, 1500, { cents })).toBe(pass);
     }
+  });
+
+  it('a tolerance change applies to the singing step in progress', () => {
+    const s = make({ singTolerance: 25 });
+    const c = new Clock();
+    s.start();
+    s.listenDone(0);
+    c.quiet(s, 100);
+    expect(c.sing(s, 55, 1000, { cents: 40 })).toBe(false);
+    s.setSettings({ ...DEFAULT_SETTINGS, singTolerance: 50 });
+    expect(c.sing(s, 55, 1000, { cents: 40 })).toBe(true);
   });
 
   it('require-exact-octave makes singing octave-sensitive', () => {
@@ -74,8 +123,9 @@ describe('session state machine', () => {
     const c = new Clock();
     s.start();
     s.listenDone(0);
-    expect(c.feed(s, 67, 1500)).toBe(false);
-    expect(c.feed(s, 55, 1000)).toBe(true);
+    expect(c.sing(s, 67, 1500)).toBe(false);
+    c.quiet(s, 200);
+    expect(c.sing(s, 55, 1000)).toBe(true);
   });
 
   it('rejects silence and low-clarity frames', () => {
@@ -83,7 +133,7 @@ describe('session state machine', () => {
     const c = new Clock();
     s.start();
     s.listenDone(0);
-    expect(c.feed(s, null, 3000)).toBe(false);
+    expect(c.quiet(s, 3000)).toBe(false);
     for (let i = 0; i < 100; i++) expect(s.pitch({ t: 3 + i * 0.02, freq: midiToFreq(55), clarity: 0.5, rms: 0.1 })).toBe(false);
   });
 
@@ -97,7 +147,7 @@ describe('session state machine', () => {
     s.start();
     s.listenDone(0);
     expect(s.view().phase).toBe('sing');
-    expect(c.feed(s, 55, 800)).toBe(true);
+    expect(c.sing(s, 55, 800)).toBe(true);
     expect(s.view().index).toBe(1);
     expect(s.view().phase).toBe('listen');
   });
@@ -114,14 +164,14 @@ describe('session state machine', () => {
     const c = new Clock();
     s.start();
     s.listenDone(0);
-    c.feed(s, 58, 600); // wrong note held: 1 attempt
+    c.sing(s, 58, 700); // wrong note held: 1 attempt
     s.replay();
     expect(s.view().phase).toBe('listen');
     expect(s.view().next).toBe('sing');
-    expect(c.feed(s, 55, 1000)).toBe(false); // mic ignored during replay
+    expect(c.sing(s, 55, 1000)).toBe(false); // mic ignored during replay
     s.listenDone(c.t);
     expect(s.view().phase).toBe('sing');
-    expect(c.feed(s, 55, 700)).toBe(true);
+    expect(c.sing(s, 55, 700)).toBe(true);
     expect(s.view().stats[0].singAttempts).toBe(2);
     expect(s.view().stats[0].singMs).toBeGreaterThan(2000);
   });
@@ -134,19 +184,19 @@ describe('session state machine', () => {
     for (let i = 0; i < 6; i++) {
       expect(s.view().index).toBe(i);
       s.listenDone(c.t);
-      c.feed(s, null, 100);
-      expect(c.feed(s, phrase[i], 400)).toBe(true);
+      c.quiet(s, 100);
+      expect(c.pluck(s, phrase[i], 400)).toBe(true);
     }
     let v = s.view();
     expect(v.phase).toBe('review');
     expect(v.review?.notes).toEqual(phrase);
     expect(v.review?.pos).toBe(0);
-    expect(c.feed(s, 60, 500)).toBe(false); // last note still ringing: no fresh attack, wrong note anyway
-    c.feed(s, null, 100);
-    expect(c.feed(s, 52, 400)).toBe(false); // out of order
+    expect(c.pluck(s, 60, 500, { peak: 0.05 })).toBe(false); // last note still ringing: no fresh attack, wrong note anyway
+    c.quiet(s, 100);
+    expect(c.pluck(s, 52, 500)).toBe(false); // out of order
     for (let k = 0; k < 6; k++) {
-      c.feed(s, null, 100);
-      expect(c.feed(s, phrase[k], 400)).toBe(true);
+      c.quiet(s, 100);
+      expect(c.pluck(s, phrase[k], 400)).toBe(true);
       if (k < 5) expect(s.view().review?.pos).toBe(k + 1);
     }
     v = s.view();
@@ -156,14 +206,31 @@ describe('session state machine', () => {
     expect(v.reviews[0].mistakes).toBe(1); // only the out-of-order E3; the ringing C4 is not a slip
   });
 
+  it('a sung phrase does not pass the review', () => {
+    const s = make({ skipSing: true });
+    const c = new Clock();
+    s.start();
+    for (let i = 0; i < 6; i++) {
+      s.listenDone(c.t);
+      c.quiet(s, 100);
+      c.pluck(s, s.view().targetMidi, 400);
+    }
+    expect(s.view().phase).toBe('review');
+    for (const m of [55, 52, 48, 52, 55, 60]) {
+      c.quiet(s, 150);
+      expect(c.sing(s, m, 600)).toBe(false);
+    }
+    expect(s.view().review?.pos).toBe(0);
+  });
+
   it('the review itself can be skipped', () => {
     const s = make({ skipSing: true });
     const c = new Clock();
     s.start();
     for (let i = 0; i < 6; i++) {
       s.listenDone(c.t);
-      c.feed(s, null, 100);
-      c.feed(s, s.view().targetMidi, 400);
+      c.quiet(s, 100);
+      c.pluck(s, s.view().targetMidi, 400);
     }
     expect(s.view().phase).toBe('review');
     s.replay();
@@ -181,20 +248,23 @@ describe('session state machine', () => {
     // advance to note 12 ("What so" = G3 G3, indices 12 and 13)
     for (let i = 0; i < 12; i++) {
       s.listenDone(c.t);
-      c.feed(s, null, 100);
-      c.feed(s, s.view().targetMidi, 400);
+      c.quiet(s, 100);
+      c.pluck(s, s.view().targetMidi, 400);
     }
     s.listenDone(c.t);
     expect(s.view().targetMidi).toBe(55);
-    c.feed(s, null, 100);
-    expect(c.feed(s, 55, 300, { rms: 0.2 })).toBe(true);
+    c.quiet(s, 100);
+    expect(c.pluck(s, 55, 400)).toBe(true);
     expect(s.view().index).toBe(13);
     s.listenDone(c.t);
     expect(s.view().targetMidi).toBe(55);
     // still ringing (and decaying) — must not pass
-    for (let k = 0; k < 40; k++) expect(c.feed(s, 55, 20, { rms: 0.15 * Math.pow(0.97, k) })).toBe(false);
+    for (let k = 0; k < 40; k++) {
+      c.t += 0.02;
+      expect(s.pitch({ t: c.t, freq: midiToFreq(55), clarity: 0.97, rms: 0.05 * Math.pow(0.97, k) })).toBe(false);
+    }
     // new pluck: level jumps
-    expect(c.feed(s, 55, 300, { rms: 0.3 })).toBe(true);
+    expect(c.pluck(s, 55, 400)).toBe(true);
   });
 
   it('skip button only when allowed; completes to done with a summary', () => {
@@ -206,18 +276,34 @@ describe('session state machine', () => {
     const c = new Clock();
     s.start();
     s.listenDone(0);
-    c.feed(s, 55, 800);
-    c.feed(s, null, 100);
-    c.feed(s, 55, 300);
+    c.sing(s, 55, 800);
+    c.quiet(s, 100);
+    c.pluck(s, 55, 400);
     let guard = 0;
     while (s.view().phase !== 'done' && guard++ < 1000) s.skip();
     const v = s.view();
     expect(v.phase).toBe('done');
-    expect(v.stats.filter((x) => x.skipped)).toHaveLength(99);
+    expect(v.stats.filter((x) => x.skipped)).toHaveLength(SSB.notes.length - 1);
     expect(v.reviews).toHaveLength(0); // skipped notes don't trigger a review
     const sum = summarize(v);
     expect(sum.notesDone).toBe(1);
-    expect(sum.notesSkipped).toBe(99);
+    expect(sum.notesSkipped).toBe(SSB.notes.length - 1);
     expect(sum.totalAttempts).toBe(2);
+  });
+
+  it('restores earlier per-note results when resuming', () => {
+    const a = make();
+    const c = new Clock();
+    a.start();
+    a.listenDone(0);
+    c.sing(a, 55, 800);
+    c.quiet(a, 100);
+    c.pluck(a, 55, 400);
+    const saved = a.view();
+    const b = make();
+    b.restore({ stats: saved.stats, reviews: saved.reviews });
+    b.start(1);
+    expect(b.view().stats[0].playAttempts).toBe(1);
+    expect(summarize(b.view()).notesDone).toBe(1);
   });
 });

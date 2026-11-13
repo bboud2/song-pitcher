@@ -1,7 +1,9 @@
 // End-to-end test: real app in Chromium with phone emulation and a fake microphone fed from
-// generated WAV files. Also writes phone-size screenshots of every main screen to screenshots/.
+// generated WAV files. Also writes phone-size screenshots of every main screen to e2e/out/screenshots/
+// (git-ignored); pass --refresh-screenshots to write them to the tracked screenshots/ folder instead.
 //
 //   npm run e2e          (builds, serves dist/ with vite preview, runs both devices)
+//   flags: --device=iphone13|pixel7  --no-build  --skip-negatives  --refresh-screenshots
 //
 // Uses the globally installed `playwright` package and its bundled Chromium.
 import { execSync, spawn, type ChildProcess } from 'node:child_process';
@@ -24,7 +26,7 @@ const pw = loadPlaywright();
 
 const ROOT = resolve(import.meta.dirname, '..');
 const OUT = join(ROOT, 'e2e', 'out');
-const SHOTS = join(ROOT, 'screenshots');
+const SHOTS = process.argv.includes('--refresh-screenshots') ? join(ROOT, 'screenshots') : join(ROOT, 'e2e', 'out', 'screenshots');
 const PORT = 4179;
 const URL = `http://localhost:${PORT}/`;
 const DEVICES: { name: string; slug: string }[] = [
@@ -41,7 +43,7 @@ function check(cond: boolean, msg: string): void {
 }
 
 async function startServer(): Promise<ChildProcess> {
-  const p = spawn('npx', ['vite', 'preview', '--port', String(PORT), '--strictPort'], { cwd: ROOT, stdio: 'pipe' });
+  const p = spawn('npx', ['vite', 'preview', '--port', String(PORT), '--strictPort', '--host'], { cwd: ROOT, stdio: 'pipe' });
   const deadline = Date.now() + 20000;
   while (Date.now() < deadline) {
     try {
@@ -175,16 +177,28 @@ async function correctRun(device: { name: string; slug: string }, wav: string): 
   check(await waitSession(page, `index === 6`, 40000), `${tag} review complete → note 7 (${elapsed()})`);
   check(await waitSession(page, `index === 7`, 45000), `${tag} note 7 sung + played → note 8 (${elapsed()})`);
 
+  // Settings overlay pauses the session: note 8's sung segment plays while the panel is open.
+  await page.click('[data-testid="open-settings"]');
+  const pausedAt = await attr(page, 'data-phase');
+  await page.waitForTimeout(5000);
+  const stillIdx = await attr(page, 'data-index');
+  const stillPhase = await attr(page, 'data-phase');
+  check(stillIdx === '7' && (stillPhase === 'sing' || stillPhase === 'listen'), `${tag} session paused behind settings for 5 s (phase ${pausedAt} → ${stillPhase}, note ${Number(stillIdx) + 1})`);
+  await page.click('[data-testid="close-settings"]');
+
   await page.click('[data-testid="end"]');
   await page.waitForSelector('[data-testid="summary"]');
   const rows = await page.$$eval('.stats-table tbody tr', (trs: Element[]) => trs.map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent)));
-  check(rows.length >= 7 && rows.slice(0, 7).every((r: (string | null)[]) => r[4] !== '–' && r[2] !== '–'), `${tag} summary lists sing/play attempts for the 7 completed notes`);
+  check(rows.length === 7 && rows.every((r: (string | null)[]) => r[4] !== '–' && r[2] !== '–'), `${tag} summary lists exactly the 7 completed notes (not the unfinished 8th), with sing/play attempts`);
+  const playFinds = rows.map((r: (string | null)[]) => parseFloat(r[5] ?? '0'));
+  // The sung note (0–2.6 s of each segment) is in the guitar's octave; the guitar step must wait for the pluck.
+  check(playFinds.every((x: number) => x >= 0.5), `${tag} no guitar step passed by the voice (find times ${playFinds.join(', ')} s)`);
   console.log(`${tag} summary rows (#, note, sing tries, sing ¢, play tries, find, play ¢):`, JSON.stringify(rows.slice(0, 8)));
   const log = await page.evaluate(() => (window as unknown as { __songPitcherLog: unknown[] }).__songPitcherLog);
   console.log(`${tag} accept log:`, JSON.stringify(log));
   await shot(page, device.slug, '7-summary');
   const resume = await page.evaluate(() => JSON.parse(localStorage.getItem('songPitcher.v1') ?? '{}').resume);
-  check(resume?.index === 7, `${tag} resume point saved at note 8 (got ${JSON.stringify(resume)})`);
+  check(resume?.index === 7 && Array.isArray(resume?.stats), `${tag} resume point saved at note 8 with per-note results (index ${resume?.index}, ${resume?.stats?.filter((x: { playAttempts: number | null }) => x.playAttempts !== null).length} notes with results)`);
 
   // Layout sanity: no horizontal overflow on any screen we visited last; check home too.
   await page.click('[data-testid="home-btn"]');
@@ -194,36 +208,142 @@ async function correctRun(device: { name: string; slug: string }, wav: string): 
   await browser.close();
 }
 
-async function wrongRun(device: { name: string; slug: string }, wav: string): Promise<void> {
+async function negativeRun(device: { name: string; slug: string }, wav: string, label: string, expectPhase: string): Promise<void> {
   const browser = await launch(wav);
   const ctx = await browser.newContext({ ...pw.devices[device.name] });
   await ctx.grantPermissions(['microphone'], { origin: URL });
   const page = await ctx.newPage();
-  const tag = `[${device.name} wrong notes]`;
+  const tag = `[${device.name} ${label}]`;
   await page.goto(URL);
   await page.evaluate(() => localStorage.clear());
   await page.reload();
   await page.click('[data-testid="start"]');
-  await page.waitForSelector('[data-testid="begin"]:not([disabled])', { timeout: 10000 });
+  await page.waitForSelector('[data-testid="begin"]:not([disabled])', { timeout: 12000 });
   await page.click('[data-testid="begin"]');
-  // The whole wrong-notes file (≈55 s) loops; give it 45 s — longer than the correct run needs for 6 notes.
+  // The file (≈55 s) loops; 45 s is far longer than the correct run needs for 6 notes.
   const advanced = await waitSession(page, `index > 0`, 45000);
   const phase = await attr(page, 'data-phase');
   check(!advanced, `${tag} never advanced past note 1 in 45 s (ended in phase '${phase}')`);
+  check(phase === expectPhase, `${tag} stuck in the expected step: ${expectPhase} (got ${phase})`);
+  await browser.close();
+}
+
+/** On plain http from a non-localhost address the page must explain that the mic needs https. */
+/** The reference tone (rendered offline with the app's own code) must be steady during its sustain. */
+async function toneRun(): Promise<void> {
+  const browser = await pw.chromium.launch({ headless: true }).catch(() => pw.chromium.launch({ headless: true, executablePath: '/opt/pw-browsers/chromium' }));
+  const page = await browser.newPage();
+  await page.goto(URL);
+  for (const midi of [40, 48, 55, 60, 67, 76]) {
+    const r = await page.evaluate(async (m: number) => {
+      const x: Float32Array = await (window as unknown as { __songPitcherRenderTone: (m: number) => Promise<Float32Array> }).__songPitcherRenderTone(m);
+      const sr = 48000;
+      const lv: number[] = [];
+      // 50 ms RMS windows over the sustain (0.3 s .. 0.85 s after the start)
+      for (let t = 0.3; t + 0.05 <= 0.85; t += 0.05) {
+        let e = 0;
+        for (let i = Math.floor(t * sr); i < Math.floor((t + 0.05) * sr); i++) e += x[i] * x[i];
+        lv.push(10 * Math.log10(e / (0.05 * sr)));
+      }
+      return { swing: Math.max(...lv) - Math.min(...lv), level: Math.max(...lv) };
+    }, midi);
+    check(r.swing < 1, `[tone] reference note midi ${midi}: sustain level swing ${r.swing.toFixed(2)} dB (level ${r.level.toFixed(1)} dBFS)`);
+  }
+  await browser.close();
+}
+
+async function insecureRun(): Promise<void> {
+  const { networkInterfaces } = await import('node:os');
+  const ip = Object.values(networkInterfaces()).flat().find((a) => a && a.family === 'IPv4' && !a.internal)?.address;
+  if (!ip) {
+    check(true, '[insecure origin] skipped: no non-loopback IPv4 address');
+    return;
+  }
+  const browser = await pw.chromium.launch({ headless: true }).catch(() => pw.chromium.launch({ headless: true, executablePath: '/opt/pw-browsers/chromium' }));
+  const page = await (await browser.newContext({ ...pw.devices['iPhone 13'] })).newPage();
+  const errors: string[] = [];
+  page.on('pageerror', (e: Error) => errors.push(e.message));
+  await page.goto(`http://${ip}:${PORT}/`);
+  await page.click('[data-testid="start"]');
+  const msg = await page.waitForSelector('[data-testid="mic-error"]', { timeout: 5000 }).then((e: { textContent(): Promise<string> }) => e.textContent(), () => '');
+  check(/https/.test(msg) && !/undefined|getUserMedia/.test(msg), `[insecure origin http://${ip}] plain explanation shown: "${msg.slice(0, 90)}…"`);
+  await page.screenshot({ path: join(SHOTS, 'iphone13-9-insecure-http.png') });
+  check(errors.length === 0, `[insecure origin] no page errors${errors.length ? ': ' + errors.join(' | ') : ''}`);
+  await browser.close();
+}
+
+/** Extra layouts: tiny phone, landscape, tall phone; degree-only and hidden hints. */
+async function layoutRun(wav: string): Promise<void> {
+  const browser = await launch(wav);
+  for (const [name, vp] of [['se-320x568', { width: 320, height: 568 }], ['landscape-844x390', { width: 844, height: 390 }], ['tall-430x932', { width: 430, height: 932 }]] as const) {
+    const ctx = await browser.newContext({ viewport: vp, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
+    await ctx.grantPermissions(['microphone'], { origin: URL });
+    const page = await ctx.newPage();
+    await page.goto(URL);
+    await page.evaluate(() => localStorage.clear());
+    await page.reload();
+    await page.click('[data-key="7"]'); // G: shows an octave row
+    const startVisible = await page.$eval('[data-testid="start"]', (b: Element) => { const r = b.getBoundingClientRect(); return r.bottom <= window.innerHeight + 1 && r.top >= 0; });
+    check(startVisible, `[layout ${name}] Start button visible without scrolling (key G with octave row)`);
+    await page.screenshot({ path: join(SHOTS, `layout-${name}-home.png`) });
+    await page.click('[data-testid="start"]');
+    await page.waitForSelector('[data-testid="begin"]:not([disabled])', { timeout: 12000 });
+    await page.click('[data-testid="begin"]');
+    await waitSession(page, `phase === 'sing'`, 10000);
+    const fits = await page.evaluate(() => {
+      const c = document.querySelector('.controls')!.getBoundingClientRect();
+      return c.bottom <= window.innerHeight + 1 && document.documentElement.scrollWidth <= window.innerWidth + 1;
+    });
+    check(fits, `[layout ${name}] session controls on screen, no horizontal scroll`);
+    await page.screenshot({ path: join(SHOTS, `layout-${name}-sing.png`) });
+    await ctx.close();
+  }
+  // Hidden-hint modes on iPhone 13 size.
+  for (const [mode, settings] of [['degree-only', { showNoteName: false, showDegree: true }], ['no-hints', { showNoteName: false, showDegree: false, meterSing: false, meterGuitar: false }]] as const) {
+    const ctx = await browser.newContext({ ...pw.devices['iPhone 13'] });
+    await ctx.grantPermissions(['microphone'], { origin: URL });
+    const page = await ctx.newPage();
+    await page.goto(URL);
+    await page.evaluate((st: object) => localStorage.setItem('songPitcher.v1', JSON.stringify({ settings: { ...st } })), settings);
+    await page.reload();
+    const range = (await page.textContent('[data-testid="range"]')) ?? '';
+    check(!/G3$|first note G3/.test(range), `[${mode}] home does not name the first note ("${range}")`);
+    await page.click('[data-testid="start"]');
+    await page.waitForSelector('[data-testid="begin"]:not([disabled])', { timeout: 12000 });
+    await page.click('[data-testid="begin"]');
+    await waitSession(page, `phase === 'sing'`, 10000);
+    await page.screenshot({ path: join(SHOTS, `iphone13-${mode}-sing.png`) });
+    const tgt = (await page.textContent('[data-testid="target"]')) ?? '';
+    check(!/G3/.test(tgt), `[${mode}] target does not show the note name ("${tgt}")`);
+    await page.click('[data-testid="end"]');
+    await page.waitForSelector('[data-testid="summary"]');
+    const body = (await page.textContent('[data-testid="summary"]')) ?? '';
+    check(!/G3/.test(body), `[${mode}] ending early does not reveal the unfinished note`);
+    await ctx.close();
+  }
   await browser.close();
 }
 
 async function main(): Promise<void> {
   mkdirSync(SHOTS, { recursive: true });
-  const { correct, wrong } = buildWavs(OUT);
-  console.log('WAVs:', correct, wrong);
+  const { correct, wrong, voiceOnly, guitarOnly } = buildWavs(OUT);
+  console.log('WAVs:', correct, wrong, voiceOnly, guitarOnly);
   if (!process.argv.includes('--no-build')) execSync('npx vite build', { cwd: ROOT, stdio: 'inherit' });
   const server = await startServer();
   const only = process.argv.find((a) => a.startsWith('--device='))?.split('=')[1];
   try {
     const devs = DEVICES.filter((d) => !only || d.slug === only);
     await Promise.all(devs.map((d) => correctRun(d, correct)));
-    if (!process.argv.includes('--skip-wrong')) await Promise.all(devs.map((d) => wrongRun(d, wrong)));
+    if (!process.argv.includes('--skip-negatives')) {
+      await Promise.all(devs.map((d) => negativeRun(d, wrong, 'wrong notes', 'sing')));
+      // Sings every note in the guitar's octave and never plays: must get stuck in the guitar step.
+      await Promise.all(devs.map((d) => negativeRun(d, voiceOnly, 'voice only, no guitar', 'play')));
+      // Plucks every note and never sings: must get stuck in the singing step.
+      await Promise.all(devs.map((d) => negativeRun(d, guitarOnly, 'guitar only, no singing', 'sing')));
+    }
+    await toneRun();
+    await insecureRun();
+    await layoutRun(correct);
   } finally {
     server.kill();
   }

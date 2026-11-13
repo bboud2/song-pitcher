@@ -13,6 +13,8 @@ export interface Settings {
   skipGuitar: boolean;
   phraseReview: boolean;
   allowSkip: boolean;
+  /** Play the tonic chord (key context) before the first note. */
+  playKeyAtStart: boolean;
 }
 
 /** Defaults are the easy end: all hints on, widest tolerance. */
@@ -27,6 +29,7 @@ export const DEFAULT_SETTINGS: Settings = {
   skipGuitar: false,
   phraseReview: true,
   allowSkip: true,
+  playKeyAtStart: true,
 };
 
 /** Merge unknown/partial input (e.g. from localStorage) into valid settings. */

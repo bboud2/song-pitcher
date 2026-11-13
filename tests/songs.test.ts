@@ -13,8 +13,8 @@ describe('melody parser', () => {
 });
 
 describe('The Star-Spangled Banner data', () => {
-  it('has the complete melody: 100 notes, 16 phrases, 32 bars of 3/4 plus a one-beat pickup', () => {
-    expect(SSB.notes).toHaveLength(100);
+  it('has the complete melody: 101 notes, 16 phrases, 32 bars of 3/4 plus a one-beat pickup', () => {
+    expect(SSB.notes).toHaveLength(101);
     expect(SSB.phrases).toHaveLength(16);
     const beats = SSB.notes.reduce((a, n) => a + n.beats, 0);
     expect(beats).toBe(97);
@@ -41,7 +41,7 @@ describe('The Star-Spangled Banner data', () => {
     expect(midis.slice(0, 6).map((m) => noteName(m))).toEqual(['G3', 'E3', 'C3', 'E3', 'G3', 'C4']);
     // "...land of the free" climbs to the top note; "...home of the brave" ends on the tonic.
     expect(noteName(midis[midis.length - 1])).toBe('C4');
-    expect(midis.slice(87, 94).map((m) => noteName(m))).toEqual(['G3', 'G3', 'C4', 'D4', 'E4', 'F4', 'G4']);
+    expect(midis.slice(88, 95).map((m) => noteName(m))).toEqual(['G3', 'G3', 'C4', 'D4', 'E4', 'F4', 'G4']);
   });
   it('interval sanity: diatonic except the raised 4th, steps/leaps of plausible size', () => {
     const diatonicPlusSharp4 = new Set([0, 2, 4, 5, 6, 7, 9, 11]);
@@ -53,6 +53,18 @@ describe('The Star-Spangled Banner data', () => {
     expect(leaps.slice(0, 5)).toEqual([-3, -4, 4, 3, 5]);
     // Exactly the ♯4 appears in "dawn's early light", "perilous fight", "still there".
     expect(SSB.notes.filter((n) => n.offset === 6)).toHaveLength(3);
+  });
+  it('"banner yet wave" matches the transcriptions: D4 F4 E4 D4 C4 | C4 B3', () => {
+    const p = SSB.phrases[13];
+    const midis = transpose(SSB, 48).slice(p.start, p.end + 1).map((m) => noteName(m));
+    expect(midis).toEqual(['D4', 'F4', 'E4', 'D4', 'C4', 'C4', 'B3']);
+    expect(SSB.notes.slice(p.start, p.end + 1).map((n) => n.beats)).toEqual([1, 0.5, 0.5, 0.5, 0.5, 1, 1]);
+    // every bar is complete: phrase starts fall on the beat before a downbeat, except "banner" (a downbeat)
+    let t = 0;
+    for (const ph of SSB.phrases) {
+      expect(t % 3).toBe(ph === p ? 1 : 0);
+      for (let i = ph.start; i <= ph.end; i++) t += SSB.notes[i].beats;
+    }
   });
   it('spans an octave and a fifth', () => {
     expect(songRange(SSB)).toEqual({ min: 0, max: 19 });

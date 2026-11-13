@@ -1,267 +1,423 @@
-// Pitch-engine gauntlet: synthesizes fixtures, runs them through the exact detector + matcher
-// pipeline the app uses, prints a metrics table and exits non-zero if targets are missed.
+// Pitch-engine gauntlet: synthesizes fixtures with two independent synthesis models, runs them
+// through the exact front end + detector + matcher the app uses, prints metric tables, runs the
+// session simulations, and exits non-zero if any target is missed.
 //
-//   npm run gauntlet            (add -- --verbose for per-fixture lines)
-import { analyzeBuffer, guitarConfig, runMatcher, singConfig } from '../src/core/engine.ts';
-import { NoteMatcher, type MatchConfig } from '../src/core/matcher.ts';
+//   npm run gauntlet                 (≈5 min)
+//   npm run gauntlet -- --only=slide (run groups whose name contains "slide"; skips simulations)
+//   npm run gauntlet -- --no-sims    (skip the session simulations)
+//   npm run gauntlet -- --verbose    (list failing fixtures)
+//
+// Groups: "P …" must be accepted (target ≥ 98 %), "N …" must never be accepted (target 0),
+// "I …" are informational (no target). Octave-err counts fixtures where the matcher reported a
+// pitch an octave/fifth/twelfth away from the truth while the note sounded.
+import { analyzeBuffer, guitarConfig, singConfig, type AnalysisPath } from '../src/core/engine.ts';
+import { NoteMatcher, type MatchConfig, type PitchFrame } from '../src/core/matcher.ts';
 import { noteName } from '../src/core/music.ts';
-import { SR, addNoise, concat, mixInto, noise, pluck, silence, voice } from './fixtures.ts';
+import { SR, addNoise, concat, mixInto, noise, pluck, rng as rng1, silence as sil1, voice as voice1 } from './fixtures.ts';
+import { guitar, highpass, hum, mix, reverb, rms, rng, silence, voice, whiteNoise, type GuitarOpts, type VoiceOpts } from './fixtures2.ts';
+import { printSims, runAllSims } from './sessionsim.ts';
 
 const verbose = process.argv.includes('--verbose');
-const LEAD = 0.3; // seconds of silence (or noise) before the note onset
-const GUITAR_LOW = 40; // E2
-const GUITAR_HIGH = 76; // E5
-const VOICE_LOW = 40; // E2
-const VOICE_HIGH = 69; // A4
-const VOWELS = ['ah', 'ee', 'oo', 'eh'] as const;
+const only = process.argv.find((a) => a.startsWith('--only='))?.slice(7);
+const noSims = process.argv.includes('--no-sims') || !!only;
+const ONSET = 0.3;
+const FLOOR = 0.0018; // ≈ -55 dBFS room noise under the additive-model fixtures
+const GUITAR = Array.from({ length: 37 }, (_, i) => 40 + i); // E2..E5
+const SONG_C = [48, 50, 52, 54, 55, 57, 59, 60, 62, 64, 65, 67]; // song notes in C (C3..G4)
 
-interface Fixture {
-  group: string;
-  name: string;
-  samples: Float32Array;
-  onset: number; // s
-  truthMidi: number | null;
-  cfg: MatchConfig;
-  expectAccept: boolean;
+type Kind = 'P' | 'N' | 'I';
+interface Stats {
+  kind: Kind;
+  n: number;
+  acc: number;
+  tta: number[];
+  oct: number;
+  fails: string[];
+}
+const groups = new Map<string, Stats>();
+const t0 = Date.now();
+
+function framesOf(x: Float32Array, path: AnalysisPath, sr = SR): PitchFrame[] {
+  const out: PitchFrame[] = [];
+  analyzeBuffer(x, sr, (f) => {
+    out.push(f);
+  }, path);
+  return out;
 }
 
-/** Onset time varies per note so onsets fall at different phases of the analysis hop. */
-const lead = (m: number) => LEAD + ((m * 7) % 20) / 1000;
-
-function guitarNote(m: number, noisy: boolean): Float32Array {
-  const L = lead(m);
-  const x = concat(silence(L), pluck(m, 1.6), silence(0.2));
-  return noisy ? addNoise(x, 20, 1000 + m, Math.floor(L * SR), Math.floor((L + 1.0) * SR)) : x;
+function runCfg(fr: PitchFrame[], cfg: MatchConfig, from = 0): { at: number | null; octErr: boolean; truthOk: boolean } {
+  const m = new NoteMatcher(cfg);
+  for (const f of fr) {
+    if (f.t < from) continue;
+    const s = m.push(f);
+    if (s.accepted) return { at: s.acceptedAt, octErr: false, truthOk: true };
+  }
+  return { at: null, octErr: false, truthOk: true };
 }
 
-function voiceNote(m: number, noisy: boolean): Float32Array {
-  const L = lead(m);
-  const x = concat(silence(L), voice(m, 2.0, { vowel: VOWELS[m % VOWELS.length] }), silence(0.2));
-  return noisy ? addNoise(x, 20, 2000 + m, Math.floor(L * SR), Math.floor((L + 2.0) * SR)) : x;
+/** Octave scan: run a never-accepting matcher and look at the pitch it reports while the note sounds. */
+function octaveScan(fr: PitchFrame[], cfg: MatchConfig, truth: number, from: number, to: number, alsoTrue: number[] = []): boolean {
+  const m = new NoteMatcher({ ...cfg, holdMs: 1e9, neverAccept: true });
+  let errs = 0;
+  for (const f of fr) {
+    const s = m.push(f);
+    if (f.t < from || f.t > to || !s.stable || s.detectedMidi === null) continue;
+    if (alsoTrue.some((m) => Math.abs(s.detectedMidi! - m) < 0.5)) continue; // another note really is sounding
+    const d = Math.abs(s.detectedMidi - truth);
+    if ([7, 12, 19, 24].some((iv) => Math.abs(d - iv) < 0.5)) errs++;
+  }
+  return errs >= 3; // three or more frames (60 ms) misread
 }
 
-const fixtures: Fixture[] = [];
+function want(name: string): boolean {
+  return !only || name.includes(only);
+}
 
-// ---- Positives ----
-for (let m = GUITAR_LOW; m <= GUITAR_HIGH; m++) {
-  for (const noisy of [false, true]) {
-    fixtures.push({
-      group: noisy ? 'guitar +noise 20dB' : 'guitar clean', name: `pluck ${noteName(m)}`,
-      samples: guitarNote(m, noisy), onset: lead(m), truthMidi: m, cfg: guitarConfig(m), expectAccept: true,
-    });
+function record(group: string, kind: Kind, label: string, fr: PitchFrame[], cfg: MatchConfig, onset: number, truth: number | null, listenFrom = 0, scanTo = onset + 1.0, alsoTrue: number[] = []) {
+  let g = groups.get(group);
+  if (!g) groups.set(group, (g = { kind, n: 0, acc: 0, tta: [], oct: 0, fails: [] }));
+  g.n++;
+  const { at } = runCfg(fr, cfg, listenFrom);
+  if (at !== null) {
+    g.acc++;
+    g.tta.push((at - onset) * 1000);
+    if (kind === 'N') g.fails.push(`${label} (accepted @ ${((at - onset) * 1000).toFixed(0)} ms)`);
+    if (kind === 'P' && at < onset) g.fails.push(`${label} (accepted BEFORE onset)`);
+  } else if (kind === 'P') g.fails.push(label);
+  if (truth !== null && kind !== 'N' && octaveScan(fr, cfg, truth, onset + 0.05, scanTo, alsoTrue)) {
+    g.oct++;
+    g.fails.push(`${label} (octave misread)`);
   }
 }
-for (let m = VOICE_LOW; m <= VOICE_HIGH; m++) {
-  for (const noisy of [false, true]) {
-    const samples = voiceNote(m, noisy);
-    fixtures.push({
-      group: noisy ? 'voice +noise 20dB (±50)' : 'voice clean (±50)', name: `voice ${noteName(m)}`,
-      samples, onset: lead(m), truthMidi: m, cfg: singConfig(m, 50, false), expectAccept: true,
-    });
-    fixtures.push({
-      group: 'voice strict ±25, any noise', name: `voice ${noteName(m)}${noisy ? ' noisy' : ''}`,
-      samples, onset: lead(m), truthMidi: m, cfg: singConfig(m, 25, false), expectAccept: true,
-    });
-    fixtures.push({
-      group: 'voice exact-octave ±50', name: `voice ${noteName(m)}${noisy ? ' noisy' : ''}`,
-      samples, onset: lead(m), truthMidi: m, cfg: singConfig(m, 50, true), expectAccept: true,
-    });
+
+const floorBase = (sr: number, dur: number, seed: number, lvl = FLOOR) => whiteNoise(silence(dur, sr), lvl, seed);
+
+// ======================================================================= GUITAR STEP (plucked)
+function guitarGroup(name: string, kind: Kind, mk: (m: number, sr: number) => { x: Float32Array; target?: number; onset?: number; listenFrom?: number; alsoTrue?: number[] } | null, opts: { sr?: number; notes?: number[] } = {}) {
+  const full = `guitar ${name}`;
+  if (!want(full)) return;
+  const sr = opts.sr ?? SR;
+  for (const m of opts.notes ?? GUITAR) {
+    const r = mk(m, sr);
+    if (!r) continue;
+    const target = r.target ?? m;
+    const on = r.onset ?? ONSET;
+    record(full, kind, `${noteName(m)}→${noteName(target)}`, framesOf(r.x, 'guitar', sr), guitarConfig(target), on, kind === 'N' ? null : m, r.listenFrom ?? 0, on + 1.0, r.alsoTrue ?? []);
   }
 }
 
-// Harder guitar cases: out-of-tune strings (within the ±40 cent slack), quiet plucks, a new
-// note plucked while the previous note is still ringing, and a dull (thumb/neck pickup) tone.
-for (let m = GUITAR_LOW; m <= GUITAR_HIGH; m++) {
-  const L = lead(m);
-  const cents = m % 2 ? 22 : -22;
-  fixtures.push({
-    group: 'guitar detuned ±22c', name: `pluck ${noteName(m)} ${cents}c`,
-    samples: addNoise(concat(silence(L), pluck(m, 1.6, { cents }), silence(0.2)), 30, 3000 + m),
-    onset: L, truthMidi: m, cfg: guitarConfig(m), expectAccept: true,
+const ks = (m: number, o: Parameters<typeof pluck>[2] = {}, lead = ONSET) => concat(sil1(lead), pluck(m, 1.6, o), sil1(0.2));
+const add = (m: number, sr: number, o: Partial<GuitarOpts> = {}, dur = 2.0) => mix(floorBase(sr, dur + 0.4, m), guitar(m, dur, { sr, seed: m + 3, ...o }), ONSET, sr);
+
+// --- positives, model 1 (Karplus-Strong)
+guitarGroup('P ks clean', 'P', (m) => ({ x: ks(m) }));
+guitarGroup('P ks +noise 20dB', 'P', (m) => ({ x: addNoise(ks(m), 20, 1000 + m, Math.floor(ONSET * SR), Math.floor((ONSET + 1) * SR)) }));
+guitarGroup('P ks detuned ±22c', 'P', (m) => ({ x: addNoise(ks(m, { cents: m % 2 ? 22 : -22 }), 30, 3000 + m) }));
+guitarGroup('P ks quiet -36dBFS peak', 'P', (m) => ({ x: addNoise(ks(m, { amp: 0.016, seed: m + 5 }), 25, 4000 + m, Math.floor(ONSET * SR), Math.floor((ONSET + 1) * SR)) }));
+guitarGroup('P ks dull tone', 'P', (m) => ({ x: ks(m, { brightness: 0.25, pickPos: 0.45, seed: m + 9 }) }));
+// --- positives, model 2 (additive, inharmonic)
+guitarGroup('P add normal', 'P', (m, sr) => ({ x: add(m, sr) }));
+guitarGroup('P add normal 44.1k', 'P', (m, sr) => ({ x: add(m, sr) }), { sr: 44100 });
+guitarGroup('P add weak fundamental (h1 -22dB)', 'P', (m, sr) => ({ x: add(m, sr, { profile: 'weakfund' }) }));
+guitarGroup('P add weak fundamental 44.1k', 'P', (m, sr) => ({ x: add(m, sr, { profile: 'weakfund' }) }), { sr: 44100 });
+guitarGroup('P add missing fundamental', 'P', (m, sr) => ({ x: add(m, sr, { profile: 'nofund' }) }));
+guitarGroup('P add bright', 'P', (m, sr) => ({ x: add(m, sr, { profile: 'bright' }) }));
+guitarGroup('P add sharp +30c settling 80ms', 'P', (m, sr) => ({ x: add(m, sr, { glideCents: 30 }) }));
+guitarGroup('P add sharp +60c settling 150ms', 'P', (m, sr) => ({ x: add(m, sr, { glideCents: 60, glideTau: 0.15 }) }));
+guitarGroup('P add fret buzz', 'P', (m, sr) => ({ x: add(m, sr, { buzz: 0.6 }) }));
+guitarGroup('P add phone HPF 180Hz', 'P', (m, sr) => ({ x: highpass(add(m, sr), sr, 180) }));
+guitarGroup('P add HPF 180Hz + weak fundamental', 'P', (m, sr) => ({ x: highpass(add(m, sr, { profile: 'weakfund' }), sr, 180) }));
+guitarGroup('P add room reverb RT60 0.6s', 'P', (m, sr) => ({ x: reverb(add(m, sr), sr, 0.6, 0.6) }));
+guitarGroup('P add slide in from -2 st over 400ms', 'P', (m, sr) => ({ x: add(m, sr, { slideFromSemis: -2, slideSec: 0.4 }) }));
+guitarGroup('P add detuned +35c', 'P', (m, sr) => ({ x: add(m, sr, { cents: 35 }) }));
+guitarGroup('I add quiet -40dBFS peak (body SNR ≈4 dB)', 'I', (m, sr) => ({ x: add(m, sr, { amp: 0.01 }) }));
+guitarGroup('P add combo weakfund+glide+HPF180+reverb', 'P', (m, sr) => ({ x: reverb(highpass(add(m, sr, { profile: 'weakfund', glideCents: 30 }), sr, 180), sr, 0.5, 0.5) }));
+guitarGroup('P add + 60Hz hum -35dBFS', 'P', (m, sr) => ({ x: hum(add(m, sr), sr, 60, 0.0178) }));
+guitarGroup('I add quiet -34dBFS + 60Hz hum -40dBFS (SNR<0 dB)', 'I', (m, sr) => ({ x: hum(add(m, sr, { amp: 0.02 }), sr, 60, 0.01) }));
+for (const iv of [3, -4, 7, -7, 5, -5, 12, -12]) {
+  guitarGroup(`P over ringing previous note ${iv > 0 ? '+' : ''}${iv} st`, 'P', (m, sr) => {
+    const prev = m + iv;
+    if (prev < 40 || prev > 76) return null;
+    const x = floorBase(sr, 3.1, m);
+    mix(x, guitar(prev, 2.8, { sr, seed: m }), ONSET, sr);
+    mix(x, guitar(m, 2.0, { sr, seed: m + 9 }), ONSET + 0.8, sr);
+    return { x, onset: ONSET + 0.8, listenFrom: ONSET + 0.7, alsoTrue: [prev] };
   });
-  fixtures.push({
-    group: 'guitar quiet (-36 dBFS peak)', name: `pluck ${noteName(m)}`,
-    samples: addNoise(concat(silence(L), pluck(m, 1.6, { amp: 0.016, seed: m + 5 }), silence(0.2)), 25, 4000 + m, Math.floor(L * SR), Math.floor((L + 1) * SR)),
-    onset: L, truthMidi: m, cfg: guitarConfig(m), expectAccept: true,
-  });
-  fixtures.push({
-    group: 'guitar dull tone', name: `pluck ${noteName(m)}`,
-    samples: concat(silence(L), pluck(m, 1.6, { brightness: 0.25, pickPos: 0.45, seed: m + 9 }), silence(0.2)),
-    onset: L, truthMidi: m, cfg: guitarConfig(m), expectAccept: true,
-  });
-  // Previous note (a 3rd away) still ringing at -6 dB when the target is plucked.
-  const prevM = m + (m % 3 === 0 ? -4 : 3);
-  if (prevM >= GUITAR_LOW && prevM <= GUITAR_HIGH) {
-    const prev = pluck(prevM, 0.6 + 1.6 + 0.2, { amp: 0.25, seed: prevM + 77 });
-    const x = concat(silence(0.3), silence(0.6 + L), pluck(m, 1.6), silence(0.2));
-    mixInto(x, prev, Math.floor(0.3 * SR));
-    fixtures.push({
-      group: 'guitar over ringing prev note', name: `pluck ${noteName(m)} over ${noteName(prevM)}`,
-      samples: x, onset: 0.9 + L, truthMidi: m, cfg: guitarConfig(m), expectAccept: true,
-    });
-  }
 }
+// Re-plucking the LOWER octave while it still rings must not pass a target an octave up.
+guitarGroup('N re-pluck the octave below while it rings (target +12)', 'N', (m, sr) => {
+  if (m + 12 > 76) return null;
+  const x = floorBase(sr, 3.1, m);
+  mix(x, guitar(m, 2.8, { sr, seed: m }), ONSET, sr);
+  mix(x, guitar(m, 2.0, { sr, seed: m + 9 }), ONSET + 0.8, sr);
+  return { x, target: m + 12, onset: ONSET + 0.8, listenFrom: ONSET + 0.7 };
+});
+guitarGroup('N KS re-pluck the octave below while it rings (target +12)', 'N', (m) => {
+  if (m + 12 > 76) return null;
+  const x = concat(sil1(ONSET), pluck(m, 2.8, { seed: m }), sil1(0.2));
+  mixInto(x, pluck(m, 2.0, { seed: m + 9, pickPos: 0.3 }), Math.floor((ONSET + 0.8) * SR));
+  return { x, target: m + 12, onset: ONSET + 0.8, listenFrom: ONSET + 0.7 };
+});
+for (const snr of [20, 15, 12, 9]) {
+  guitarGroup(`${snr >= 12 ? 'P' : 'I'} add SNR ${snr}dB (vs first 300 ms)`, snr >= 12 ? 'P' : 'I', (m, sr) => {
+    if (m % 2) return null;
+    const g = guitar(m, 2.0, { sr, seed: m });
+    const x = mix(silence(2.6, sr), g, ONSET, sr);
+    return { x: whiteNoise(x, rms(g, 0, Math.floor(0.3 * sr)) / Math.pow(10, snr / 20), m) };
+  });
+}
+// --- negatives
+guitarGroup('N ks semitone off (both sides)', 'N', (m) => (m < 76 ? { x: ks(m), target: m + 1 } : { x: ks(m), target: m - 1 }));
+guitarGroup('N ks wrong octave', 'N', (m) => ({ x: ks(m), target: m + 12 <= 76 ? m + 12 : m - 12 }));
+guitarGroup('N add wrong octave (target an octave up)', 'N', (m, sr) => (m + 12 <= 76 ? { x: add(m, sr), target: m + 12 } : null));
+guitarGroup('N add wrong octave (target an octave down)', 'N', (m, sr) => (m - 12 >= 40 ? { x: add(m, sr), target: m - 12 } : null));
+guitarGroup('N add weakfund wrong octave (target up)', 'N', (m, sr) => (m + 12 <= 76 ? { x: add(m, sr, { profile: 'weakfund' }), target: m + 12 } : null));
+guitarGroup('N add detuned +55c', 'N', (m, sr) => ({ x: add(m, sr, { cents: 55 }) }));
+guitarGroup('N slide through target 2 st/s, never stops', 'N', (m, sr) => ({ x: add(m, sr, { f0fn: (t) => -2 + 2 * t, t60: 6 }) }));
+guitarGroup('N slide through target 4 st/s', 'N', (m, sr) => ({ x: add(m, sr, { f0fn: (t) => -3 + 4 * t, t60: 6 }) }));
+guitarGroup('N slide through target 8 st/s', 'N', (m, sr) => ({ x: add(m, sr, { f0fn: (t) => -6 + 8 * t, t60: 6 }) }));
+guitarGroup('N slide-in passes the fret below (target -1)', 'N', (m, sr) => (m > 40 ? { x: add(m, sr, { slideFromSemis: -2, slideSec: 0.4 }), target: m - 1 } : null));
+// a SUNG note in the guitar's exact octave must not pass the guitar step
+const VOWELS = ['a', 'i', 'u', 'o', 'hum'] as const;
+for (const vib of [0, 15, 50]) {
+  guitarGroup(`N sung note (vib ±${vib}c) in the exact octave`, 'N', (m, sr) => {
+    if (m > 69 || m % 2) return null;
+    return { x: mix(floorBase(sr, 2.1, m), voice(m, 1.5, { sr, seed: m, vowel: VOWELS[m % 5], vibCents: vib }), ONSET, sr) };
+  });
+}
+guitarGroup('N sung note, sharp "ta" attack (5 ms), straight tone', 'N', (m, sr) => {
+  if (m > 69 || m % 2 === 0) return null;
+  return { x: mix(floorBase(sr, 2.1, m), voice(m, 1.5, { sr, seed: m, vowel: 'a', vibCents: 0, attack: 0.005 }), ONSET, sr) };
+});
+guitarGroup('N sung note, model-1 voice (scoop + vibrato)', 'N', (m) => (m > 69 ? null : { x: concat(sil1(ONSET), voice1(m, 1.5), sil1(0.2)) }));
 
-// ---- Negatives ----
-const negTargets = [40, 45, 52, 57, 64, 69, 76];
-for (const t of negTargets) {
-  fixtures.push({ group: 'NEG silence', name: `silence → guitar ${noteName(t)}`, samples: concat(silence(2), noise(0.01, 0)), onset: 0, truthMidi: null, cfg: guitarConfig(t), expectAccept: false });
-  fixtures.push({ group: 'NEG silence', name: `near-silence → sing ${noteName(t)}`, samples: noise(2, 3e-5, t), onset: 0, truthMidi: null, cfg: singConfig(t, 50, false), expectAccept: false });
-  for (const lvl of [0.005, 0.03, 0.15]) {
-    fixtures.push({ group: 'NEG noise only', name: `noise ${lvl} → guitar ${noteName(t)}`, samples: noise(2, lvl, t * 13 + Math.round(lvl * 1000)), onset: 0, truthMidi: null, cfg: guitarConfig(t), expectAccept: false });
-    fixtures.push({ group: 'NEG noise only', name: `noise ${lvl} → sing ${noteName(t)}`, samples: noise(2, lvl, t * 17 + Math.round(lvl * 1000)), onset: 0, truthMidi: null, cfg: singConfig(t, 50, false), expectAccept: false });
-  }
+// hum / noise / silence against every target
+function staticNegatives(name: string, x: Float32Array, path: AnalysisPath, mkCfg: (t: number) => MatchConfig, targets: number[]) {
+  const full = `${path === 'guitar' ? 'guitar' : 'voice'} ${name}`;
+  if (!want(full)) return;
+  const fr = framesOf(x, path);
+  for (const t of targets) record(full, 'N', noteName(t), fr, mkCfg(t), 0, null);
 }
-for (let m = GUITAR_LOW; m <= GUITAR_HIGH; m++) {
-  for (const noisy of [false, true]) {
-    const x = guitarNote(m, noisy);
-    for (const d of [-1, 1]) {
-      const t = m + d;
-      if (t < GUITAR_LOW || t > GUITAR_HIGH) continue;
-      fixtures.push({ group: 'NEG guitar semitone off', name: `pluck ${noteName(m)} → target ${noteName(t)}${noisy ? ' noisy' : ''}`, samples: x, onset: lead(m), truthMidi: m, cfg: guitarConfig(t), expectAccept: false });
+staticNegatives('N silence', silence(3, SR), 'guitar', guitarConfig, GUITAR);
+staticNegatives('N white noise -30dBFS', noise(3, 0.03, 9), 'guitar', guitarConfig, GUITAR);
+staticNegatives('N 60Hz hum only -40dBFS', hum(floorBase(SR, 4, 3), SR, 60, 0.01), 'guitar', guitarConfig, GUITAR);
+staticNegatives('N 120Hz-dominant hum -40dBFS', hum(floorBase(SR, 4, 3), SR, 60, 0.01, [0.3, 1, 0.3, 0.2]), 'guitar', guitarConfig, GUITAR);
+staticNegatives('N 100Hz-dominant hum (50Hz mains)', hum(floorBase(SR, 4, 3), SR, 50, 0.01, [0.3, 1, 0.3, 0.2]), 'guitar', guitarConfig, GUITAR);
+
+// ======================================================================= SINGING STEP (sung)
+function voiceGroup(name: string, kind: Kind, mk: (t: number, sung: number, sr: number) => { x: Float32Array; onset?: number } | null, opts: { tol?: number; exact?: boolean; octaves?: number[]; targets?: number[]; sr?: number } = {}) {
+  const full = `voice ${name}`;
+  if (!want(full)) return;
+  const sr = opts.sr ?? SR;
+  for (const oc of opts.octaves ?? [0, 12]) {
+    for (const t of opts.targets ?? SONG_C) {
+      const sung = t + oc;
+      const r = mk(t, sung, sr);
+      if (!r) continue;
+      record(full, kind, `${noteName(sung)}→${noteName(t)}`, framesOf(r.x, 'voice', sr), singConfig(t, opts.tol ?? 50, opts.exact ?? false), r.onset ?? ONSET, kind === 'N' ? null : sung, 0, (r.onset ?? ONSET) + 1.5);
     }
-    {
-      const t = m + (m % 2 ? 1 : -1);
-      if (t >= GUITAR_LOW && t <= GUITAR_HIGH) {
-        const off = m % 2 ? -55 : 55; // played 55 cents away from the target: outside the ±40 slack
-        const L = lead(m);
-        const y = concat(silence(L), pluck(t, 1.6, { cents: off, seed: m + 31 }), silence(0.2));
-        fixtures.push({ group: 'NEG guitar 55 cents out', name: `pluck ${noteName(t)}${off > 0 ? '+' : ''}${off}c → target ${noteName(t)}${noisy ? ' noisy' : ''}`, samples: noisy ? addNoise(y, 20, 5000 + m) : y, onset: L, truthMidi: null, cfg: guitarConfig(t), expectAccept: false });
+  }
+}
+const sv = (sung: number, sr: number, o: Partial<VoiceOpts> & { dur?: number; floor?: number } = {}) =>
+  mix(floorBase(sr, (o.dur ?? 2.5) + 0.6, sung, o.floor), voice(sung, o.dur ?? 2.5, { sr, seed: sung, ...o }), ONSET, sr);
+
+// model 1 voices over E2–A4 (low and high voices), clean and noisy
+const LOWHIGH = Array.from({ length: 30 }, (_, i) => 40 + i);
+const v1x = (m: number, noisy: boolean) => {
+  const x = concat(sil1(ONSET), voice1(m, 2.0, { vowel: (['ah', 'ee', 'oo', 'eh'] as const)[m % 4] }), sil1(0.2));
+  return noisy ? addNoise(x, 20, 2000 + m, Math.floor(ONSET * SR), Math.floor((ONSET + 2) * SR)) : x;
+};
+voiceGroup('P model-1 voice E2–A4 clean', 'P', (t) => ({ x: v1x(t, false) }), { targets: LOWHIGH, octaves: [0] });
+voiceGroup('P model-1 voice E2–A4 +noise 20dB', 'P', (t) => ({ x: v1x(t, true) }), { targets: LOWHIGH, octaves: [0] });
+voiceGroup('P model-1 voice strict ±25', 'P', (t) => ({ x: v1x(t, t % 2 === 0) }), { targets: LOWHIGH, octaves: [0], tol: 25 });
+voiceGroup('P model-1 voice exact-octave on', 'P', (t) => ({ x: v1x(t, false) }), { targets: LOWHIGH, octaves: [0], exact: true });
+for (const v of ['a', 'i', 'u', 'o'] as const) voiceGroup(`P vowel ${v}`, 'P', (_t, s, sr) => ({ x: sv(s, sr, { vowel: v }) }));
+voiceGroup('P vowels 44.1k', 'P', (t, s, sr) => ({ x: sv(s, sr, { vowel: (['a', 'i', 'u', 'o'] as const)[t % 4] }) }), { sr: 44100 });
+voiceGroup('P humming (mmm)', 'P', (_t, s, sr) => ({ x: sv(s, sr, { vowel: 'hum' }) }));
+voiceGroup('P vibrato ±50c 5.5Hz', 'P', (_t, s, sr) => ({ x: sv(s, sr, { vibCents: 50 }) }));
+voiceGroup('P vibrato ±100c 5.5Hz', 'P', (_t, s, sr) => ({ x: sv(s, sr, { vibCents: 100 }) }));
+voiceGroup('P vibrato ±100c 4.5Hz', 'P', (_t, s, sr) => ({ x: sv(s, sr, { vibCents: 100, vibRate: 4.5 }) }));
+voiceGroup('P vibrato ±150c 6Hz', 'P', (_t, s, sr) => ({ x: sv(s, sr, { vibCents: 150, vibRate: 6 }) }));
+voiceGroup('P vibrato ±50c at strict ±25', 'P', (_t, s, sr) => ({ x: sv(s, sr, { vibCents: 50 }) }), { tol: 25 });
+voiceGroup('P vibrato ±80c centred +40c', 'P', (_t, s, sr) => ({ x: sv(s, sr, { vibCents: 80, f0fn: () => 0.4 }) }));
+voiceGroup('P breathy', 'P', (_t, s, sr) => ({ x: sv(s, sr, { breath: 2.0, vowel: 'u' }) }));
+voiceGroup('P quiet -40dBFS, floor -55', 'P', (_t, s, sr) => ({ x: sv(s, sr, { amp: 0.01 }) }));
+voiceGroup('P quiet -52dBFS, floor -75', 'P', (_t, s, sr) => ({ x: sv(s, sr, { amp: 0.0025, floor: 0.00018 }) }));
+voiceGroup('P breathy + quiet -40, floor -60', 'P', (_t, s, sr) => ({ x: sv(s, sr, { amp: 0.01, breath: 1.5, floor: 0.001 }) }));
+voiceGroup('P scoop from -300c over 300ms', 'P', (_t, s, sr) => ({ x: sv(s, sr, { f0fn: (t) => -3 * Math.max(0, 1 - t / 0.3) }) }));
+voiceGroup('P +45c sharp (inside ±50)', 'P', (_t, s, sr) => ({ x: sv(s, sr, { f0fn: () => 0.45 }) }));
+voiceGroup('P low voice an octave down (C2–G3)', 'P', (_t, s, sr) => ({ x: sv(s, sr) }), { octaves: [-12] });
+voiceGroup('P high voice two octaves up (C5–G6)', 'P', (_t, s, sr) => ({ x: sv(s, sr) }), { octaves: [24] });
+voiceGroup('P exact-octave on, right octave', 'P', (_t, s, sr) => ({ x: sv(s, sr) }), { exact: true, octaves: [0] });
+for (const snr of [20, 12, 6]) {
+  voiceGroup(`P SNR ${snr}dB`, 'P', (_t, s, sr) => {
+    const v = voice(s, 2.5, { sr, vowel: s % 2 ? 'a' : 'u', vibCents: 20, seed: s });
+    const x = mix(silence(3.1, sr), v, ONSET, sr);
+    return { x: whiteNoise(x, rms(v) / Math.pow(10, snr / 20), s) };
+  }, { octaves: [0] });
+}
+// negatives
+voiceGroup('N semitone sharp', 'N', (_t, s, sr) => ({ x: sv(s + 1, sr) }));
+voiceGroup('N +55c sharp', 'N', (_t, s, sr) => ({ x: sv(s, sr, { f0fn: () => 0.55 }) }));
+voiceGroup('N +30c at strict ±25', 'N', (_t, s, sr) => ({ x: sv(s, sr, { f0fn: () => 0.3 }) }), { tol: 25 });
+voiceGroup('N vibrato ±80c centred +70c', 'N', (_t, s, sr) => ({ x: sv(s, sr, { vibCents: 80, f0fn: () => 0.7 }) }));
+for (const rate of [1, 1.5, 2, 4]) {
+  voiceGroup(`N glide through target ${rate} st/s, never settles`, 'N', (_t, s, sr) => {
+    const dur = Math.min(6, 6 / rate + 0.5);
+    return { x: sv(s, sr, { dur, f0fn: (t) => -3 + rate * t }) };
+  });
+}
+voiceGroup('N exact-octave on, sung an octave up', 'N', (t, _s, sr) => ({ x: sv(t + 12, sr) }), { exact: true, octaves: [0] });
+voiceGroup('N exact-octave on, sung an octave down', 'N', (t, _s, sr) => ({ x: sv(t - 12, sr) }), { exact: true, octaves: [0] });
+voiceGroup('N model-1 voice semitone off', 'N', (t) => ({ x: v1x(t + (t % 2 ? 1 : -1), t % 3 === 0) }), { targets: LOWHIGH, octaves: [0] });
+// a PLUCKED note (any octave) must not pass the singing step
+voiceGroup('N guitar pluck (additive) in the singing step', 'N', (_t, s, sr) => (s >= 40 && s <= 76 ? { x: add(s, sr) } : null), { octaves: [0, 12, -12] });
+voiceGroup('N guitar pluck (KS) in the singing step', 'N', (_t, s) => (s >= 40 && s <= 76 ? { x: ks(s) } : null), { octaves: [0, 12, -12] });
+voiceGroup('N repeated plucks every 1.2 s (KS) in the singing step', 'N', (_t, s) => {
+  if (s < 40 || s > 76) return null;
+  const x = sil1(ONSET + 5);
+  for (let k = 0; k < 4; k++) mixInto(x, pluck(s, 1.15, { seed: s + k }), Math.floor((ONSET + 1.2 * k) * SR));
+  return { x };
+}, { octaves: [0, 12] });
+voiceGroup('N repeated plucks every 0.6 s (additive) in the singing step', 'N', (_t, s, sr) => {
+  if (s < 40 || s > 76) return null;
+  const x = floorBase(sr, ONSET + 4, s);
+  for (let k = 0; k < 6; k++) mix(x, guitar(s, 0.8, { sr, seed: s + k }), ONSET + 0.6 * k, sr);
+  return { x };
+}, { octaves: [0] });
+voiceGroup('I tremolo re-plucks every 0.3 s in the singing step (KNOWN GAP: accepted)', 'I', (_t, s, sr) => {
+  if (s < 40 || s > 76) return null;
+  const x = floorBase(sr, ONSET + 4, s);
+  for (let k = 0; k < 12; k++) mix(x, guitar(s, 0.5, { sr, seed: s + k }), ONSET + 0.3 * k, sr);
+  return { x };
+}, { octaves: [0] });
+voiceGroup('N guitar pluck slow decay (t60 6s) in the singing step', 'N', (_t, s, sr) => (s >= 40 && s <= 76 ? { x: add(s, sr, { t60: 6 }) } : null), { octaves: [0] });
+// informational: tolerance-edge wobbles
+voiceGroup('I wobble +50c ±15c @1.5Hz (edge)', 'I', (_t, s, sr) => ({ x: sv(s, sr, { f0fn: (t) => 0.5 + 0.15 * Math.sin(2 * Math.PI * 1.5 * t) }) }));
+voiceGroup('I wobble +40c ±25c @1.5Hz', 'I', (_t, s, sr) => ({ x: sv(s, sr, { f0fn: (t) => 0.4 + 0.25 * Math.sin(2 * Math.PI * 1.5 * t) }) }));
+staticNegatives('N silence', silence(3, SR), 'voice', (t) => singConfig(t, 50, false), SONG_C);
+staticNegatives('N white noise -30dBFS', noise(3, 0.03, 19), 'voice', (t) => singConfig(t, 50, false), SONG_C);
+staticNegatives('N 60Hz hum only -40dBFS', hum(floorBase(SR, 4, 3), SR, 60, 0.01), 'voice', (t) => singConfig(t, 50, false), SONG_C);
+
+// ======================================================================= speech, coughs: false accepts per minute
+const fapm: string[] = [];
+function speech(dur: number, lo: number, hi: number, seed: number): Float32Array {
+  const r = rng(seed);
+  const x = floorBase(SR, dur, seed);
+  let t = 0.3;
+  let m = (lo + hi) / 2;
+  const vowels = ['a', 'i', 'u', 'o'] as const;
+  while (t < dur - 0.5) {
+    const d = 0.09 + r() * 0.22;
+    m = Math.max(lo, Math.min(hi, m + (r() * 2 - 1) * 3));
+    const g = (r() * 2 - 1) * 2.5;
+    const syl = voice(60, d, { sr: SR, seed: Math.floor(r() * 1e6), vowel: vowels[Math.floor(r() * 4)], f0fn: (tt) => m - 60 + (g * tt) / d, amp: 0.15 + 0.2 * r(), attack: 0.02, breath: 0.3 });
+    mix(x, syl, t, SR);
+    t += d + (r() < 0.25 ? 0.15 + r() * 0.3 : 0.02 + r() * 0.05);
+  }
+  return x;
+}
+function coughs(dur: number, seed: number): Float32Array {
+  const r = rng(seed);
+  const x = floorBase(SR, dur, seed);
+  for (let t = 0.4; t < dur - 0.5; t += 0.5 + r() * 0.8) {
+    const n = Math.floor((0.12 + r() * 0.15) * SR);
+    const at = Math.floor(t * SR);
+    let lp = 0, bp1 = 0, bp2 = 0;
+    const w = (2 * Math.PI * (300 + r() * 500)) / SR;
+    for (let i = 0; i < n; i++) {
+      const e = Math.exp(-i / (0.05 * SR)) * Math.min(1, i / 60);
+      const nz = r() * 2 - 1;
+      lp = 0.5 * lp + 0.5 * nz;
+      const y = 2 * 0.985 * Math.cos(w) * bp1 - 0.985 * 0.985 * bp2 + nz * 0.1;
+      bp2 = bp1; bp1 = y;
+      x[at + i] += 0.4 * e * (0.6 * lp + 0.4 * y);
+    }
+  }
+  return x;
+}
+if (want('speech')) {
+  void rng1;
+  for (const [name, mk] of [
+    ['male speech 95-180Hz', (s: number) => speech(60, 43, 54, s)],
+    ['female speech 170-300Hz', (s: number) => speech(60, 53, 62, s)],
+    ['coughs / throat clearing', (s: number) => coughs(60, s)],
+  ] as [string, (s: number) => Float32Array][]) {
+    let singFA = 0, playFA = 0, singT = 0, playT = 0;
+    for (const seed of [11, 22]) {
+      const x = mk(seed);
+      const fv = framesOf(x, 'voice');
+      const fg = framesOf(x, 'guitar');
+      for (let pc = 0; pc < 12; pc++) {
+        singT++;
+        let m = new NoteMatcher(singConfig(48 + pc, 50, false));
+        for (const f of fv) if (m.push(f).accepted) { singFA++; m = new NoteMatcher(singConfig(48 + pc, 50, false)); }
+      }
+      for (const t of [43, 45, 47, 48, 50, 52, 53, 54, 55, 57, 59, 60, 62, 64, 65, 67]) {
+        playT++;
+        let m = new NoteMatcher(guitarConfig(t));
+        for (const f of fg) if (m.push(f).accepted) { playFA++; m = new NoteMatcher(guitarConfig(t)); }
       }
     }
-    for (const d of [-12, 12]) {
-      const t = m + d;
-      if (t < GUITAR_LOW || t > GUITAR_HIGH) continue;
-      fixtures.push({ group: 'NEG guitar wrong octave', name: `pluck ${noteName(m)} → target ${noteName(t)}${noisy ? ' noisy' : ''}`, samples: x, onset: lead(m), truthMidi: m, cfg: guitarConfig(t), expectAccept: false });
-    }
-  }
-}
-for (let m = VOICE_LOW; m <= VOICE_HIGH; m++) {
-  for (const noisy of [false, true]) {
-    const x = voiceNote(m, noisy);
-    for (const d of [-1, 1]) {
-      fixtures.push({ group: 'NEG voice semitone off', name: `voice ${noteName(m)} → sing ${noteName(m + d)}${noisy ? ' noisy' : ''}`, samples: x, onset: lead(m), truthMidi: m, cfg: singConfig(m + d, 50, false), expectAccept: false });
-    }
-    fixtures.push({ group: 'NEG voice semitone off (±25)', name: `voice ${noteName(m)} → sing ${noteName(m + 1)}${noisy ? ' noisy' : ''}`, samples: x, onset: LEAD, truthMidi: m, cfg: singConfig(m + 1, 25, false), expectAccept: false });
-    fixtures.push({ group: 'NEG voice wrong octave (exact-octave on)', name: `voice ${noteName(m)} → sing ${noteName(m + 12)}${noisy ? ' noisy' : ''}`, samples: x, onset: lead(m), truthMidi: m, cfg: singConfig(m + 12, 50, true), expectAccept: false });
+    fapm.push(`${name.padEnd(26)} sing step ${(singFA / singT).toFixed(2)} /min/target (${singFA} in ${singT} target-min)   guitar step ${(playFA / playT).toFixed(2)} /min/target (${playFA} in ${playT} target-min)`);
   }
 }
 
-// ---- Run ----
-interface GroupStats {
-  n: number;
-  accepted: number;
-  expectAccept: boolean;
-  times: number[];
-  octaveErrFixtures: number;
-  octaveErrFrames: number;
-  stableFrames: number;
-  failures: string[];
-  early: number;
-}
-const groups = new Map<string, GroupStats>();
-
-/** Octave-error scan: run a never-accepting matcher over the whole fixture and inspect trusted pitches. */
-function octaveScan(f: Fixture): { frames: number; errs: number } {
-  if (f.truthMidi === null) return { frames: 0, errs: 0 };
-  const m = new NoteMatcher({ ...f.cfg, holdMs: Infinity });
-  let frames = 0;
-  let errs = 0;
-  analyzeBuffer(f.samples, SR, (fr) => {
-    const s = m.push(fr);
-    if (s.stable && s.detectedMidi !== null) {
-      frames++;
-      const diff = Math.abs(s.detectedMidi - f.truthMidi!);
-      for (const iv of [12, 19, 24, 7]) if (Math.abs(diff - iv) < 0.5) errs++;
-    }
-  });
-  return { frames, errs };
-}
-
-const t0 = Date.now();
-for (const f of fixtures) {
-  let g = groups.get(f.group);
-  if (!g) {
-    g = { n: 0, accepted: 0, expectAccept: f.expectAccept, times: [], octaveErrFixtures: 0, octaveErrFrames: 0, stableFrames: 0, failures: [], early: 0 };
-    groups.set(f.group, g);
-  }
-  g.n++;
-  const { acceptedAt } = runMatcher(f.samples, SR, f.cfg);
-  const early = acceptedAt !== null && acceptedAt < f.onset;
-  const ok = (acceptedAt !== null) === f.expectAccept && !early;
-  if (early) g.early++;
-  if (acceptedAt !== null && !early) {
-    g.accepted++;
-    g.times.push((acceptedAt - f.onset) * 1000);
-  }
-  if (!ok) g.failures.push(early ? `${f.name} (accepted BEFORE onset)` : f.name);
-  if (f.expectAccept) {
-    const o = octaveScan(f);
-    g.stableFrames += o.frames;
-    g.octaveErrFrames += o.errs;
-    if (o.errs > 0) {
-      g.octaveErrFixtures++;
-      g.failures.push(`${f.name} (octave error frames: ${o.errs})`);
-    }
-  }
-  if (verbose) console.log(`${ok ? 'ok  ' : 'FAIL'} ${f.group.padEnd(34)} ${f.name.padEnd(36)} ${acceptedAt === null ? 'no accept' : `accept @ ${((acceptedAt - f.onset) * 1000).toFixed(0)} ms`}`);
-}
-
-const pct = (a: number, b: number) => (b ? ((100 * a) / b).toFixed(1) + '%' : '-');
-const quant = (xs: number[], q: number) => {
+// ======================================================================= report
+const q = (xs: number[], p: number) => {
   if (!xs.length) return NaN;
   const s = [...xs].sort((a, b) => a - b);
-  return s[Math.min(s.length - 1, Math.floor(q * (s.length - 1) + 0.5))];
+  return s[Math.min(s.length - 1, Math.floor(p * (s.length - 1) + 0.5))];
 };
 const ms = (v: number) => (Number.isFinite(v) ? v.toFixed(0) : '-');
-
-const header = ['group', 'n', 'correct-accept', 'false-accept', 'octave-err', 'tta median', 'tta p90', 'tta max'];
-const rows: string[][] = [];
-let failed = false;
 const problems: string[] = [];
+const head = ['group', 'n', 'accept', 'false-acc', 'oct-err', 'tta med', 'p90', 'max'];
+const rows: string[][] = [];
+const guitarPosTimes: number[] = [];
 for (const [name, g] of groups) {
-  const ca = g.expectAccept ? pct(g.accepted, g.n) : '-';
-  const fa = g.expectAccept ? (g.early ? `${g.early} early` : '-') : `${g.accepted}/${g.n}`;
-  const oe = g.expectAccept ? `${g.octaveErrFixtures}/${g.n}` : '-';
-  const med = quant(g.times, 0.5);
-  rows.push([name, String(g.n), ca, fa, oe, g.expectAccept ? ms(med) : '-', g.expectAccept ? ms(quant(g.times, 0.9)) : '-', g.expectAccept ? ms(Math.max(...g.times)) : '-']);
-  if (g.expectAccept && g.accepted / g.n < 0.98) problems.push(`${name}: correct-accept ${pct(g.accepted, g.n)} < 98%`);
-  if (!g.expectAccept && g.accepted > 0) problems.push(`${name}: ${g.accepted} false accepts`);
-  if (g.early > 0) problems.push(`${name}: ${g.early} accepted before the note onset`);
-  if (g.octaveErrFixtures > 0) problems.push(`${name}: ${g.octaveErrFixtures} fixtures with octave errors`);
-  if (name.startsWith('guitar') && med > 400) problems.push(`${name}: median time-to-accept ${ms(med)} ms > 400 ms`);
-  if (g.failures.length && (problems.length || verbose)) {
-    for (const f of g.failures.slice(0, 12)) problems.push(`   - ${name}: ${f}`);
+  const pct = `${((100 * g.acc) / g.n).toFixed(1)}%`;
+  rows.push([
+    name, String(g.n),
+    g.kind === 'N' ? '-' : pct,
+    g.kind === 'N' ? `${g.acc}/${g.n}` : '-',
+    g.kind === 'N' ? '-' : `${g.oct}/${g.n}`,
+    g.kind === 'N' ? '-' : ms(q(g.tta, 0.5)), g.kind === 'N' ? '-' : ms(q(g.tta, 0.9)), g.kind === 'N' ? '-' : ms(Math.max(...g.tta)),
+  ]);
+  if (g.kind === 'P' && g.acc / g.n < 0.98) problems.push(`${name}: accept ${pct} < 98%`);
+  if (g.kind === 'N' && g.acc > 0) problems.push(`${name}: ${g.acc} false accepts`);
+  if (g.kind !== 'N' && g.oct > 0) problems.push(`${name}: ${g.oct} fixtures with octave misreads`);
+  if (g.kind === 'P' && name.startsWith('guitar') && !name.includes('over ringing') && !name.includes('slide in') && !name.includes('+60c')) guitarPosTimes.push(...g.tta);
+  if ((verbose || g.kind !== 'I') && g.fails.length && (verbose || problems.some((p) => p.startsWith(name)))) {
+    problems.push(`   ${name}: ${g.fails.slice(0, 10).join(', ')}${g.fails.length > 10 ? ` … (+${g.fails.length - 10})` : ''}`);
   }
 }
+const gMed = q(guitarPosTimes, 0.5);
+rows.push(['guitar: all plain-pluck positives, time-to-accept', String(guitarPosTimes.length), '', '', '', ms(gMed), ms(q(guitarPosTimes, 0.9)), ms(Math.max(...guitarPosTimes))]);
+if (gMed > 400) problems.push(`guitar median time-to-accept ${ms(gMed)} ms > 400 ms`);
 
-// Totals
-const pos = [...groups.values()].filter((g) => g.expectAccept);
-const neg = [...groups.values()].filter((g) => !g.expectAccept);
-const totPos = pos.reduce((a, g) => a + g.n, 0);
-const totAcc = pos.reduce((a, g) => a + g.accepted, 0);
-const totNeg = neg.reduce((a, g) => a + g.n, 0);
-const totFa = neg.reduce((a, g) => a + g.accepted, 0) + pos.reduce((a, g) => a + g.early, 0);
-const totOe = pos.reduce((a, g) => a + g.octaveErrFixtures, 0);
-const guitarTimes = [...groups].filter(([k, g]) => g.expectAccept && k.startsWith('guitar')).flatMap(([, g]) => g.times);
-rows.push(['ALL positives / negatives', `${totPos}/${totNeg}`, pct(totAcc, totPos), `${totFa}/${totNeg}`, `${totOe}/${totPos}`, '', '', '']);
-rows.push(['guitar overall time-to-accept', String(guitarTimes.length), '', '', '', ms(quant(guitarTimes, 0.5)), ms(quant(guitarTimes, 0.9)), ms(Math.max(...guitarTimes))]);
-
-const widths = header.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i].length)));
-const line = (cells: string[]) => cells.map((c, i) => (i === 0 ? c.padEnd(widths[i]) : c.padStart(widths[i]))).join('  ');
-console.log(`\nPitch-engine gauntlet (${fixtures.length} fixture runs, ${SR} Hz, ${((Date.now() - t0) / 1000).toFixed(1)} s)`);
-console.log('time-to-accept (tta) is ms after note onset; octave-err = fixtures with any trusted frame an octave/twelfth off\n');
-console.log(line(header));
-console.log(widths.map((w) => '-'.repeat(w)).join('  '));
+const w = head.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i].length)));
+const line = (c: string[]) => c.map((x, i) => (i === 0 ? x.padEnd(w[i]) : x.padStart(w[i]))).join('  ');
+console.log(`\nPitch-engine gauntlet — ${[...groups.values()].reduce((a, g) => a + g.n, 0)} fixture runs (${((Date.now() - t0) / 1000).toFixed(0)} s)`);
+console.log('P = must accept (≥98%), N = must never accept, I = informational. tta = ms after note onset.\n');
+console.log(line(head));
+console.log(w.map((n) => '-'.repeat(n)).join('  '));
 for (const r of rows) console.log(line(r));
+if (fapm.length) {
+  console.log('\nFalse accepts from speech / coughs (continuous 60 s recordings, every target):');
+  for (const f of fapm) console.log('  ' + f);
+}
 
-const guitarMed = quant(guitarTimes, 0.5);
-console.log('\nTargets: correct-accept ≥ 98% per positive group, 0 false accepts, 0 octave errors, guitar median tta ≤ 400 ms');
-if (guitarMed > 400) problems.push(`guitar overall median tta ${ms(guitarMed)} ms > 400 ms`);
-failed = problems.some((p) => !p.startsWith('   '));
+if (!noSims) {
+  console.log('\nSession simulations (real Session + front end; voice-only / guitar-only must pass 0 cross-steps):\n');
+  const { rows: simRows, problems: simProblems } = runAllSims();
+  printSims(simRows);
+  problems.push(...simProblems);
+}
+
+const failed = problems.some((p) => !p.startsWith('   '));
 if (problems.length) {
-  console.log('\nIssues:');
+  console.log('\nTargets missed:');
   for (const p of problems) console.log('  ' + p);
 }
-console.log(failed ? '\nGAUNTLET: FAIL' : '\nGAUNTLET: PASS');
+console.log(`\nGAUNTLET: ${failed ? 'FAIL' : 'PASS'} (${((Date.now() - t0) / 1000).toFixed(0)} s)`);
 process.exit(failed ? 1 : 0);

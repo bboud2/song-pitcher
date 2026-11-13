@@ -33,7 +33,7 @@ function phraseSegment(midis: number[], seed: number): Float32Array {
 
 export const FIRST_NOTES = [55, 52, 48, 52, 55, 60, 64, 62]; // G3 E3 C3 E3 G3 C4 | E4 D4
 
-export function buildWavs(outDir: string): { correct: string; wrong: string } {
+export function buildWavs(outDir: string): { correct: string; wrong: string; voiceOnly: string; guitarOnly: string } {
   const lead = silence(4.0);
   const phrase = FIRST_NOTES.slice(0, 6);
   const correct = concat(
@@ -48,6 +48,19 @@ export function buildWavs(outDir: string): { correct: string; wrong: string } {
     phraseSegment(phrase.map((m) => m + 1), 500),
     ...FIRST_NOTES.slice(6).map((m, i) => noteSegment(m + 1, [m - 1, m - 12], 200 + i * 10)),
   );
+  // voice-only: same sung notes (in the guitar's octave, vibrato ±30 c), no plucks at all.
+  const voiceOnly = concat(lead, ...FIRST_NOTES.map((m, i) => {
+    const seg = silence(SEG);
+    mixInto(seg, voice(m, 2.6, { seed: 10 + i * 10, amp: 0.35, vowel: 'ah' }), 0);
+    mixInto(seg, voice(m, 1.6, { seed: 11 + i * 10, amp: 0.35, vowel: 'oo', vibratoCents: 5 }), Math.floor(3.0 * SR));
+    return seg;
+  }));
+  // guitar-only: the plucks of every note, never a sung note.
+  const guitarOnly = concat(lead, ...FIRST_NOTES.map((m, i) => {
+    const seg = silence(SEG);
+    for (const at of [0.2, 1.4, 2.6, 3.8]) mixInto(seg, pluck(m, 1.15, { seed: 300 + i * 10 + at * 10, amp: 0.45 }), Math.floor(at * SR));
+    return seg;
+  }));
   // A little room noise everywhere (about -50 dBFS).
   const addFloor = (x: Float32Array, seed: number) => {
     const n = noise(x.length / SR, 0.003, seed);
@@ -59,5 +72,9 @@ export function buildWavs(outDir: string): { correct: string; wrong: string } {
   mkdirSync(dirname(c), { recursive: true });
   writeFileSync(c, encodeWav(addFloor(correct, 1)));
   writeFileSync(w, encodeWav(addFloor(wrong, 2)));
-  return { correct: c, wrong: w };
+  const vo = `${outDir}/voice-only.wav`;
+  const go = `${outDir}/guitar-only.wav`;
+  writeFileSync(vo, encodeWav(addFloor(voiceOnly, 3)));
+  writeFileSync(go, encodeWav(addFloor(guitarOnly, 4)));
+  return { correct: c, wrong: w, voiceOnly: vo, guitarOnly: go };
 }

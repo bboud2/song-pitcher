@@ -72,6 +72,20 @@ function buildSong(
  * "The Star-Spangled Banner" (melody: John Stafford Smith; words: Francis Scott Key, 1814). Public domain.
  * Degrees are relative to the low tonic ("1" = do). In C it spans C3 (do) to G4 (high sol).
  * 3/4 time; beats in quarter notes. Phrase boundaries split each line in half for phrase review.
+ *
+ * Checked against four independent ABC transcriptions (community transcriptions, not an
+ * authoritative edition — none was reachable from the build environment):
+ *   - github.com/avnerdorman/abc-solfege-tool songs/Anachreon_in_Heaven_3V-D-32-2.abc
+ *     (fife part, transcribed by John Chambers from ancients.sudburymuster.org fyf02F.pdf)
+ *   - github.com/abdulhaim/abc_karaoke_project sample-abc/star_spangled_banner.abc (with lyrics)
+ *   - github.com/syntithenai/abc2book abcresources/jc/abc_tune_jc_201217968.abc
+ *   - github.com/tljameswade/comp504 HW06/src/songs/star_spangled.abc
+ * All four agree on every pitch below. Where all four agreed on a rhythm it was corrected:
+ * "at the" (twilight's / gallantly) and "does that" are straight eighths, and "banner yet wave"
+ * is 2'(1) 4' 3' 2' 1' (eighths) | 1'(1) 7(1) — 101 notes in all.
+ * Still disputed (sources split 2–2; left as is, please check by ear): "What so" / "O'er the
+ * ramparts" (straight vs dotted eighths), "And the rockets'", "O'er the land", "and the home"
+ * (same question), and "that our flag" (dotted here; two sources have straight eighths).
  */
 export const STAR_SPANGLED_BANNER: Song = buildSong(
   { id: 'star-spangled-banner', title: 'The Star-Spangled Banner', defaultKeyPc: 0, defaultTonicMidi: 48, bpm: 84 },
@@ -79,17 +93,17 @@ export const STAR_SPANGLED_BANNER: Song = buildSong(
     { lyric: 'O say can you see', melody: "5:0.75 3:0.25 1:1 3:1 5:1 1':2" },
     { lyric: "by the dawn's early light", melody: "3':0.75 2':0.25 1':1 3:1 #4:1 5:2" },
     { lyric: 'What so proudly we hailed', melody: "5:0.5 5:0.5 3':1.5 2':0.5 1':1 7:2" },
-    { lyric: "at the twilight's last gleaming?", melody: "6:0.75 7:0.25 1':1 1':1 5:1 3:1 1:1" },
+    { lyric: "at the twilight's last gleaming?", melody: "6:0.5 7:0.5 1':1 1':1 5:1 3:1 1:1" },
     { lyric: 'Whose broad stripes and bright stars', melody: "5:0.75 3:0.25 1:1 3:1 5:1 1':2" },
     { lyric: 'through the perilous fight,', melody: "3':0.75 2':0.25 1':1 3:1 #4:1 5:2" },
     { lyric: "O'er the ramparts we watched", melody: "5:0.5 5:0.5 3':1.5 2':0.5 1':1 7:2" },
-    { lyric: 'were so gallantly streaming?', melody: "6:0.75 7:0.25 1':1 1':1 5:1 3:1 1:1" },
+    { lyric: 'were so gallantly streaming?', melody: "6:0.5 7:0.5 1':1 1':1 5:1 3:1 1:1" },
     { lyric: "And the rockets' red glare,", melody: "3':0.5 3':0.5 3':1 4':1 5':1 5':2" },
     { lyric: 'the bombs bursting in air,', melody: "4':0.5 3':0.5 2':1 3':1 4':1 4':2" },
     { lyric: 'Gave proof through the night', melody: "4':1 3':1.5 2':0.5 1':1 7:2" },
     { lyric: 'that our flag was still there;', melody: "6:0.75 7:0.25 1':1 3:1 #4:1 5:2" },
-    { lyric: 'O say does that star-spangled', melody: "5:1 1':1 1':1 1':0.75 7:0.25 6:1 6:1 6:1" },
-    { lyric: 'banner yet wave', melody: "2':1.5 4':0.5 3':0.5 2':0.5 1':1 7:1" },
+    { lyric: 'O say does that star-spangled', melody: "5:1 1':1 1':1 1':0.5 7:0.5 6:1 6:1 6:1" },
+    { lyric: 'banner yet wave', melody: "2':1 4':0.5 3':0.5 2':0.5 1':0.5 1':1 7:1" },
     { lyric: "O'er the land of the free", melody: "5:0.5 5:0.5 1':1.5 2':0.5 3':0.5 4':0.5 5':2" },
     { lyric: 'and the home of the brave?', melody: "1':0.5 2':0.5 3':1.5 4':0.5 2':1 1':3" },
   ],

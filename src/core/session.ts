@@ -6,11 +6,10 @@
 // Flow per note:  listen → sing → play → [phrase review at phrase ends] → next note … → done
 // The app plays audio only in 'listen' phases and feeds mic frames only in sing/play/review,
 // so the reference tone can never be heard by the matcher.
-import { guitarConfig, singConfig } from './engine.ts';
+import { guitarConfig, pathForPhase, singConfig, type AnalysisPath } from './engine.ts';
 import { NoteMatcher, type MatchState, type PitchFrame } from './matcher.ts';
 import type { Settings } from './settings.ts';
 import { phraseEndingAt, transpose, type Phrase, type Song } from './songs.ts';
-import { mod } from './music.ts';
 
 export type Phase = 'listen' | 'sing' | 'play' | 'review' | 'done';
 export type ListenKind = 'note' | 'phrase';
@@ -72,6 +71,8 @@ export class Session {
   private reviewStart = 0;
   private reviewMistakes = 0;
   private started = false;
+  /** Frames of the current step (last 1.2 s). */
+  private recent: PitchFrame[] = [];
   /** Match state of the most recent accept (for logging). */
   lastAccepted: MatchState | null = null;
   private stats: NoteStats[];
@@ -96,10 +97,33 @@ export class Session {
     this.beginNote(this.startIndex);
   }
 
-  /** Change difficulty mid-session; matching rules apply from the next step. */
+  /** Change difficulty mid-session. A tolerance / octave change applies to the step in progress at once. */
   setSettings(s: Settings): void {
+    const prev = this.settings;
     this.settings = { ...s };
     if (this.settings.skipSing && this.settings.skipGuitar) this.settings.skipGuitar = false;
+    const matchingChanged = prev.singTolerance !== this.settings.singTolerance || prev.singExactOctave !== this.settings.singExactOctave;
+    if (matchingChanged && this.phase === 'sing' && this.matcher) {
+      this.attemptCarry += this.matcher.current.wrongAttempts;
+      this.makeStepMatcher();
+      // Re-feed the last second of this step so the new matcher continues where the old one was.
+      for (const f of this.recent) this.matcher.push(f);
+    }
+  }
+
+  /** Which analysis path the app should feed: the voice path while singing, the guitar path otherwise. */
+  listeningPath(): AnalysisPath {
+    return pathForPhase(this.phase);
+  }
+
+  /** Restore per-note results from an earlier, interrupted session (resume). */
+  restore(prior: { stats?: NoteStats[]; reviews?: ReviewStats[] }): void {
+    if (prior.stats) {
+      for (const p of prior.stats) {
+        if (p && p.index >= 0 && p.index < this.stats.length && p.midi === this.stats[p.index].midi) this.stats[p.index] = { ...p };
+      }
+    }
+    if (prior.reviews) this.reviews = prior.reviews.map((r) => ({ ...r }));
   }
 
   private firstStep(): Phase {
@@ -123,6 +147,7 @@ export class Session {
   /** The reference audio for the current 'listen' phase finished playing (and its tail decayed). */
   listenDone(t: number): void {
     if (this.phase !== 'listen') return;
+    this.recent = [];
     this.phase = this.next;
     if (this.phase === 'review') {
       this.startReviewMatcher();
@@ -133,20 +158,15 @@ export class Session {
     this.makeStepMatcher();
   }
 
-  private repeatedNote(): boolean {
-    const i = this.index;
-    return i > 0 && mod(this.midis[i] - this.midis[i - 1], 12) === 0;
-  }
-
   private makeStepMatcher(): void {
     const target = this.midis[this.index];
-    const needAttack = this.repeatedNote();
     const cfg =
       this.phase === 'sing'
         ? singConfig(target, this.settings.singTolerance, this.settings.singExactOctave)
         : guitarConfig(target);
     const prev = this.index > 0 ? this.midis[this.index - 1] : undefined;
-    this.matcher = new NoteMatcher({ ...cfg, needAttack, ignoreMidi: this.phase === 'sing' ? prev : undefined });
+    // A still-sounding previous note is not counted as a wrong attempt.
+    this.matcher = new NoteMatcher({ ...cfg, ignoreMidi: prev });
   }
 
   private reviewPhrase(): Phrase | undefined {
@@ -157,9 +177,9 @@ export class Session {
     const p = this.reviewPhrase()!;
     const target = this.midis[p.start + this.reviewPos];
     const prev = this.reviewPos > 0 ? this.midis[p.start + this.reviewPos - 1] : this.midis[this.index];
-    // Always require a fresh attack in review: the last note of the phrase (just played)
-    // or the previous review note may still be ringing.
-    this.matcher = new NoteMatcher({ ...guitarConfig(target), needAttack: prev === target || this.reviewPos === 0, ignoreMidi: prev });
+    // The plucked-note model always needs a fresh attack, so the previous (still ringing) note
+    // cannot pass a repeated note; it is also not counted as a slip.
+    this.matcher = new NoteMatcher({ ...guitarConfig(target), ignoreMidi: prev });
   }
 
   /** Replay the reference (note, or phrase during review). Pauses listening. */
@@ -179,6 +199,8 @@ export class Session {
     if (!this.started || !this.matcher || (this.phase !== 'sing' && this.phase !== 'play' && this.phase !== 'review')) {
       return false;
     }
+    this.recent.push(f);
+    while (this.recent.length && this.recent[0].t < f.t - 1.2) this.recent.shift();
     const s = this.matcher.push(f);
     if (!s.accepted) return false;
     this.lastAccepted = s;
@@ -207,6 +229,7 @@ export class Session {
         this.finishNote(at);
       } else {
         this.phase = 'play';
+        this.recent = [];
         this.stepStart = at;
         this.attemptCarry = 0;
         this.makeStepMatcher();

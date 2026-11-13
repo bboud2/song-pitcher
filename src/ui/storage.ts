@@ -1,4 +1,5 @@
 // localStorage persistence for settings, song/key choice, resume point and session history.
+import type { NoteStats, ReviewStats } from '../core/session.ts';
 import { normalizeSettings, type Settings } from '../core/settings.ts';
 
 const KEY = 'songPitcher.v1';
@@ -20,7 +21,7 @@ export interface Stored {
   keyPc: number;
   tonicMidi: number | null;
   /** Where to resume an unfinished session. */
-  resume: { songId: string; tonicMidi: number; index: number } | null;
+  resume: { songId: string; tonicMidi: number; index: number; stats?: NoteStats[]; reviews?: ReviewStats[] } | null;
   history: HistoryEntry[];
 }
 

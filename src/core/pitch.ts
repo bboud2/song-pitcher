@@ -11,6 +11,8 @@ export interface PitchResult {
   clarity: number;
   /** RMS level of the frame (linear, full scale = 1). */
   rms: number;
+  /** NSDF height at half the detected period (periodicity one octave up), 0 if none. */
+  upClarity?: number;
 }
 
 export interface PitchDetectorOptions {
@@ -213,7 +215,13 @@ export class PitchDetector {
       peakVal = y1 - 0.25 * (y0 - y2) * shift;
     }
     const period = chosen + shift;
-    return { freq: this.sampleRate / period, clarity: Math.min(1, peakVal), rms };
+    // Periodicity one octave above the detected pitch (local max of the NSDF around period/2).
+    let upClarity = 0;
+    const half = period / 2;
+    const lo = Math.max(1, Math.floor(half * 0.97));
+    const hi = Math.min(maxLag, Math.ceil(half * 1.03));
+    for (let k = lo; k <= hi; k++) if (nsdf[k] > upClarity) upClarity = nsdf[k];
+    return { freq: this.sampleRate / period, clarity: Math.min(1, peakVal), rms, upClarity };
   }
 }
 

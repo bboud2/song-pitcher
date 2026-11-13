@@ -5,12 +5,15 @@ export interface MeterHandle {
   el: HTMLElement;
   /** cents = null → no pitch. tolerance = green zone half-width. */
   set(cents: number | null, tolerance: number, opts?: { label?: string; idle?: string }): void;
+  /** Replace the readout with a message (e.g. "That sounds like singing"). */
+  note(text: string): void;
 }
 
-/** Meter half-width in cents: twice the tolerance (at least ±50), so the green zone is the middle half. */
-const rangeFor = (tolerance: number) => Math.max(50, tolerance * 2);
-
-export function createMeter(): MeterHandle {
+/**
+ * `range` = meter half-width in cents, fixed per screen so the green zone visibly narrows when the
+ * tolerance is tightened (±100 in practice, ±50 in the tuner).
+ */
+export function createMeter(range = 100): MeterHandle {
   const zone = h('div', { class: 'meter-zone' });
   const needle = h('div', { class: 'meter-needle' });
   const ticks = h('div', { class: 'meter-ticks' });
@@ -19,13 +22,13 @@ export function createMeter(): MeterHandle {
   }
   const track = h('div', { class: 'meter-track' }, zone, ticks, needle);
   const readout = h('div', { class: 'meter-readout', attrs: { 'aria-live': 'polite' } });
-  const ends = h('div', { class: 'meter-ends' }, h('span', { text: '♭ flat' }), h('span', { text: 'sharp ♯' }));
+  const ends = h('div', { class: 'meter-ends' }, h('span', { text: '♭ flat' }), h('span', { text: `±${range}¢` }), h('span', { text: 'sharp ♯' }));
   const el = h('div', { class: 'meter', attrs: { 'data-testid': 'meter' } }, track, ends, readout);
 
   return {
     el,
     set(cents, tolerance, opts = {}) {
-      const RANGE = rangeFor(tolerance);
+      const RANGE = range;
       zone.style.left = `${50 - (tolerance / RANGE) * 50}%`;
       zone.style.width = `${(tolerance / RANGE) * 100}%`;
       if (cents === null) {
@@ -45,6 +48,9 @@ export function createMeter(): MeterHandle {
       else if (inTol) txt = Math.abs(c) <= 5 ? 'In tune' : `${Math.abs(c)}¢ ${c < 0 ? 'flat' : 'sharp'} — OK`;
       else txt = `${Math.abs(c)}¢ ${c < 0 ? 'flat — go up' : 'sharp — go down'}`;
       readout.textContent = opts.label ? `${opts.label} · ${txt}` : txt;
+    },
+    note(text) {
+      readout.textContent = text;
     },
   };
 }
