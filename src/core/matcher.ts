@@ -34,13 +34,20 @@ export interface MatchConfig {
   graceMs: number;
   /** A trusted pitch held this long outside tolerance counts as one wrong attempt. */
   wrongNoteMs: number;
+  /**
+   * Require a fresh attack (silence gap or a ≥6 dB level jump) before the hold may start.
+   * Used for repeated notes so a still-ringing previous note cannot pass the next step.
+   */
+  needAttack?: boolean;
+  /** A still-ringing previous note: holding this (rounded) MIDI note is not counted as a wrong attempt. */
+  ignoreMidi?: number;
 }
 
 export const SING_DEFAULTS: Omit<MatchConfig, 'targetMidi' | 'toleranceCents'> = {
   mode: 'pitchClass',
   holdMs: 500,
   minClarity: 0.8,
-  minDb: -50,
+  minDb: -65,
   stableFrames: 3,
   stableCents: 70,
   smoothFrames: 9,
@@ -52,7 +59,7 @@ export const GUITAR_DEFAULTS: Omit<MatchConfig, 'targetMidi' | 'toleranceCents'>
   mode: 'exact',
   holdMs: 80,
   minClarity: 0.88,
-  minDb: -55,
+  minDb: -70,
   stableFrames: 3,
   stableCents: 25,
   smoothFrames: 3,
@@ -98,9 +105,12 @@ export class NoteMatcher {
   private wrongMidi: number | null = null;
   private lastCountedWrong: number | null = null;
   private state: MatchState;
+  private attackSeen: boolean;
+  private minRms = Infinity;
 
   constructor(cfg: MatchConfig) {
     this.cfg = cfg;
+    this.attackSeen = !cfg.needAttack;
     this.state = {
       voiced: false, stable: false, detectedMidi: null, cents: null, inTolerance: false,
       progress: 0, accepted: false, acceptedAt: null, meanAbsCents: null, wrongAttempts: 0,
@@ -125,6 +135,11 @@ export class NoteMatcher {
 
     const voiced =
       f.freq > 0 && f.clarity >= c.minClarity && rmsToDb(f.rms) >= c.minDb && f.freq >= 55 && f.freq <= 1400;
+
+    if (!this.attackSeen) {
+      if ((!voiced && (f.t - this.lastVoicedT) * 1000 > c.graceMs) || f.rms > 2 * this.minRms) this.attackSeen = true;
+      this.minRms = Math.min(this.minRms, f.rms);
+    }
 
     if (!voiced) {
       const gap = (f.t - this.lastVoicedT) * 1000;
@@ -166,6 +181,10 @@ export class NoteMatcher {
     const sm = median(this.smooth);
     const cents = this.deviation(sm);
     const inTol = Math.abs(cents) <= c.toleranceCents;
+    if (!this.attackSeen) {
+      this.state = { ...s, voiced: true, stable: true, detectedMidi: sm, cents, inTolerance: inTol, progress: 0 };
+      return this.state;
+    }
 
     let progress = 0;
     let accepted = false;
@@ -197,7 +216,8 @@ export class NoteMatcher {
       if (
         this.wrongStart !== null &&
         (f.t - this.wrongStart) * 1000 >= c.wrongNoteMs &&
-        this.lastCountedWrong !== rounded
+        this.lastCountedWrong !== rounded &&
+        rounded !== c.ignoreMidi
       ) {
         wrongAttempts++;
         this.lastCountedWrong = rounded;
@@ -220,14 +240,12 @@ export class StablePitch {
   private recent: number[] = [];
   private smooth: number[] = [];
   private lastVoicedT = -Infinity;
-  constructor(
-    private minClarity = 0.85,
-    private minDb = -55,
-    private stableFrames = 3,
-    private stableCents = 40,
-    private smoothFrames = 5,
-    private graceMs = 80,
-  ) {}
+  private minClarity = 0.85;
+  private minDb = -70;
+  private stableFrames = 3;
+  private stableCents = 40;
+  private smoothFrames = 5;
+  private graceMs = 80;
 
   push(f: PitchFrame): number | null {
     const voiced = f.freq > 0 && f.clarity >= this.minClarity && rmsToDb(f.rms) >= this.minDb;

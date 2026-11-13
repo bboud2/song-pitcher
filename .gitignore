@@ -1,5 +1,5 @@
 node_modules/
 dist/
+e2e/out/
 test-results/
-playwright-report/
 *.log

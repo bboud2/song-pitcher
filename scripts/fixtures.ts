@@ -38,11 +38,11 @@ export function rmsOf(x: Float32Array, from = 0, to = x.length): number {
 export function pluck(
   midi: number,
   durSec: number,
-  opts: { seed?: number; sr?: number; amp?: number; brightness?: number; pickPos?: number; t60?: number } = {},
+  opts: { seed?: number; sr?: number; amp?: number; brightness?: number; pickPos?: number; t60?: number; cents?: number } = {},
 ): Float32Array {
   const sr = opts.sr ?? SR;
   const r = rng(opts.seed ?? midi * 7919 + 1);
-  const f = midiFreq(midi);
+  const f = midiFreq(midi) * Math.pow(2, (opts.cents ?? 0) / 1200);
   const n = Math.floor(durSec * sr);
   const out = new Float32Array(n);
 

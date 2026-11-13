@@ -20,6 +20,8 @@ export interface PitchDetectorOptions {
   maxFreq?: number;
   /** MPM key-maximum threshold, fraction of the highest key maximum. Default 0.9. */
   cutoff?: number;
+  /** A lobe at twice the chosen lag wins if it is this much more periodic. Default 0.04. */
+  octaveMargin?: number;
 }
 
 class FFT {
@@ -85,6 +87,7 @@ export class PitchDetector {
   private minLag: number;
   private maxLag: number;
   private cutoff: number;
+  private octaveMargin: number;
   private fft: FFT;
   private re: Float64Array;
   private im: Float64Array;
@@ -97,6 +100,7 @@ export class PitchDetector {
     const minFreq = opts.minFreq ?? 60;
     const maxFreq = opts.maxFreq ?? 1200;
     this.cutoff = opts.cutoff ?? 0.9;
+    this.octaveMargin = opts.octaveMargin ?? 0.04;
     this.minLag = Math.max(2, Math.floor(sampleRate / maxFreq));
     this.maxLag = Math.min(Math.floor(size * 0.6), Math.ceil(sampleRate / minFreq));
     let n = 1;
@@ -180,6 +184,21 @@ export class PitchDetector {
       }
     }
     if (chosen < 0) return { freq: 0, clarity: 0, rms };
+
+    // Octave-up guard: when the fundamental is weak (e.g. a vowel formant sitting on the 2nd
+    // harmonic), the half-period lobe can clear the MPM cutoff. If a lobe at ~2x the lag is
+    // clearly more periodic, the true period is the longer one.
+    for (let guard = 0; guard < 2; guard++) {
+      const target = chosen * 2;
+      let better = -1;
+      for (const p of peaks) {
+        if (Math.abs(p - target) <= Math.max(2, target * 0.03) && nsdf[p] > nsdf[chosen] + this.octaveMargin) {
+          if (better < 0 || nsdf[p] > nsdf[better]) better = p;
+        }
+      }
+      if (better < 0) break;
+      chosen = better;
+    }
 
     // Parabolic interpolation around the peak.
     const y0 = nsdf[chosen - 1];
