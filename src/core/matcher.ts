@@ -1,19 +1,31 @@
 // Turns a stream of raw pitch detections into "the student produced the target note" decisions.
 // Pure TypeScript, no DOM.
 //
-// Two source models, because the app must tell singing from playing:
+// Design priorities (in this order):
+//  (a) an honest student must never get stuck (no false rejects),
+//  (b) an honest student must never be advanced by accident (their own sung answer must not
+//      pass the guitar step, a wrong note / wrong octave must not pass, a note still ringing
+//      from the previous step must not pass the next one),
+//  (c) catching deliberate gaming (humming instead of playing) is lowest priority.
 //
-//  * 'sung'    — a SUSTAINED tone. The pitch is smoothed with a two-stage moving average
-//                (≈320 ms triangular window, which cancels 4.5–6 Hz vibrato of any width), then
-//                the smoothed centre must be inside the tolerance AND have stopped moving
-//                (a glide is not a held note), AND the level must not be dying away like a
-//                plucked string. Accepts ≈0.5 s after the voice settles.
-//  * 'plucked' — an IMPULSIVE tone: a fresh onset (level jump), then a FREE DECAY (the level
-//                falls steadily in two consecutive 120 ms segments without swelling back), with
-//                a steady pitch (not sliding) in tolerance. A sung or hummed note has an onset
-//                but then sustains, so it never qualifies; a slide never holds still.
+// So the default rules are simple physical gates, not timbre classification:
+//
+//  * 'sung'    — the pitch is smoothed with a two-stage moving average (≈320 ms triangular
+//                window, which cancels 4.5–6 Hz vibrato of any width); the smoothed centre must
+//                be inside the tolerance and have stopped moving (a glide is not a held note).
+//                The only level rule: a sound that was already there when the step opened, at
+//                the pitch of the previous (possibly still ringing) note, must not be dying away.
+//  * 'plucked' — a NEW attack (level jump, or a clean jump to a new pitch for hammer-ons/
+//                legato) opens a candidate; the note's identity is read from the first steady
+//                window after that attack and is locked: a later octave flip of the detector (a
+//                dying note, hum) cannot turn it into a different note. A sound that has no
+//                attack of its own — the tail of the sung answer, a note still ringing — never
+//                opens a candidate.
+//
+// `strict` ("strict instrument check" setting, off by default) adds envelope-shape tests: sung
+// notes must not decay like a string, plucked notes must decay freely after the attack.
 import { centsFromMidi, centsFromPitchClass, freqToMidi, midiToFreq } from './music.ts';
-import { rmsToDb } from './pitch.ts';
+import { periodicityAt, rmsToDb } from './pitch.ts';
 
 /** One analysed frame: time in seconds plus the detector output. */
 export interface PitchFrame {
@@ -21,12 +33,13 @@ export interface PitchFrame {
   freq: number;
   clarity: number;
   rms: number;
-  /**
-   * NSDF height at half the detected period (i.e. how periodic the frame is one octave above
-   * the detected pitch), 0 if unknown. Used to hear a new note over a still-ringing note an
-   * octave below it.
-   */
+  /** NSDF height at half the detected period, 0 if unknown. */
   upClarity?: number;
+  /** Level after stationary-noise removal; falls back to rms. */
+  cleanRms?: number;
+  /** NSDF of the frame (lag in samples) and the sample rate, for periodicity checks. */
+  nsdf?: Float32Array;
+  sr?: number;
 }
 
 export type MatchMode = 'pitchClass' | 'exact';
@@ -38,9 +51,11 @@ export interface MatchConfig {
   mode: MatchMode;
   toleranceCents: number;
   kind: SourceKind;
+  /** Strict instrument check: envelope-shape tests (off by default). */
+  strict: boolean;
   /** Minimum NSDF clarity for a frame to count as voiced. */
   minClarity: number;
-  /** Minimum frame level (dBFS) for a frame to count as voiced. */
+  /** Minimum frame level (dBFS, after noise removal) for a frame to count as voiced. */
   minDb: number;
   /** An unvoiced gap shorter than this does not break a sung note. */
   graceMs: number;
@@ -48,107 +63,112 @@ export interface MatchConfig {
   ignoreMidi?: number;
 
   // ---- sung
-  /** Length of each of the two moving-average stages. */
   smoothMs: number;
-  /** The smoothed pitch must not have moved more than maxTrendCents over this span. */
   trendMs: number;
   maxTrendCents: number;
-  /** Level regression slope over the last holdMs must be above this (dB/s): rejects plucks. */
-  minDbSlope: number;
-  /** A jump bigger than this between consecutive frames starts a new note. */
   jumpCents: number;
-  /** Total settle time needed (≥ 2·smoothMs + trendMs). */
   holdMs: number;
+  /** Exact pitch that may still be ringing from the previous step (guards carry-over). */
+  carryMidi?: number;
+  /** Strict mode: level slope over the hold window must be above this (dB/s). */
+  minDbSlope: number;
 
   // ---- plucked
   /** Level rise (dB) over the previous ~100 ms that counts as a new attack. */
   onsetRiseDb: number;
-  /** The level must fall at least minSegDecayDb in each of two consecutive segments of this length after the peak. */
+  /** Length of the steady-pitch window read after the attack. */
+  pitchWindowMs: number;
+  /** Max difference between the means of the two halves of that window (slides vs vibrato). */
+  maxStepCents: number;
+  /** A candidate must be identified within this time after its attack. */
+  maxIdentityMs: number;
+  /** Strict mode: free-decay check segments. */
   decaySegMs: number;
   minSegDecayDb: number;
-  /** How late after the peak the two decay segments may start. */
-  decayStartSlackMs: number;
-  /** After the peak, a swell of more than this above the running minimum disqualifies (voice, speech). */
-  maxReswellDb: number;
-  /** Pitch must be steady (range ≤ pitchRangeCents) over this window, entirely after the onset. */
-  pitchWindowMs: number;
-  pitchRangeCents: number;
-  /** A pluck must be recognised within this time after its onset. */
-  maxAcceptAfterOnsetMs: number;
-  /** Analyse but never accept (used by the gauntlet's octave scan). */
+  /** Analyse but never accept (gauntlet octave scans). */
   neverAccept?: boolean;
 }
 
-export const SUNG_DEFAULTS: Omit<MatchConfig, 'targetMidi' | 'toleranceCents' | 'mode'> = {
-  kind: 'sung',
-  minClarity: 0.7,
-  minDb: -75,
+const COMMON = {
+  minDb: -78,
   graceMs: 80,
+  ignoreMidi: undefined,
   smoothMs: 160,
   trendMs: 180,
   maxTrendCents: 14,
-  minDbSlope: -5,
   jumpCents: 200,
   holdMs: 500,
+  minDbSlope: -5,
   onsetRiseDb: 6,
+  pitchWindowMs: 120,
+  maxStepCents: 30,
+  maxIdentityMs: 800,
   decaySegMs: 100,
   minSegDecayDb: 0.4,
-  decayStartSlackMs: 200,
-  maxReswellDb: 3,
-  pitchWindowMs: 160,
-  pitchRangeCents: 25,
-  maxAcceptAfterOnsetMs: 1200,
+};
+
+export const SUNG_DEFAULTS: Omit<MatchConfig, 'targetMidi' | 'toleranceCents' | 'mode'> = {
+  ...COMMON,
+  kind: 'sung',
+  strict: false,
+  minClarity: 0.7,
 };
 
 export const PLUCKED_DEFAULTS: Omit<MatchConfig, 'targetMidi' | 'toleranceCents' | 'mode'> = {
-  ...SUNG_DEFAULTS,
+  ...COMMON,
   kind: 'plucked',
-  // Low: a quiet pluck in a noisy room still has a clear pitch; the onset + decay + steady-pitch
-  // requirements are what keep noise, speech and voices out.
+  strict: false,
   minClarity: 0.55,
 };
 
+export type MatchHint =
+  /** guitar step: the right pitch is sounding but nothing was plucked (a voice, or a note still ringing) */
+  | 'noAttack'
+  /** guitar step: the plucked note is the right note in the wrong octave */
+  | 'octaveHigh'
+  | 'octaveLow'
+  /** pitch still gliding/sliding */
+  | 'moving'
+  /** singing step: the guitar note from the previous step is still ringing */
+  | 'carryOver'
+  /** strict mode only */
+  | 'sustained'
+  | 'decaying';
+
 export interface MatchState {
-  /** True when the current frame passes level + clarity gating. */
   voiced: boolean;
-  /** True when a trustworthy pitch is being reported. */
   stable: boolean;
-  /** Smoothed detected pitch as fractional MIDI, or null. */
+  /** Detected pitch as fractional MIDI (for the meter), or null. */
   detectedMidi: number | null;
-  /** Smoothed deviation from the target in cents (octave-folded in pitchClass mode), or null. */
+  /** Deviation from the target in cents (octave-folded in pitchClass mode), or null. */
   cents: number | null;
   inTolerance: boolean;
-  /** 0..1 progress towards acceptance. */
   progress: number;
   accepted: boolean;
   acceptedAt: number | null;
-  /** Mean |cents| over the frames that justified the accept. */
   meanAbsCents: number | null;
-  /** Number of wrong notes held / plucked (attempts that missed). */
   wrongAttempts: number;
-  /**
-   * Why the right pitch is not being accepted, for user feedback:
-   * 'sustained' — a held tone during the guitar step (sounds like singing);
-   * 'decaying'  — a dying, plucked-sounding tone during the singing step;
-   * 'moving'    — pitch still gliding/sliding.
-   */
-  hint: 'sustained' | 'decaying' | 'moving' | null;
+  hint: MatchHint | null;
 }
-
-const MAINS_HZ = [50, 60, 100, 120, 150, 180, 200, 240];
 
 interface Rec {
   t: number;
   db: number;
   clarity: number;
-  /** fractional midi if voiced */
   midi: number | null;
+  up: number;
+  nsdf?: Float32Array;
+  sr?: number;
 }
 
 function median(xs: number[]): number {
   const s = [...xs].sort((a, b) => a - b);
   const m = s.length >> 1;
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+function mean(xs: number[]): number {
+  return xs.reduce((a, b) => a + b, 0) / xs.length;
 }
 
 function slope(ts: number[], ys: number[]): number {
@@ -166,30 +186,33 @@ interface Candidate {
   onsetT: number;
   peakT: number;
   peakDb: number;
-  runMin: number;
-  state: 'pending' | 'confirmed' | 'rejected';
-  counted: boolean;
-  /** upClarity just before the onset (ringing lower-octave note). */
-  preUp: number;
+  /** pitched sound sounding just before the attack (a ringing note), if any */
   preMidi: number | null;
-  /** Median pitch of the latest steady post-onset window, if any. */
-  goodMidi: number | null;
+  /** frames just before the attack, for "what changed" periodicity checks */
+  pre: Rec[];
+  identity: number | null;
+  lastWindowMidi: number | null;
+  done: boolean;
+  counted: boolean;
+  decay: 'pending' | 'confirmed' | 'rejected';
 }
 
 export class NoteMatcher {
   readonly cfg: MatchConfig;
   private hist: Rec[] = [];
   private state: MatchState;
+  private firstT: number | null = null;
   // sung
-  private seg: { t: number; c: number; db: number }[] = []; // current continuous sung segment (cents vs target, unfolded)
+  private seg: { t: number; c: number; db: number }[] = [];
   private sm1: { t: number; v: number }[] = [];
   private sm2: { t: number; v: number }[] = [];
+  private segFirstT: number | null = null;
+  private segOnset = false;
   private lastVoicedT = -Infinity;
   private lastCountedWrong: number | null = null;
   // plucked
   private cand: Candidate | null = null;
   private lastOnsetT = -Infinity;
-  private upHist: { t: number; up: number; midi: number | null }[] = [];
 
   constructor(cfg: MatchConfig) {
     this.cfg = cfg;
@@ -212,23 +235,26 @@ export class NoteMatcher {
   push(f: PitchFrame): MatchState {
     if (this.state.accepted) return this.state;
     const c = this.cfg;
-    const db = rmsToDb(f.rms);
+    this.firstT ??= f.t;
+    const db = rmsToDb(f.cleanRms ?? f.rms);
     const voiced = f.freq > 0 && f.clarity >= c.minClarity && db >= c.minDb && f.freq >= 55 && f.freq <= 1700;
     const midi = voiced ? freqToMidi(f.freq) : null;
-    this.hist.push({ t: f.t, db, clarity: f.clarity, midi });
+    this.hist.push({ t: f.t, db, clarity: f.clarity, midi, up: f.upClarity ?? 0, nsdf: f.nsdf, sr: f.sr });
     while (this.hist.length && this.hist[0].t < f.t - 2.5) this.hist.shift();
+    // keep the (large) NSDF copies only for the last ~0.6 s
+    for (let i = this.hist.length - 1; i >= 0 && this.hist[i].t >= f.t - 0.8; i--) {
+      if (this.hist[i].t < f.t - 0.6) this.hist[i].nsdf = undefined;
+    }
     this.state = c.kind === 'sung' ? this.pushSung(f, db, midi) : this.pushPlucked(f, db, midi);
     return this.state;
   }
 
   private displayMidi(): number | null {
-    // The meter is stricter than the decision gate in plucked mode: weak-clarity frames (a
-    // decayed note mixed with hum) are where sub-octave misreads happen.
+    // The meter is stricter than the decision gate for plucked notes: weak-clarity frames (a
+    // dying note mixed with hum) are where sub-octave misreads happen.
     const minClar = this.cfg.kind === 'plucked' ? 0.8 : 0;
     let recent = this.hist.slice(-3).filter((r) => r.clarity >= minClar).map((r) => r.midi).filter((m): m is number => m !== null);
-    // A plucked string cannot jump an octave (or fifth) without a new attack: such readings of
-    // the note being tracked are detector misreads (e.g. a dying note mixed with hum).
-    const g = this.cand && this.cand.state !== 'rejected' ? this.cand.goodMidi : null;
+    const g = this.cand && !this.cand.done ? this.cand.identity : null;
     if (this.cfg.kind === 'plucked' && g !== null) {
       recent = recent.filter((m) => ![7, 12, 19, 24].some((iv) => Math.abs(Math.abs(m - g) - iv) < 0.6));
     }
@@ -237,35 +263,34 @@ export class NoteMatcher {
 
   // ------------------------------------------------------------------ sung
 
+  private resetSeg(): void {
+    this.seg = [];
+    this.sm1 = [];
+    this.sm2 = [];
+    this.segFirstT = null;
+  }
+
   private pushSung(f: PitchFrame, db: number, midi: number | null): MatchState {
     const c = this.cfg;
     const s = this.state;
     if (midi === null) {
       if ((f.t - this.lastVoicedT) * 1000 > c.graceMs) {
-        this.seg = [];
-        this.sm1 = [];
-        this.sm2 = [];
+        this.resetSeg();
         return { ...s, voiced: false, stable: false, detectedMidi: null, cents: null, inTolerance: false, progress: 0, hint: null };
       }
       return { ...s, voiced: false };
     }
     this.lastVoicedT = f.t;
-    // Unfolded cents relative to the target; in pitchClass mode fold each note to the target's
-    // nearest octave, but keep continuity with the previous frame (no wrap jumps).
     let cents = this.deviation(midi);
     if (c.mode === 'pitchClass' && this.seg.length) {
       const prev = this.seg[this.seg.length - 1].c;
       while (cents - prev > 600) cents -= 1200;
       while (prev - cents > 600) cents += 1200;
     }
-    if (this.seg.length && Math.abs(cents - this.seg[this.seg.length - 1].c) > c.jumpCents) {
-      this.seg = [];
-      this.sm1 = [];
-      this.sm2 = [];
-    }
+    if (this.seg.length && Math.abs(cents - this.seg[this.seg.length - 1].c) > c.jumpCents) this.resetSeg();
     if (!this.seg.length) {
       this.segFirstT = f.t;
-      // Did this note start with an attack (rise from a quieter level), or was it already there?
+      // Did this note start with an attack inside this step, or was it already sounding?
       const prior = this.hist.filter((r) => r.t < f.t - 1e-6 && r.t >= f.t - 0.4);
       this.segOnset = prior.length > 0 && db - Math.min(...prior.map((r) => r.db)) >= 6;
     }
@@ -273,61 +298,54 @@ export class NoteMatcher {
     const horizon = f.t - (c.holdMs + 200) / 1000;
     while (this.seg.length && this.seg[0].t < horizon) this.seg.shift();
 
-    // Two-stage moving average.
     const w = c.smoothMs / 1000;
     const in1 = this.seg.filter((p) => p.t > f.t - w);
-    const v1 = in1.reduce((a, p) => a + p.c, 0) / in1.length;
+    const v1 = mean(in1.map((p) => p.c));
     this.sm1.push({ t: f.t, v: v1 });
     while (this.sm1.length && this.sm1[0].t < horizon) this.sm1.shift();
     const in2 = this.sm1.filter((p) => p.t > f.t - w);
-    const v2 = in2.reduce((a, p) => a + p.v, 0) / in2.length;
+    const v2 = mean(in2.map((p) => p.v));
     this.sm2.push({ t: f.t, v: v2 });
     while (this.sm2.length && this.sm2[0].t < horizon) this.sm2.shift();
 
-    const segStart = this.segStartT();
-    const age = (f.t - segStart) * 1000;
-    const settledAge = 2 * c.smoothMs + c.trendMs;
-    const display = v1; // single-stage average: responsive, vibrato mostly damped
+    const age = (f.t - (this.segFirstT ?? f.t)) * 1000;
+    const settledAge = Math.max(2 * c.smoothMs + c.trendMs, c.holdMs);
     const inTolNow = Math.abs(v2) <= c.toleranceCents;
 
-    let hint: MatchState['hint'] = null;
+    let hint: MatchHint | null = null;
     let accepted = false;
     let wrong = s.wrongAttempts;
     let meanAbs: number | null = null;
-    if (age >= Math.max(settledAge, c.holdMs) - 10) {
+    if (age >= settledAge - 10) {
       const old = this.sm2.find((p) => p.t >= f.t - c.trendMs / 1000 - 1e-6);
       const trend = old ? Math.abs(v2 - old.v) : Infinity;
       const win = this.seg.filter((p) => p.t > f.t - c.holdMs / 1000);
-      const dbSlope = slope(win.map((p) => p.t), win.map((p) => p.db));
-      // Speech: syllables leave unvoiced gaps and wander far from the smoothed centre.
       const span = this.hist.filter((r) => r.t > f.t - c.holdMs / 1000);
       const voicedFrac = span.length ? span.filter((r) => r.midi !== null).length / span.length : 0;
       const wander = Math.max(...win.map((p) => Math.abs(p.c - v2)));
-      const steady = trend <= c.maxTrendCents && voicedFrac >= 0.96 && wander <= 190;
-      // Sustained = no plucked-string behaviour anywhere in the window: neither half may be
-      // dying away fast, and there must be no re-attack (repeated plucks look "sustained" on
-      // average).
-      const mid = f.t - c.holdMs / 2000;
-      const h1 = win.filter((p) => p.t <= mid);
-      const h2 = win.filter((p) => p.t > mid);
-      const s1 = slope(h1.map((p) => p.t), h1.map((p) => p.db));
-      const s2 = slope(h2.map((p) => p.t), h2.map((p) => p.db));
-      let maxRise = 0;
-      for (let i = 0; i < win.length; i++) {
-        let lo = Infinity;
-        for (let j = i - 1; j >= 0 && win[i].t - win[j].t <= 0.1 + 1e-6; j--) lo = Math.min(lo, win[j].db);
-        if (lo < Infinity) maxRise = Math.max(maxRise, win[i].db - lo);
+      const steady = trend <= c.maxTrendCents && voicedFrac >= 0.9 && wander <= 220;
+      const dbSlope = slope(win.map((p) => p.t), win.map((p) => p.db));
+      // Carry-over guard: a sound that was already there when the step opened, at the exact
+      // pitch of the previous (possibly still ringing) note, only counts once it stops dying away
+      // (i.e. a voice is actually holding it).
+      const fromStart = !this.segOnset && this.segFirstT !== null && this.firstT !== null && this.segFirstT - this.firstT < 0.1;
+      const sungMidi = this.cfg.targetMidi + v2 / 100 + Math.round((midi - (this.cfg.targetMidi + v2 / 100)) / 12) * 12;
+      const carry = fromStart && c.carryMidi !== undefined && Math.abs(sungMidi - c.carryMidi) < 0.6 && dbSlope < -3;
+      let sustainedOk = true;
+      if (c.strict) {
+        const mid = f.t - c.holdMs / 2000;
+        const h1 = win.filter((p) => p.t <= mid);
+        const h2 = win.filter((p) => p.t > mid);
+        const s1 = slope(h1.map((p) => p.t), h1.map((p) => p.db));
+        const s2 = slope(h2.map((p) => p.t), h2.map((p) => p.db));
+        sustainedOk = dbSlope >= c.minDbSlope && s1 >= 2 * c.minDbSlope && s2 >= 2 * c.minDbSlope;
       }
-      const sustained = dbSlope >= c.minDbSlope && s1 >= 2 * c.minDbSlope && s2 >= 2 * c.minDbSlope && maxRise < 9;
-      // Mains hum (50/60 Hz and low harmonics) is steady, exactly on frequency and has no attack.
-      // A note within 8 cents of one of those frequencies only counts if it started with an attack.
-      const hz = midiToFreq(median(win.map((p) => p.c)) / 100 + this.cfg.targetMidi + this.octaveOffset(midi));
-      const humLike = MAINS_HZ.some((m) => Math.abs(1200 * Math.log2(hz / m)) < 8) && !this.segOnset;
       if (!steady) hint = 'moving';
-      else if (!sustained) hint = 'decaying';
-      if (steady && sustained && !humLike) {
+      else if (carry) hint = 'carryOver';
+      else if (!sustainedOk) hint = 'decaying';
+      if (steady && !carry && sustainedOk) {
         if (inTolNow) {
-          accepted = true;
+          accepted = !c.neverAccept;
           meanAbs = Math.abs(v2);
         } else {
           const rounded = Math.round(this.cfg.targetMidi + v2 / 100);
@@ -338,25 +356,13 @@ export class NoteMatcher {
         }
       }
     }
-    const progress = inTolNow || Math.abs(display) <= c.toleranceCents ? Math.min(1, age / Math.max(settledAge, c.holdMs)) : 0;
+    const progress = Math.abs(v1) <= c.toleranceCents ? Math.min(1, age / settledAge) : 0;
     return {
       voiced: true, stable: true, detectedMidi: this.displayMidi(),
-      cents: display, inTolerance: Math.abs(display) <= c.toleranceCents, progress: accepted ? 1 : progress,
-      accepted, acceptedAt: accepted ? f.t : null, meanAbsCents: meanAbs, wrongAttempts: wrong, hint,
+      cents: v1, inTolerance: Math.abs(v1) <= c.toleranceCents, progress: accepted ? 1 : progress,
+      accepted, acceptedAt: accepted ? f.t : null, meanAbsCents: meanAbs, wrongAttempts: wrong, hint: accepted ? null : hint,
     };
   }
-
-  /** Octave (in semitones) between the folded target-relative value and the sung pitch. */
-  private octaveOffset(midi: number): number {
-    const last = this.seg[this.seg.length - 1];
-    return Math.round((midi - (this.cfg.targetMidi + last.c / 100)) / 12) * 12;
-  }
-
-  private segStartT(): number {
-    return this.segFirstT ?? Infinity;
-  }
-  private segFirstT: number | null = null;
-  private segOnset = false;
 
   // ------------------------------------------------------------------ plucked
 
@@ -364,130 +370,162 @@ export class NoteMatcher {
     const c = this.cfg;
     const s = this.state;
     const t = f.t;
-    this.upHist.push({ t, up: f.upClarity ?? 0, midi });
-    while (this.upHist.length && this.upHist[0].t < t - 0.5) this.upHist.shift();
+    const hist = this.hist;
+    const n = hist.length;
 
-    // ---- onset
-    const before = this.hist.filter((r) => r.t >= t - 0.14 - 1e-6 && r.t <= t - 0.04 + 1e-6);
+    // ---- new attack: a level jump, or a clean jump to a new steady pitch (hammer-on, legato)
+    let onset = false;
+    const before = hist.filter((r) => r.t >= t - 0.14 - 1e-6 && r.t <= t - 0.04 + 1e-6);
+    const prevDb = n >= 2 ? hist[n - 2].db : -Infinity;
     if (before.length >= 2 && t - this.lastOnsetT >= 0.08) {
       const minBefore = Math.min(...before.map((r) => r.db));
-      const prevDb = this.hist.length >= 2 ? this.hist[this.hist.length - 2].db : -Infinity;
-      // An attack: well above the level of 40–140 ms ago, and still rising at this frame.
-      if (db - minBefore >= c.onsetRiseDb && db >= c.minDb && db > prevDb + 1) {
-        const pre = this.upHist.filter((u) => u.t < t - 0.03);
-        const preUps = pre.slice(-4).map((u) => u.up);
-        const preMidis = pre.slice(-4).map((u) => u.midi).filter((m): m is number => m !== null);
-        this.cand = {
-          onsetT: t, peakT: t, peakDb: db, runMin: db, state: 'pending', counted: false,
-          preUp: preUps.length ? Math.max(...preUps) : 0, preMidi: preMidis.length ? median(preMidis) : null,
-          goodMidi: null,
-        };
-        this.lastOnsetT = t;
+      if (db - minBefore >= c.onsetRiseDb && db >= c.minDb && db > prevDb + 1) onset = true;
+    }
+    if (!onset && n >= 6 && t - this.lastOnsetT >= 0.15) {
+      const last = hist.slice(-3).map((r) => r.midi);
+      const prior = hist.slice(-6, -3).map((r) => r.midi);
+      if (last.every((m) => m !== null) && prior.every((m) => m !== null)) {
+        const l = last as number[];
+        const p = prior as number[];
+        if (Math.max(...l) - Math.min(...l) <= 0.4 && Math.max(...p) - Math.min(...p) <= 0.4 && Math.abs(median(l) - median(p)) >= 0.8) onset = true;
       }
+    }
+    if (onset) {
+      const pre = hist.filter((r) => r.t >= t - 0.3 && r.t <= t - 0.04 + 1e-6);
+      const preVoiced = pre.filter((r) => r.midi !== null && r.clarity >= 0.75).map((r) => r.midi as number);
+      this.cand = {
+        onsetT: t, peakT: t, peakDb: db,
+        preMidi: preVoiced.length >= 3 ? median(preVoiced) : null,
+        pre: pre.slice(-6),
+        identity: null, lastWindowMidi: null, done: false, counted: false, decay: 'pending',
+      };
+      this.lastOnsetT = t;
     }
 
     const cand = this.cand;
-    let hint: MatchState['hint'] = null;
-    if (cand && cand.state !== 'rejected') {
+    let hint: MatchHint | null = null;
+    let accepted = false;
+    let wrong = s.wrongAttempts;
+    let accMidi: number | null = null;
+
+    if (cand && !cand.done) {
+      if (t - cand.onsetT > c.maxIdentityMs / 1000) cand.done = true;
       if (t - cand.onsetT <= 0.1 && db > cand.peakDb) {
         cand.peakDb = db;
         cand.peakT = t;
-        cand.runMin = db;
-      } else if (t > cand.peakT) {
-        cand.runMin = Math.min(cand.runMin, db);
-        if (db > cand.runMin + c.maxReswellDb) cand.state = 'rejected';
       }
-      const seg = c.decaySegMs / 1000;
-      if (cand.state === 'pending' && t >= cand.peakT + 2 * seg - 1e-6) {
-        // Free decay: the level falls in each of two consecutive segments. The segments start at
-        // the peak, or a little later (up to decayStartSlackMs) because room reflections can hold
-        // the level up briefly after the attack.
-        const mean = (a: number, b: number) => {
-          const xs = this.hist.filter((r) => r.t >= a - 1e-6 && r.t <= b + 1e-6).map((r) => r.db);
-          return xs.length ? xs.reduce((x, y) => x + y, 0) / xs.length : NaN;
-        };
-        const s0 = t - 2 * seg;
-        const m0 = mean(s0, s0 + 0.03);
-        const m1 = mean(s0 + seg - 0.02, s0 + seg + 0.02);
-        const m2 = mean(t - 0.04, t);
-        // A string rings continuously; speech has unvoiced gaps between syllables.
-        const gaps = this.hist.filter((r) => r.t >= cand.peakT - 1e-6 && r.midi === null).length;
-        if (m0 - m1 >= c.minSegDecayDb && m1 - m2 >= c.minSegDecayDb && gaps <= 1) cand.state = 'confirmed';
-        else if (s0 >= cand.peakT + c.decayStartSlackMs / 1000) {
-          cand.state = 'rejected';
-          hint = 'sustained';
+      if (c.strict) this.strictDecay(cand, t);
+    }
+
+    if (cand && !cand.done && t >= cand.onsetT + 0.04) {
+      const W = c.pitchWindowMs / 1000;
+      const from = Math.max(t - W, cand.onsetT + 0.04);
+      const win = hist.filter((r) => r.t > from - 1e-6);
+      const span = (t - from) * 1000;
+      const vw = win.filter((r) => r.midi !== null);
+      if (span >= c.pitchWindowMs - 25 && vw.length >= win.length - 1 && vw.length >= 3) {
+        let midis = vw.map((r) => r.midi as number);
+        // New note an octave above a still-ringing note: the detector keeps reporting the lower,
+        // common period, but periodicity one octave up jumped with this attack.
+        if (cand.preMidi !== null && Math.abs(median(midis) - cand.preMidi) < 0.5) {
+          const upHz = midiToFreq(cand.preMidi + 12);
+          const post = median(vw.map((r) => periodicityAt(r.nsdf, r.sr ?? 48000, upHz) || r.up));
+          const preUp = cand.pre.length ? median(cand.pre.map((r) => periodicityAt(r.nsdf, r.sr ?? 48000, upHz) || r.up)) : 0;
+          if (post >= 0.8 && post - preUp >= 0.25) midis = midis.map((m) => m + 12);
+        }
+        const half = Math.floor(midis.length / 2);
+        const a = mean(midis.slice(0, half));
+        const b = mean(midis.slice(midis.length - half));
+        const steady = Math.abs(a - b) * 100 <= c.maxStepCents && (Math.max(...midis) - Math.min(...midis)) * 100 <= 150;
+        if (steady) {
+          const wm = median(midis);
+          if (cand.lastWindowMidi !== null && Math.abs(wm - cand.lastWindowMidi) > 1.0) {
+            // the reading jumped (octave flip of a dying note, hum): this attack is not trusted any more
+            cand.done = true;
+          } else {
+            cand.lastWindowMidi = wm;
+            cand.identity ??= wm;
+            const dev = this.deviation(wm);
+            if (Math.abs(dev) <= c.toleranceCents) {
+              if (!c.strict || cand.decay === 'confirmed') {
+                accepted = !c.neverAccept;
+                accMidi = wm;
+              } else if (cand.decay === 'rejected') {
+                hint = 'sustained';
+              }
+            } else {
+              const d = wm - this.cfg.targetMidi;
+              if (Math.abs(d - 12) < 0.5) hint = 'octaveHigh';
+              else if (Math.abs(d + 12) < 0.5) hint = 'octaveLow';
+              if (!cand.counted && t - cand.onsetT >= 0.1) {
+                if (Math.round(wm) !== c.ignoreMidi) wrong++;
+                cand.counted = true;
+              }
+            }
+          }
+        } else {
+          hint = 'moving';
+        }
+        // Target-aware fallback for mixtures (a new note over a different ringing note can make
+        // the detector report a common sub-harmonic): accept when periodicity at the target
+        // appeared with this attack, there is no periodicity an octave above it, and the blind
+        // reading is not the target's octave neighbour.
+        if (!accepted && !c.strict && !c.neverAccept && !cand.done) {
+          const tHz = midiToFreq(this.cfg.targetMidi);
+          const withN = vw.filter((r) => r.nsdf);
+          if (withN.length >= 3 && cand.pre.length) {
+            const sr = withN[0].sr ?? 48000;
+            const postT = median(withN.map((r) => periodicityAt(r.nsdf, sr, tHz)));
+            const postUp = median(withN.map((r) => periodicityAt(r.nsdf, sr, tHz * 2)));
+            const preT = median(cand.pre.map((r) => (r.nsdf ? periodicityAt(r.nsdf, sr, tHz) : 0)));
+            const blind = median(midis);
+            const octaveReading = [12, -12, 24, -24].some((iv) => Math.abs(blind - (this.cfg.targetMidi + iv)) < 0.5);
+            const targetReading = Math.abs(blind - this.cfg.targetMidi) < 0.5;
+            if (postT >= 0.75 && postUp <= 0.6 && postT - preT >= 0.25 && !octaveReading && !targetReading) {
+              accepted = true;
+              accMidi = this.cfg.targetMidi;
+            }
+          }
         }
       }
-      if (t - cand.onsetT > c.maxAcceptAfterOnsetMs / 1000) cand.state = 'rejected';
-    } else if (cand && cand.state === 'rejected' && t - cand.onsetT < 1.5) {
-      hint = 'sustained';
     }
 
-    // New note an octave above a still-ringing note: the detector keeps reporting the lower
-    // (ringing) pitch, but periodicity at half its period jumped with this onset. Re-read such
-    // frames an octave up. Only after an onset, only when that same lower note was already
-    // ringing before it, and only for the octave below the target.
-    if (cand && c.mode === 'exact' && cand.preMidi !== null && midi !== null && t > cand.onsetT) {
-      const up = f.upClarity ?? 0;
-      if (
-        Math.abs(midi - cand.preMidi) < 0.5 &&
-        Math.abs(midi - (c.targetMidi - 12)) < 0.5 &&
-        up >= 0.8 &&
-        up - cand.preUp >= 0.25
-      ) {
-        this.hist[this.hist.length - 1].midi = midi + 12;
-      }
-    }
-
-    // ---- pitch over a window entirely after the onset
     const disp = this.displayMidi();
-    if (cand && cand.state !== 'rejected') {
-      const from = Math.max(t - c.pitchWindowMs / 1000, cand.onsetT + 0.04);
-      const win = this.hist.filter((r) => r.t > from - 1e-6);
-      const span = (t - from) * 1000;
-      const voicedWin = win.filter((r) => r.midi !== null) as { t: number; db: number; midi: number }[];
-      if (span >= c.pitchWindowMs - 25 && voicedWin.length >= win.length - 1 && voicedWin.length >= 5) {
-        const midis = voicedWin.map((r) => r.midi);
-        const range = (Math.max(...midis) - Math.min(...midis)) * 100;
-        if (range <= c.pitchRangeCents) {
-          // Remember the latest steady window: the pitch may already be clear before the decay
-          // has been confirmed (and a ringing neighbour may take over the detector later).
-          cand.goodMidi = median(midis);
-        } else if (!hint) hint = 'moving';
-      }
-    }
-    const windowMidi = cand && cand.state !== 'rejected' ? cand.goodMidi : null;
-    const windowDev = windowMidi !== null ? this.deviation(windowMidi) : null;
-    const pitchOk = windowMidi !== null;
-
-    let wrong = s.wrongAttempts;
-    let accepted = false;
-    if (cand && cand.state === 'confirmed' && pitchOk && windowDev !== null) {
-      if (Math.abs(windowDev) <= c.toleranceCents) {
-        accepted = !c.neverAccept;
-      } else if (!cand.counted && windowMidi !== null) {
-        const rounded = Math.round(windowMidi);
-        if (rounded !== c.ignoreMidi) wrong++;
-        cand.counted = true;
-      }
-    }
-    const cents = accepted && windowDev !== null ? windowDev : disp !== null ? this.deviation(disp) : null;
+    const cents = accepted && accMidi !== null ? this.deviation(accMidi) : disp !== null ? this.deviation(disp) : null;
     const inTol = cents !== null && Math.abs(cents) <= c.toleranceCents;
-    let progress = 0;
-    if (cand && cand.state !== 'rejected' && inTol) progress = cand.state === 'confirmed' ? 0.8 : Math.min(0.7, (t - cand.onsetT) / 0.35);
+    // The right pitch is sounding but nothing opened a candidate: a voice, or a note still ringing.
+    if (!accepted && !hint && inTol && (!cand || cand.done || t - cand.onsetT > 0.4)) hint = 'noAttack';
     return {
       voiced: midi !== null,
       stable: disp !== null,
-      detectedMidi: accepted && windowMidi !== null ? windowMidi : disp,
+      detectedMidi: accepted && accMidi !== null ? accMidi : disp,
       cents,
       inTolerance: inTol,
-      progress: accepted ? 1 : progress,
+      progress: accepted ? 1 : 0,
       accepted,
       acceptedAt: accepted ? t : null,
-      meanAbsCents: accepted && windowDev !== null ? Math.abs(windowDev) : null,
+      meanAbsCents: accepted && cents !== null ? Math.abs(cents) : null,
       wrongAttempts: wrong,
       hint: accepted ? null : hint,
     };
+  }
+
+  /** Strict mode: the level must fall freely after the attack (two consecutive segments). */
+  private strictDecay(cand: Candidate, t: number): void {
+    const c = this.cfg;
+    if (cand.decay !== 'pending') return;
+    const seg = c.decaySegMs / 1000;
+    if (t < cand.peakT + 2 * seg - 1e-6) return;
+    const meanDb = (a: number, b: number) => {
+      const xs = this.hist.filter((r) => r.t >= a - 1e-6 && r.t <= b + 1e-6).map((r) => r.db);
+      return xs.length ? mean(xs) : NaN;
+    };
+    const s0 = t - 2 * seg;
+    const m0 = meanDb(s0, s0 + 0.03);
+    const m1 = meanDb(s0 + seg - 0.02, s0 + seg + 0.02);
+    const m2 = meanDb(t - 0.04, t);
+    if (m0 - m1 >= c.minSegDecayDb && m1 - m2 >= c.minSegDecayDb) cand.decay = 'confirmed';
+    else if (s0 >= cand.peakT + 0.2) cand.decay = 'rejected';
   }
 }
 
@@ -500,14 +538,14 @@ export class StablePitch {
   private smooth: number[] = [];
   private lastVoicedT = -Infinity;
   private minClarity = 0.8;
-  private minDb = -75;
+  private minDb = -78;
   private stableFrames = 3;
   private stableCents = 40;
   private smoothFrames = 5;
   private graceMs = 80;
 
   push(f: PitchFrame): number | null {
-    const voiced = f.freq > 0 && f.clarity >= this.minClarity && rmsToDb(f.rms) >= this.minDb;
+    const voiced = f.freq > 0 && f.clarity >= this.minClarity && rmsToDb(f.cleanRms ?? f.rms) >= this.minDb;
     if (!voiced) {
       if ((f.t - this.lastVoicedT) * 1000 > this.graceMs) {
         this.recent = [];

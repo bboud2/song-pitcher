@@ -13,6 +13,24 @@ export interface PitchResult {
   rms: number;
   /** NSDF height at half the detected period (periodicity one octave up), 0 if none. */
   upClarity?: number;
+  /** RMS after stationary-noise removal (equals rms when denoising is off). */
+  cleanRms?: number;
+  /** Copy of the NSDF (index = lag in samples) for target-aware periodicity checks. */
+  nsdf?: Float32Array;
+}
+
+/**
+ * Periodicity (NSDF height) of a frame at a given frequency: the highest NSDF value within
+ * ±2.5 % of that period. 0 when unknown or out of range.
+ */
+export function periodicityAt(nsdf: Float32Array | undefined, sampleRate: number, hz: number): number {
+  if (!nsdf || !(hz > 0)) return 0;
+  const lag = sampleRate / hz;
+  const lo = Math.max(2, Math.floor(lag * 0.975));
+  const hi = Math.min(nsdf.length - 1, Math.ceil(lag * 1.025));
+  let best = 0;
+  for (let k = lo; k <= hi; k++) if (nsdf[k] > best) best = nsdf[k];
+  return best;
 }
 
 export interface PitchDetectorOptions {
@@ -24,6 +42,13 @@ export interface PitchDetectorOptions {
   cutoff?: number;
   /** A lobe at twice the chosen lag wins if it is this much more periodic. Default 0.04. */
   octaveMargin?: number;
+  /**
+   * Remove stationary noise (fan, hiss, mains hum) before pitch analysis: a per-bin noise
+   * spectrum is tracked (smoothed periodogram, fast-down / slow-up minimum, about +3 dB/s) and
+   * subtracted from each frame's power spectrum. Needs `hopSec` to set the rise rate.
+   */
+  denoise?: boolean;
+  hopSec?: number;
 }
 
 class FFT {
@@ -90,6 +115,10 @@ export class PitchDetector {
   private maxLag: number;
   private cutoff: number;
   private octaveMargin: number;
+  private denoise: boolean;
+  private rise: number;
+  private smooth: Float64Array | null = null;
+  private noise: Float64Array | null = null;
   private fft: FFT;
   private re: Float64Array;
   private im: Float64Array;
@@ -103,6 +132,8 @@ export class PitchDetector {
     const maxFreq = opts.maxFreq ?? 1200;
     this.cutoff = opts.cutoff ?? 0.9;
     this.octaveMargin = opts.octaveMargin ?? 0.04;
+    this.denoise = opts.denoise ?? false;
+    this.rise = Math.pow(10, (3 * (opts.hopSec ?? 0.02)) / 10); // +3 dB per second
     this.minLag = Math.max(2, Math.floor(sampleRate / maxFreq));
     this.maxLag = Math.min(Math.floor(size * 0.6), Math.ceil(sampleRate / minFreq));
     let n = 1;
@@ -130,16 +161,40 @@ export class PitchDetector {
       energy += v * v;
     }
     const rms = Math.sqrt(energy / N);
-    if (energy < 1e-12) return { freq: 0, clarity: 0, rms };
+    if (energy < 1e-12) return { freq: 0, clarity: 0, rms, cleanRms: 0 };
 
     // Autocorrelation via FFT: r = IFFT(|X|^2)
     this.fft.transform(re, im, false);
-    for (let i = 0; i < re.length; i++) {
+    const nb = re.length;
+    for (let i = 0; i < nb; i++) {
       re[i] = re[i] * re[i] + im[i] * im[i];
       im[i] = 0;
     }
+    let cleanFactor = 1;
+    if (this.denoise) {
+      if (!this.smooth || !this.noise) {
+        this.smooth = Float64Array.from(re);
+        this.noise = Float64Array.from(re);
+      }
+      const sm = this.smooth;
+      const nz = this.noise;
+      let before = 0;
+      let after = 0;
+      for (let i = 0; i < nb; i++) {
+        const p = re[i];
+        sm[i] = 0.8 * sm[i] + 0.2 * p;
+        nz[i] = Math.min(nz[i] * this.rise, sm[i]);
+        // over-subtract (the running minimum under-estimates the mean noise power), keep a floor
+        const c = Math.max(p - 3 * nz[i], 0.03 * p);
+        before += p;
+        after += c;
+        re[i] = c;
+      }
+      cleanFactor = before > 0 ? after / before : 1;
+    }
     this.fft.transform(re, im, true);
     const scale = 1 / re.length;
+    const cleanRms = rms * Math.sqrt(cleanFactor);
 
     // NSDF with running m(tau) = sum_{j} x_j^2 + x_{j+tau}^2
     const nsdf = this.nsdf;
@@ -150,7 +205,9 @@ export class PitchDetector {
       const a = frame[off + tau - 1] - mean;
       const b = frame[off + N - tau] - mean;
       m -= a * a + b * b;
-      nsdf[tau] = m > 1e-12 ? (2 * re[tau] * scale) / m : 0;
+      // with denoising, the energy terms are scaled by the same factor as the spectrum
+      const mm = m * cleanFactor;
+      nsdf[tau] = mm > 1e-12 ? (2 * re[tau] * scale) / mm : 0;
     }
 
     // Key maxima: highest point of each positive lobe after the first negative zero crossing.
@@ -176,7 +233,7 @@ export class PitchDetector {
 
     let best = -Infinity;
     for (const p of peaks) if (p >= this.minLag && nsdf[p] > best) best = nsdf[p];
-    if (!(best > 0)) return { freq: 0, clarity: 0, rms };
+    if (!(best > 0)) return { freq: 0, clarity: 0, rms, cleanRms, nsdf: Float32Array.from(nsdf) };
     const threshold = this.cutoff * best;
     let chosen = -1;
     for (const p of peaks) {
@@ -185,7 +242,7 @@ export class PitchDetector {
         break;
       }
     }
-    if (chosen < 0) return { freq: 0, clarity: 0, rms };
+    if (chosen < 0) return { freq: 0, clarity: 0, rms, cleanRms, nsdf: Float32Array.from(nsdf) };
 
     // Octave-up guard: when the fundamental is weak (e.g. a vowel formant sitting on the 2nd
     // harmonic), the half-period lobe can clear the MPM cutoff. If a lobe at ~2x the lag is
@@ -221,7 +278,7 @@ export class PitchDetector {
     const lo = Math.max(1, Math.floor(half * 0.97));
     const hi = Math.min(maxLag, Math.ceil(half * 1.03));
     for (let k = lo; k <= hi; k++) if (nsdf[k] > upClarity) upClarity = nsdf[k];
-    return { freq: this.sampleRate / period, clarity: Math.min(1, peakVal), rms, upClarity };
+    return { freq: this.sampleRate / period, clarity: Math.min(1, peakVal), rms, upClarity, cleanRms, nsdf: Float32Array.from(nsdf) };
   }
 }
 
