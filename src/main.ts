@@ -1,5 +1,6 @@
 import './style.css';
 import { StablePitch, type PitchFrame } from './core/matcher.ts';
+import { RoomCheck } from './core/roomcheck.ts';
 import { GUITAR_TOLERANCE_CENTS } from './core/engine.ts';
 import { KEY_NAMES, OPEN_STRINGS, degreeLabel, mod, nearestNote, noteName, solfege } from './core/music.ts';
 import { Session, summarize, type SessionView } from './core/session.ts';
@@ -119,10 +120,10 @@ function homeScreen(): HTMLElement {
       h('p', { class: 'range-line', attrs: { 'data-testid': 'range' } },
         `Range ${noteName(tonic + min, store.keyPc)}–${noteName(tonic + max, store.keyPc)}${firstNoteHint(midis[0] - tonic, midis[0])}`),
     ),
-    h('div', { class: 'actions sticky-actions' },
+    h('div', { class: `actions sticky-actions${resume !== null ? ' two' : ''}` },
       button(h('span', {}, icon('mic', 24), ' Start'), () => void startFlow(null), 'btn primary big', { 'data-testid': 'start' }),
       resume !== null
-        ? button(`Resume at note ${resume + 1}`, () => void startFlow(resume), 'btn secondary', { 'data-testid': 'resume' })
+        ? button(`Resume note ${resume + 1}`, () => void startFlow(resume), 'btn secondary', { 'data-testid': 'resume' })
         : null,
     ),
     last
@@ -191,34 +192,28 @@ function tunerScreen(): HTMLElement {
 
   if (audio.ready) {
     let peakDb = -100;
-    const dbs: number[] = [];
     let heardFrames = 0;
-    let startT: number | null = null;
-    let noteDb = -100;
+    let n = 0;
+    const room = new RoomCheck();
     audio.listen((f) => {
       const db = 20 * Math.log10(Math.max(f.rms, 1e-6));
-      startT ??= f.t;
-      dbs.push(db);
-      if (dbs.length > 150) dbs.shift();
       peakDb = Math.max(db, peakDb - 1.5);
       level.style.width = `${Math.max(0, Math.min(100, ((peakDb + 80) / 70) * 100))}%`;
-      const floorDb = [...dbs].sort((a, b) => a - b)[Math.floor(dbs.length * 0.1)];
       const m = stable.push(f);
-      if (m !== null) {
-        heardFrames++;
-        noteDb = Math.max(noteDb - 0.2, db);
+      if (m !== null) heardFrames++;
+      room.frame(f.t, db, m !== null);
+      if (++n % 10 === 0) {
+        const sp = audio.spectrumDb();
+        if (sp) room.spectrum(sp.db, sp.sampleRate, sp.fftSize);
+        const v = room.verdict();
+        const msg = v.messages.join(' ');
+        if (advice.textContent !== msg) advice.textContent = msg;
+        advice.dataset.level = v.level;
+        advice.dataset.margin = v.marginDb === null ? '' : String(Math.round(v.marginDb));
+        advice.dataset.hum = v.hum === null ? '' : String(v.hum);
       }
-      // Advice: too quiet, too noisy, mains hum.
-      const hz = m === null ? 0 : 440 * Math.pow(2, (m - 69) / 12);
-      const humHz = [50, 60, 100, 120].find((x) => Math.abs(1200 * Math.log2(hz / x)) < 15);
-      let msg = '';
-      if (humHz) msg = `I hear a steady ${humHz} Hz hum (mains/electrical). Move away from chargers, lamps or amplifiers.`;
-      else if (floorDb > -40) msg = 'The room is noisy. Notes may be missed — turn off music/TV or move somewhere quieter.';
-      else if (heardFrames > 10 && noteDb - floorDb < 15) msg = 'Your notes are only a little louder than the background. Move the phone closer or play/sing louder.';
-      else if (startT !== null && f.t - startT > 4 && heardFrames === 0 && peakDb < -55) msg = "I can't hear anything. Check the microphone isn't covered and the phone isn't muted.";
-      else if (heardFrames > 10) msg = 'Sounds good.';
-      if (advice.textContent !== msg) advice.textContent = msg;
-      if (!tunerHeard && heardFrames >= 8 && !humHz) {
+      // Begin needs one heard note; a bad room only warns (an honest student is never blocked).
+      if (!tunerHeard && heardFrames >= 8) {
         tunerHeard = true;
         setReady();
       }
@@ -226,12 +221,13 @@ function tunerScreen(): HTMLElement {
         meter.set(null, 5, { idle: 'Listening…' });
         return;
       }
-      const n = nearestNote(hz);
-      noteEl.textContent = noteName(n.midi);
+      const hz = 440 * Math.pow(2, (m - 69) / 12);
+      const nn = nearestNote(hz);
+      noteEl.textContent = noteName(nn.midi);
       noteEl.classList.remove('placeholder');
       hzEl.textContent = `${hz.toFixed(1)} Hz`;
-      meter.set(n.cents, 5);
-      for (const s of strings.children) (s as HTMLElement).dataset.on = String(Number((s as HTMLElement).dataset.midi) === n.midi);
+      meter.set(nn.cents, 5);
+      for (const st of strings.children) (st as HTMLElement).dataset.on = String(Number((st as HTMLElement).dataset.midi) === nn.midi);
     });
   }
 
@@ -336,7 +332,7 @@ function runListen(delayMs = 0): void {
     const cur = session.view();
     const notes =
       cur.listenKind === 'phrase'
-        ? cur.listenNotes.map((n) => ({ midi: n.midi, sec: Math.max(0.28, (n.beats * 60) / song.bpm) }))
+        ? cur.listenNotes.map((n) => ({ midi: n.midi, sec: Math.max(0.12, (n.beats * 60) / song.bpm) }))
         : [{ midi: cur.targetMidi, sec: 0.9 }];
     const chips = cur.listenKind === 'phrase' ? [...document.querySelectorAll<HTMLElement>('.review-chip')] : [];
     await audio.play(notes, (i) => chips.forEach((c, k) => c.classList.toggle('playing', k === i)));
@@ -355,12 +351,18 @@ async function playKey(): Promise<void> {
   if (!session || keyPlaying) return;
   cancelListen();
   keyPlaying = true;
+  if (session) refresh(session.view(), true);
   const t = session.tonicMidi;
-  const status = document.querySelector<HTMLElement>('[data-testid="status"]');
-  if (status) status.textContent = 'Playing the key (do–mi–sol)…';
   await audio.play([{ midi: t, sec: 0.32 }, { midi: t + 4, sec: 0.32 }, { midi: t + 7, sec: 0.32 }, { midi: t + 12, sec: 0.4 }, { midi: [t, t + 4, t + 7, t + 12], sec: 1.0 }]);
   keyPlaying = false;
-  if (session) refresh(session.view(), true);
+  if (!session) return;
+  // Mid-step the chord would overwrite the student's memory of the target: replay it.
+  const v = session.view();
+  if (v.phase === 'sing' || v.phase === 'play' || v.phase === 'review') {
+    session.replay();
+    refresh(session.view(), true);
+    runListen(250);
+  } else refresh(v, true);
 }
 
 function cancelListen(): void {
@@ -402,7 +404,7 @@ const PHASE_TEXT: Record<string, { label: string; hint: string }> = {
   listen: { label: 'Listen', hint: 'Listen to the note…' },
   sing: { label: 'Sing', hint: 'Sing it back' },
   play: { label: 'Play', hint: 'Find it on guitar — this exact octave' },
-  review: { label: 'Phrase review', hint: 'Play the phrase on guitar, in order' },
+  review: { label: 'Phrase review', hint: 'Play the phrase in order — any speed, let it ring' },
 };
 
 function phaseHint(phase: string): string {
@@ -410,11 +412,27 @@ function phaseHint(phase: string): string {
   return PHASE_TEXT[phase].hint;
 }
 
+/**
+ * Plain-words reasons for "I hear the right pitch but I'm not accepting it". The octave hints
+ * reveal pitch information, so they are only shown with the meter on.
+ */
 const HINT_TEXT: Record<string, Record<string, string>> = {
-  sing: { decaying: 'That sounds like the guitar — sing it', moving: 'Settle on one note…' },
-  play: { sustained: 'That sounds like singing — pluck the string', moving: 'Stop on the note (no sliding)' },
-  review: { sustained: 'That sounds like singing — pluck the string', moving: 'Stop on the note (no sliding)' },
+  sing: {
+    moving: 'Settle on one steady note…',
+    carryOver: 'That’s the guitar still ringing — now sing it',
+    tooShort: 'Hold the note a little longer (about half a second)',
+    decaying: 'Strict check: that sounds like the guitar — sing it',
+  },
+  play: {
+    noAttack: 'I hear that pitch, but no new pluck — stop singing, then pluck the string',
+    moving: 'Stop on the note (no sliding)',
+    octaveHigh: 'Right note, one octave too high',
+    octaveLow: 'Right note, one octave too low',
+    sustained: 'Strict check: that sounds like singing — pluck the string',
+  },
 };
+HINT_TEXT.review = HINT_TEXT.play;
+const PITCH_REVEALING_HINTS = new Set(['octaveHigh', 'octaveLow']);
 
 function targetLabel(midi: number, s: Settings, tonic: number, keyPc: number): { name: string | null; degree: string | null } {
   const off = midi - tonic;
@@ -465,7 +483,13 @@ function sessionScreen(): HTMLElement {
 
   updateSession = (cur: SessionView) => {
     const m = cur.match;
-    progress.style.width = `${Math.round((m?.progress ?? 0) * 100)}%`;
+    // With the meter off, nothing may reveal whether the pitch is right (no progress, neutral text).
+    progress.style.width = showMeter ? `${Math.round((m?.progress ?? 0) * 100)}%` : '0%';
+    if (keyPlaying) {
+      status.textContent = 'Playing the key (do–mi–sol)…';
+      if (showMeter) meter.note('Playing the key (do–mi–sol)…');
+      return;
+    }
     if (cur.phase === 'listen') {
       status.textContent = cur.listenKind === 'phrase' ? 'Playing the phrase…' : 'Playing the note…';
       return;
@@ -475,9 +499,10 @@ function sessionScreen(): HTMLElement {
       if (m?.detectedMidi != null && settings.showNoteName) label = `You: ${noteName(Math.round(m.detectedMidi), keyPc)}`;
       meter.set(m?.cents ?? null, tol, { label, idle: effPhase === 'sing' ? 'Sing now…' : 'Play now…' });
     }
-    const hintText = m?.hint ? HINT_TEXT[effPhase]?.[m.hint] : undefined;
-    status.textContent = hintText
-      ?? (!m?.voiced && !m?.stable ? (effPhase === 'sing' ? 'Listening for your voice…' : 'Listening for the guitar…') : m.inTolerance ? (effPhase === 'sing' ? 'Hold it…' : 'Let it ring…') : 'Listening…');
+    let hintText = m?.hint ? HINT_TEXT[effPhase]?.[m.hint] : undefined;
+    if (hintText && m?.hint && !showMeter && PITCH_REVEALING_HINTS.has(m.hint)) hintText = undefined;
+    const listening = effPhase === 'sing' ? 'Listening for your voice…' : 'Listening for the guitar…';
+    status.textContent = hintText ?? (!showMeter || (!m?.voiced && !m?.stable) ? listening : m.inTolerance ? (effPhase === 'sing' ? 'Hold it…' : 'Let it ring…') : 'Listening…');
     if (showMeter && hintText) meter.note(hintText);
   };
 
@@ -571,7 +596,8 @@ function summaryScreen(): HTMLElement {
       ...rows.map((r) =>
         h('tr', { attrs: { 'data-skipped': r.skipped } },
           h('td', { text: String(r.index + 1) }),
-          h('td', { text: noteName(r.midi, keyPc) }),
+          // a skipped note was never found: with note names hidden, don't name it here either
+          h('td', { text: r.skipped && !store.settings.showNoteName ? '?' : noteName(r.midi, keyPc) }),
           ...(r.skipped
             ? [h('td', { attrs: { colspan: 5 }, class: 'muted', text: 'skipped' })]
             : [
@@ -669,6 +695,8 @@ function settingsPanel(): HTMLElement {
       toggle('skipGuitar', 'Skip guitar step'),
       toggle('phraseReview', 'Phrase review', s.skipGuitar ? 'needs the guitar step — off while “Skip guitar step” is on' : 'play each phrase back in order', s.skipGuitar),
       toggle('allowSkip', 'Allow “Skip note” button'),
+      h('h2', { class: 'section-title', text: 'Checking' }),
+      toggle('strictCheck', 'Strict instrument check', 'also judge the sound: a sung note must hold, a guitar note must ring down. Can reject fading singers and very sustained guitars.'),
       h('h2', { class: 'section-title', text: 'Sound' }),
       toggle('playKeyAtStart', 'Play the key at the start', 'do–mi–sol chord before the first note (also on the “Key” button)'),
       h('div', { class: 'actions' },

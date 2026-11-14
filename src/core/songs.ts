@@ -83,9 +83,11 @@ function buildSong(
  * All four agree on every pitch below. Where all four agreed on a rhythm it was corrected:
  * "at the" (twilight's / gallantly) and "does that" are straight eighths, and "banner yet wave"
  * is 2'(1) 4' 3' 2' 1' (eighths) | 1'(1) 7(1) — 101 notes in all.
+ * "that our flag" is the same figure as "at the twilight's" and is written the same way
+ * (straight eighths; the sources split on it).
  * Still disputed (sources split 2–2; left as is, please check by ear): "What so" / "O'er the
  * ramparts" (straight vs dotted eighths), "And the rockets'", "O'er the land", "and the home"
- * (same question), and "that our flag" (dotted here; two sources have straight eighths).
+ * (same question).
  */
 export const STAR_SPANGLED_BANNER: Song = buildSong(
   { id: 'star-spangled-banner', title: 'The Star-Spangled Banner', defaultKeyPc: 0, defaultTonicMidi: 48, bpm: 84 },
@@ -101,7 +103,7 @@ export const STAR_SPANGLED_BANNER: Song = buildSong(
     { lyric: "And the rockets' red glare,", melody: "3':0.5 3':0.5 3':1 4':1 5':1 5':2" },
     { lyric: 'the bombs bursting in air,', melody: "4':0.5 3':0.5 2':1 3':1 4':1 4':2" },
     { lyric: 'Gave proof through the night', melody: "4':1 3':1.5 2':0.5 1':1 7:2" },
-    { lyric: 'that our flag was still there;', melody: "6:0.75 7:0.25 1':1 3:1 #4:1 5:2" },
+    { lyric: 'that our flag was still there;', melody: "6:0.5 7:0.5 1':1 3:1 #4:1 5:2" },
     { lyric: 'O say does that star-spangled', melody: "5:1 1':1 1':1 1':0.5 7:0.5 6:1 6:1 6:1" },
     { lyric: 'banner yet wave', melody: "2':1 4':0.5 3':0.5 2':0.5 1':0.5 1':1 7:1" },
     { lyric: "O'er the land of the free", melody: "5:0.5 5:0.5 1':1.5 2':0.5 3':0.5 4':0.5 5':2" },

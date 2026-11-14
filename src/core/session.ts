@@ -71,6 +71,8 @@ export class Session {
   private reviewStart = 0;
   private reviewMistakes = 0;
   private started = false;
+  /** Pitch heard when the singing step was accepted (cleared when a new note starts). */
+  private sungMidi: number | undefined;
   /** Frames of the current step (last 1.2 s). */
   private recent: PitchFrame[] = [];
   /** Match state of the most recent accept (for logging). */
@@ -102,8 +104,9 @@ export class Session {
     const prev = this.settings;
     this.settings = { ...s };
     if (this.settings.skipSing && this.settings.skipGuitar) this.settings.skipGuitar = false;
-    const matchingChanged = prev.singTolerance !== this.settings.singTolerance || prev.singExactOctave !== this.settings.singExactOctave;
-    if (matchingChanged && this.phase === 'sing' && this.matcher) {
+    const matchingChanged =
+      prev.singTolerance !== this.settings.singTolerance || prev.singExactOctave !== this.settings.singExactOctave || prev.strictCheck !== this.settings.strictCheck;
+    if (matchingChanged && (this.phase === 'sing' || this.phase === 'play') && this.matcher) {
       this.attemptCarry += this.matcher.current.wrongAttempts;
       this.makeStepMatcher();
       // Re-feed the last second of this step so the new matcher continues where the old one was.
@@ -141,6 +144,7 @@ export class Session {
     this.listenKind = 'note';
     this.next = this.firstStep();
     this.matcher = null;
+    this.sungMidi = undefined;
     this.attemptCarry = 0;
   }
 
@@ -162,11 +166,17 @@ export class Session {
     const target = this.midis[this.index];
     const cfg =
       this.phase === 'sing'
-        ? singConfig(target, this.settings.singTolerance, this.settings.singExactOctave)
-        : guitarConfig(target);
+        ? singConfig(target, this.settings.singTolerance, this.settings.singExactOctave, this.settings.strictCheck)
+        : guitarConfig(target, this.settings.strictCheck);
     const prev = this.index > 0 ? this.midis[this.index - 1] : undefined;
-    // A still-sounding previous note is not counted as a wrong attempt.
-    this.matcher = new NoteMatcher({ ...cfg, ignoreMidi: prev });
+    // A still-sounding previous note is not counted as a wrong attempt; in the singing step the
+    // guitar note of the previous step, still ringing, must not pass (carry-over guard).
+    this.matcher = new NoteMatcher({
+      ...cfg,
+      ignoreMidi: prev,
+      carryMidi: this.phase === 'sing' ? prev : undefined,
+      voiceMidi: this.phase === 'play' ? this.sungMidi : undefined,
+    });
   }
 
   private reviewPhrase(): Phrase | undefined {
@@ -179,7 +189,10 @@ export class Session {
     const prev = this.reviewPos > 0 ? this.midis[p.start + this.reviewPos - 1] : this.midis[this.index];
     // The plucked-note model always needs a fresh attack, so the previous (still ringing) note
     // cannot pass a repeated note; it is also not counted as a slip.
-    this.matcher = new NoteMatcher({ ...guitarConfig(target), ignoreMidi: prev });
+    this.matcher = new NoteMatcher({ ...guitarConfig(target, this.settings.strictCheck, true), ignoreMidi: prev });
+    // context: the previous review note's frames (so the next note's attack or pitch change is
+    // seen at once), but nothing in them can count for this note
+    this.matcher.prime(this.recent.slice(-15));
   }
 
   /** Replay the reference (note, or phrase during review). Pauses listening. */
@@ -232,6 +245,8 @@ export class Session {
         this.recent = [];
         this.stepStart = at;
         this.attemptCarry = 0;
+        // the pitch just sung (its tail must not pass the guitar step)
+        this.sungMidi = s.detectedMidi ?? undefined;
         this.makeStepMatcher();
       }
       return true;

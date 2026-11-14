@@ -79,17 +79,58 @@ describe('session state machine', () => {
     expect(v.stats[0].playCents).toBeCloseTo(0, 3);
   });
 
-  it('a sustained (sung) note never passes the guitar step; a pluck never passes the singing step', () => {
+  it('the tail of the sung answer never passes the guitar step; a new pluck does', () => {
     const s = make();
     const c = new Clock();
     s.start();
     s.listenDone(0);
     c.quiet(s, 200);
-    expect(c.pluck(s, 55, 2000)).toBe(false); // a decaying pluck is not singing
+    expect(c.sing(s, 55, 800)).toBe(true);
+    // the voice keeps going into the guitar step, then fades out: no attack, no pass
+    expect(c.sing(s, 55, 900)).toBe(false);
+    for (let k = 0; k < 20; k++) {
+      c.t += 0.02;
+      expect(s.pitch({ t: c.t, freq: midiToFreq(55), clarity: 0.95, rms: 0.1 * Math.pow(0.85, k) })).toBe(false);
+    }
+    expect(s.view().match?.hint).toBe('noAttack');
+    c.quiet(s, 300);
+    expect(c.pluck(s, 55, 400)).toBe(true);
+  });
+
+  it('a guitar note still ringing from the previous step does not pass the next singing step', () => {
+    const s = make({ phraseReview: false });
+    const c = new Clock();
+    s.start();
+    // advance to note 13 ("What so" = G3 G3: indices 12 and 13 are both G3)
+    for (let i = 0; i < 13; i++) {
+      s.listenDone(c.t);
+      c.quiet(s, 100);
+      c.sing(s, s.view().targetMidi, 700);
+      c.quiet(s, 100);
+      c.pluck(s, s.view().targetMidi, 400);
+    }
+    expect(s.view().index).toBe(13);
+    expect(s.view().targetMidi).toBe(55);
+    s.listenDone(c.t);
+    // the G3 just plucked is still ringing (decaying ~15 dB/s) when the singing step opens
+    for (let k = 0; k < 60; k++) {
+      c.t += 0.02;
+      expect(s.pitch({ t: c.t, freq: midiToFreq(55), clarity: 0.97, rms: 0.05 * Math.pow(10, (-15 * k * 0.02) / 20) })).toBe(false);
+    }
+    expect(s.view().match?.hint).toBe('carryOver');
+    c.quiet(s, 150);
+    expect(c.sing(s, 55, 700)).toBe(true);
+  });
+
+  it('strict instrument check: a pluck never passes the singing step, a sung note never passes the guitar step', () => {
+    const s = make({ strictCheck: true });
+    const c = new Clock();
+    s.start();
+    s.listenDone(0);
+    c.quiet(s, 200);
+    expect(c.pluck(s, 55, 2000)).toBe(false);
     c.quiet(s, 200);
     expect(c.sing(s, 55, 800)).toBe(true);
-    // voice keeps going into the guitar step, stops, starts again: still not a pluck
-    expect(c.sing(s, 55, 600)).toBe(false);
     c.quiet(s, 300);
     expect(c.sing(s, 55, 1500)).toBe(false);
     c.quiet(s, 300);
@@ -206,7 +247,7 @@ describe('session state machine', () => {
     expect(v.reviews[0].mistakes).toBe(1); // only the out-of-order E3; the ringing C4 is not a slip
   });
 
-  it('a sung phrase does not pass the review', () => {
+  it('phrase review accepts let-ring playing at the written tempo (order and pitch only)', () => {
     const s = make({ skipSing: true });
     const c = new Clock();
     s.start();
@@ -216,11 +257,10 @@ describe('session state machine', () => {
       c.pluck(s, s.view().targetMidi, 400);
     }
     expect(s.view().phase).toBe('review');
-    for (const m of [55, 52, 48, 52, 55, 60]) {
-      c.quiet(s, 150);
-      expect(c.sing(s, m, 600)).toBe(false);
-    }
-    expect(s.view().review?.pos).toBe(0);
+    // 16th-note fast: each note 180 ms, no gaps (the previous note keeps ringing, quieter)
+    for (const m of [55, 52, 48, 52, 55, 60]) c.pluck(s, m, 180);
+    expect(s.view().phase).toBe('listen');
+    expect(s.view().index).toBe(6);
   });
 
   it('the review itself can be skipped', () => {

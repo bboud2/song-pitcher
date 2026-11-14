@@ -135,7 +135,9 @@ p { margin: 0; }
 .strings { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; width: 100%; }
 .string { text-align: center; padding: 10px 0; border-radius: 10px; background: var(--card-2); font-weight: 700; color: var(--muted); }
 .string[data-on='true'] { background: var(--accent); color: var(--accent-ink); }
-.advice { text-align: center; font-size: 1.15rem; font-weight: 700; min-height: 1.4em; color: var(--play); }
+.advice { text-align: center; font-size: 1.15rem; font-weight: 700; min-height: 1.4em; color: var(--text); }
+.advice[data-level='warn'] { color: var(--play); }
+.advice[data-level='ok'] { color: var(--accent); }
 .tuner-help { display: flex; flex-direction: column; gap: 8px; }
 .error { background: #3a1f24; color: #ffd6d6; border-radius: 14px; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
 
@@ -152,7 +154,10 @@ p { margin: 0; }
 .meter[data-state='ok'] .meter-needle { background: var(--accent); }
 .meter[data-state='far'] .meter-needle { background: var(--danger); }
 .meter-ends { display: flex; justify-content: space-between; font-size: 1rem; font-weight: 600; color: var(--muted); margin-top: 2px; }
-.meter-readout { text-align: center; font-size: 1.45rem; font-weight: 800; min-height: 1.4em; margin-top: -2px; line-height: 1.2; }
+.meter-readout {
+  text-align: center; font-size: clamp(1.05rem, 5.6vw, 1.45rem); font-weight: 800; height: 2.5em; margin-top: -2px; line-height: 1.2;
+  display: flex; align-items: center; justify-content: center; overflow: hidden;
+}
 .meter[data-state='ok'] .meter-readout { color: var(--accent); }
 
 /* Session */
@@ -168,7 +173,7 @@ p { margin: 0; }
 .phase-review { --phase: var(--review); }
 .phase-pill {
   background: var(--phase); color: #0d1117; font-weight: 900; text-transform: uppercase; letter-spacing: 0.12em;
-  padding: 6px 16px; border-radius: 999px; font-size: 1rem;
+  padding: 6px 16px; border-radius: 999px; font-size: 1.2rem;
 }
 .hint { font-size: 1.45rem; font-weight: 700; line-height: 1.2; }
 .target { display: flex; flex-direction: column; align-items: center; gap: 2px; }
@@ -250,7 +255,15 @@ body.flash .stage { animation: flash 0.6s ease-out; }
   .icon-btn { width: 48px; height: 48px; }
   .icon-btn-spacer { width: 48px; }
   .session .stage { gap: 8px; padding-top: 16px; }
-  .hint { font-size: 1.05rem; }
+  .hint { font-size: 1.35rem; }
+}
+/* Very short phones (iPhone SE 1st gen, 568 px): smaller note so the hint can wrap and the
+   controls still fit. Text stays at 16 px or more. */
+@media (max-height: 600px) and (orientation: portrait) {
+  .target-name { font-size: min(26vw, 12vh, 120px); }
+  .target-degree { font-size: min(9vw, 4.6vh, 40px); }
+  .hint { font-size: 1.15rem; }
+  .session .stage { gap: 4px; padding-top: 10px; }
 }
 /* Landscape phone: stage on the left, controls stacked on the right, nothing scrolls. */
 @media (orientation: landscape) and (max-height: 540px) {
@@ -258,9 +271,9 @@ body.flash .stage { animation: flash 0.6s ease-out; }
   body[data-screen='home'] #app, body[data-screen='summary'] #app, body[data-screen='tuner'] #app { height: auto; }
   .session { display: grid; grid-template-columns: 1fr minmax(180px, 30%); grid-template-rows: auto auto minmax(0, 1fr); gap: 6px 12px; height: 100%; min-height: 0; }
   .session .topbar .icon-btn { width: 44px; height: 44px; }
-  .session .hint { display: none; }
+  .session .hint { font-size: 1rem; }
   .session .meter-ends { display: none; }
-  .session .meter-readout { font-size: 1.2rem; }
+  .session .meter-readout { font-size: 1.1rem; height: 2.4em; }
   .session .topbar, .session .progress { grid-column: 1 / -1; }
   .session .stage { grid-column: 1; grid-row: 3; gap: 4px; padding: 10px; min-height: 0; overflow: hidden; }
   .session .controls, .session .controls.three { grid-column: 2; grid-row: 3; grid-template-columns: 1fr; align-content: center; }
@@ -276,3 +289,9 @@ body.flash .stage { animation: flash 0.6s ease-out; }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* Home: Start and Resume share one short row so the sticky bar never covers the range line. */
+.home .sticky-actions.two { flex-direction: row; }
+.home .sticky-actions.two > :first-child { flex: 1.4; }
+.home .sticky-actions.two > :nth-child(2) { flex: 1; min-height: 68px; font-size: 1.05rem; }
+.home { padding-bottom: 8px; }

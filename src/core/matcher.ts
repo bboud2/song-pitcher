@@ -40,6 +40,11 @@ export interface PitchFrame {
   /** NSDF of the frame (lag in samples) and the sample rate, for periodicity checks. */
   nsdf?: Float32Array;
   sr?: number;
+  /** Pitch of what is new since ~160 ms ago (the note just attacked, without what was ringing). */
+  novFreq?: number;
+  novClarity?: number;
+  /** share of the frame's power that is new since ~160 ms ago */
+  novShare?: number;
 }
 
 export type MatchMode = 'pitchClass' | 'exact';
@@ -82,27 +87,36 @@ export interface MatchConfig {
   maxStepCents: number;
   /** A candidate must be identified within this time after its attack. */
   maxIdentityMs: number;
+  /** The in-tolerance identity must stay steady this long before accepting. */
+  persistMs: number;
   /** Strict mode: free-decay check segments. */
   decaySegMs: number;
   minSegDecayDb: number;
   /** Analyse but never accept (gauntlet octave scans). */
   neverAccept?: boolean;
+  /**
+   * Guitar step right after the singing step: the pitch the student just sang. Until their voice
+   * has actually stopped (the level falls well below where the step started, or goes quiet), an
+   * attack at this pitch is not counted — it is the sung answer's tail, not a pluck.
+   */
+  voiceMidi?: number;
 }
 
 const COMMON = {
   minDb: -78,
   graceMs: 80,
   ignoreMidi: undefined,
-  smoothMs: 160,
-  trendMs: 180,
-  maxTrendCents: 14,
+  smoothMs: 150,
+  trendMs: 160,
+  maxTrendCents: 10,
   jumpCents: 200,
-  holdMs: 500,
+  holdMs: 460,
   minDbSlope: -5,
   onsetRiseDb: 6,
-  pitchWindowMs: 120,
-  maxStepCents: 30,
-  maxIdentityMs: 800,
+  pitchWindowMs: 100,
+  maxStepCents: 15,
+  maxIdentityMs: 1200,
+  persistMs: 20,
   decaySegMs: 100,
   minSegDecayDb: 0.4,
 };
@@ -131,6 +145,8 @@ export type MatchHint =
   | 'moving'
   /** singing step: the guitar note from the previous step is still ringing */
   | 'carryOver'
+  /** singing step: the note was on pitch but too short to judge (hold it about half a second) */
+  | 'tooShort'
   /** strict mode only */
   | 'sustained'
   | 'decaying';
@@ -149,14 +165,23 @@ export interface MatchState {
   meanAbsCents: number | null;
   wrongAttempts: number;
   hint: MatchHint | null;
+  /** how the accept was decided (diagnostics): steady window or target-periodicity fallback */
+  reason?: 'window' | 'sung';
 }
 
 interface Rec {
   t: number;
   db: number;
+  /** raw level (before noise removal): envelope-shape tests use this, since the noise tracker
+   *  slowly learns any long sound and would make it look like it is dying away */
+  rawDb: number;
   clarity: number;
   midi: number | null;
+  /** pitch of what is new since ~160 ms ago, if clear */
+  nov: number | null;
   up: number;
+  /** heard while the student's sung answer was still sounding (guitar step) */
+  voice?: boolean;
   nsdf?: Float32Array;
   sr?: number;
 }
@@ -169,6 +194,26 @@ function median(xs: number[]): number {
 
 function mean(xs: number[]): number {
   return xs.reduce((a, b) => a + b, 0) / xs.length;
+}
+
+/** Largest cluster of readings within ±40 c; steady if it covers ≥ 60 % of the window and does not slide. */
+function cluster(xs: number[], windowLen: number, maxStepCents: number): { members: number[]; steady: boolean } {
+  if (!xs.length) return { members: [], steady: false };
+  let bestIdx = 0;
+  let bestCount = 0;
+  for (let i = 0; i < xs.length; i++) {
+    const cnt = xs.filter((x) => Math.abs(x - xs[i]) <= 0.4).length;
+    if (cnt > bestCount) {
+      bestCount = cnt;
+      bestIdx = i;
+    }
+  }
+  const centre = xs[bestIdx];
+  const members = xs.filter((x) => Math.abs(x - centre) <= 0.4);
+  const half = Math.floor(members.length / 2);
+  const a = mean(members.slice(0, half));
+  const b = mean(members.slice(members.length - half));
+  return { members, steady: members.length >= 3 && members.length >= 0.6 * windowLen && Math.abs(a - b) * 100 <= maxStepCents };
 }
 
 function slope(ts: number[], ys: number[]): number {
@@ -188,6 +233,8 @@ interface Candidate {
   peakDb: number;
   /** pitched sound sounding just before the attack (a ringing note), if any */
   preMidi: number | null;
+  /** something audible (a note still ringing, a voice) was sounding just before the attack */
+  preSounding: boolean;
   /** frames just before the attack, for "what changed" periodicity checks */
   pre: Rec[];
   identity: number | null;
@@ -195,6 +242,14 @@ interface Candidate {
   done: boolean;
   counted: boolean;
   decay: 'pending' | 'confirmed' | 'rejected';
+  /** time after the onset before pitch is read (skips the pick noise of an attack) */
+  lead: number;
+  /** opened before the student's voice had stopped (guitar step after singing) */
+  whileSinging: boolean;
+  /** the loudest level in the 1.5 s before the attack */
+  loudest: number;
+  /** first time the in-tolerance identity was read steadily */
+  steadySince?: number;
 }
 
 export class NoteMatcher {
@@ -208,14 +263,25 @@ export class NoteMatcher {
   private sm2: { t: number; v: number }[] = [];
   private segFirstT: number | null = null;
   private segOnset = false;
+  private tooShortUntil = -Infinity;
   private lastVoicedT = -Infinity;
   private lastCountedWrong: number | null = null;
   // plucked
   private cand: Candidate | null = null;
   private lastOnsetT = -Infinity;
+  private lastLevelOnsetT = -Infinity;
+  /** notes identified at recent attacks (and when) */
+  private identities: { midi: number; t: number }[] = [];
+  private prevNovShare = 1;
+  /** when the share of new power last rose past 0.4 (its rising edge), and whether it was used */
+  private novEdgeT = -Infinity;
+  private armed = true;
+  private startLevels: number[] = [];
+  private quietFrames = 0;
 
   constructor(cfg: MatchConfig) {
     this.cfg = cfg;
+    this.armed = cfg.voiceMidi === undefined;
     this.state = {
       voiced: false, stable: false, detectedMidi: null, cents: null, inTolerance: false,
       progress: 0, accepted: false, acceptedAt: null, meanAbsCents: null, wrongAttempts: 0, hint: null,
@@ -232,6 +298,23 @@ export class NoteMatcher {
     return this.cfg.mode === 'exact' ? centsFromMidi(freq, this.cfg.targetMidi) : centsFromPitchClass(freq, this.cfg.targetMidi);
   }
 
+  /**
+   * Give the matcher recent context (frames heard just before it was created) without letting
+   * anything in them count: an attack inside them opens no candidate. Lets a following note's
+   * attack or pitch change be recognised right away (fast phrase review).
+   */
+  prime(frames: PitchFrame[]): void {
+    for (const f of frames) {
+      const db = rmsToDb(f.cleanRms ?? f.rms);
+      const voiced = f.freq > 0 && f.clarity >= this.cfg.minClarity && db >= this.cfg.minDb;
+      this.hist.push({ t: f.t, db, rawDb: rmsToDb(f.rms), clarity: f.clarity, midi: voiced ? freqToMidi(f.freq) : null, nov: null, up: f.upClarity ?? 0, nsdf: f.nsdf, sr: f.sr });
+    }
+    if (frames.length) {
+      this.firstT = frames[0].t;
+      this.prevNovShare = frames[frames.length - 1].novShare ?? 1;
+    }
+  }
+
   push(f: PitchFrame): MatchState {
     if (this.state.accepted) return this.state;
     const c = this.cfg;
@@ -239,7 +322,8 @@ export class NoteMatcher {
     const db = rmsToDb(f.cleanRms ?? f.rms);
     const voiced = f.freq > 0 && f.clarity >= c.minClarity && db >= c.minDb && f.freq >= 55 && f.freq <= 1700;
     const midi = voiced ? freqToMidi(f.freq) : null;
-    this.hist.push({ t: f.t, db, clarity: f.clarity, midi, up: f.upClarity ?? 0, nsdf: f.nsdf, sr: f.sr });
+    const nov = f.novFreq && (f.novClarity ?? 0) >= 0.75 && f.novFreq >= 55 && f.novFreq <= 1700 ? freqToMidi(f.novFreq) : null;
+    this.hist.push({ t: f.t, db, rawDb: rmsToDb(f.rms), clarity: f.clarity, midi, nov, up: f.upClarity ?? 0, nsdf: f.nsdf, sr: f.sr });
     while (this.hist.length && this.hist[0].t < f.t - 2.5) this.hist.shift();
     // keep the (large) NSDF copies only for the last ~0.6 s
     for (let i = this.hist.length - 1; i >= 0 && this.hist[i].t >= f.t - 0.8; i--) {
@@ -249,16 +333,30 @@ export class NoteMatcher {
     return this.state;
   }
 
+  private shown: { midi: number; t: number } | null = null;
+  private pendingJump = 0;
+
   private displayMidi(): number | null {
     // The meter is stricter than the decision gate for plucked notes: weak-clarity frames (a
     // dying note mixed with hum) are where sub-octave misreads happen.
     const minClar = this.cfg.kind === 'plucked' ? 0.8 : 0;
     let recent = this.hist.slice(-3).filter((r) => r.clarity >= minClar).map((r) => r.midi).filter((m): m is number => m !== null);
-    const g = this.cand && !this.cand.done ? this.cand.identity : null;
-    if (this.cfg.kind === 'plucked' && g !== null) {
-      recent = recent.filter((m) => ![7, 12, 19, 24].some((iv) => Math.abs(Math.abs(m - g) - iv) < 0.6));
+    // (the last attack's note stays the reference for ~2 s, even after its candidate closed)
+    const last = this.hist.length ? this.hist[this.hist.length - 1].t : 0;
+    const g = this.cand && last - this.cand.onsetT < 2 ? this.cand.identity : null;
+    const octaveish = (a: number, b: number) => [7, 12, 19, 24].some((iv) => Math.abs(Math.abs(a - b) - iv) < 0.6);
+    if (this.cfg.kind === 'plucked' && g !== null) recent = recent.filter((m) => !octaveish(m, g));
+    if (!recent.length) return null;
+    const m = median(recent);
+    // Hysteresis: an octave/fifth jump of the reading is only shown once it persists (5 frames);
+    // a brief detector flip is not shown as "You: E2" on the meter.
+    if (this.shown && last - this.shown.t < 0.3 && octaveish(m, this.shown.midi) && this.pendingJump < 5) {
+      this.pendingJump++;
+      return this.shown.midi;
     }
-    return recent.length ? median(recent) : null;
+    this.pendingJump = 0;
+    this.shown = { midi: m, t: last };
+    return m;
   }
 
   // ------------------------------------------------------------------ sung
@@ -275,8 +373,12 @@ export class NoteMatcher {
     const s = this.state;
     if (midi === null) {
       if ((f.t - this.lastVoicedT) * 1000 > c.graceMs) {
+        // a note that was on pitch but stopped before it could be judged: say so
+        const len = this.segFirstT !== null ? this.lastVoicedT - this.segFirstT : 0;
+        if (this.seg.length && len >= 0.15 && s.inTolerance) this.tooShortUntil = f.t + 2;
         this.resetSeg();
-        return { ...s, voiced: false, stable: false, detectedMidi: null, cents: null, inTolerance: false, progress: 0, hint: null };
+        const hint: MatchHint | null = f.t < this.tooShortUntil ? 'tooShort' : null;
+        return { ...s, voiced: false, stable: false, detectedMidi: null, cents: null, inTolerance: false, progress: 0, hint };
       }
       return { ...s, voiced: false };
     }
@@ -294,7 +396,7 @@ export class NoteMatcher {
       const prior = this.hist.filter((r) => r.t < f.t - 1e-6 && r.t >= f.t - 0.4);
       this.segOnset = prior.length > 0 && db - Math.min(...prior.map((r) => r.db)) >= 6;
     }
-    this.seg.push({ t: f.t, c: cents, db });
+    this.seg.push({ t: f.t, c: cents, db: rmsToDb(f.rms) });
     const horizon = f.t - (c.holdMs + 200) / 1000;
     while (this.seg.length && this.seg[0].t < horizon) this.seg.shift();
 
@@ -328,9 +430,12 @@ export class NoteMatcher {
       // Carry-over guard: a sound that was already there when the step opened, at the exact
       // pitch of the previous (possibly still ringing) note, only counts once it stops dying away
       // (i.e. a voice is actually holding it).
-      const fromStart = !this.segOnset && this.segFirstT !== null && this.firstT !== null && this.segFirstT - this.firstT < 0.1;
-      const sungMidi = this.cfg.targetMidi + v2 / 100 + Math.round((midi - (this.cfg.targetMidi + v2 / 100)) / 12) * 12;
-      const carry = fromStart && c.carryMidi !== undefined && Math.abs(sungMidi - c.carryMidi) < 0.6 && dbSlope < -3;
+      // (any segment without an attack of its own: a ringing string's readings can flip and
+      // restart the segment, so "started with the step" is not required)
+      const fromStart = !this.segOnset;
+      // (pitch class: the ringing string's readings may flip octave)
+      const pcDiff = c.carryMidi === undefined ? 99 : Math.abs(((((this.cfg.targetMidi + v2 / 100 - c.carryMidi) % 12) + 18) % 12) - 6);
+      const carry = fromStart && pcDiff < 0.6 && dbSlope < -3;
       let sustainedOk = true;
       if (c.strict) {
         const mid = f.t - c.holdMs / 2000;
@@ -373,28 +478,98 @@ export class NoteMatcher {
     const hist = this.hist;
     const n = hist.length;
 
+    // ---- disarmed while the sung answer is still sounding
+    if (!this.armed) {
+      if (this.startLevels.length < 3) this.startLevels.push(db);
+      const startLevel = median(this.startLevels);
+      if (db <= startLevel - 20 || db <= -60 || midi === null) this.quietFrames++;
+      else this.quietFrames = 0;
+      if (this.quietFrames >= 3) this.armed = true;
+    }
+    hist[n - 1].voice = !this.armed;
+
     // ---- new attack: a level jump, or a clean jump to a new steady pitch (hammer-on, legato)
     let onset = false;
-    const before = hist.filter((r) => r.t >= t - 0.14 - 1e-6 && r.t <= t - 0.04 + 1e-6);
+    // Attacks only count when most of the frame's energy is signal, not room noise (after noise
+    // removal the level of pure noise sits well below the raw level).
+    const signalDominant = rmsToDb(f.rms) - db <= 6;
+    // A swell far below what was just played (the null-to-peak of a beating string, a
+    // resonance) is not an attack: the level must reach within 12 dB of the envelope of recent
+    // attacks, allowing that envelope to die away at 10 dB/s.
+    // (the student's own voice is louder than the guitar and does not count as an attack)
+    const env = Math.max(...hist.filter((r) => r.t >= t - 1.5 && r.t < t - 0.03 && !r.voice).map((r) => r.db - 10 * (t - r.t)), -Infinity);
+    const loudEnough = db >= env - 12;
+    let before = hist.filter((r) => r.t >= t - 0.14 - 1e-6 && r.t <= t - 0.04 + 1e-6);
+    // (after a stalled audio callback there may be a single earlier frame: use the last two heard)
+    if (before.length < 2 && n >= 3 && t - hist[n - 2].t > 0.06) before = hist.slice(n - 3, n - 1);
     const prevDb = n >= 2 ? hist[n - 2].db : -Infinity;
-    if (before.length >= 2 && t - this.lastOnsetT >= 0.08) {
+    // (a level attack is strong evidence: only another level attack holds it off)
+    if (signalDominant && before.length >= 2 && t - this.lastLevelOnsetT >= 0.08) {
       const minBefore = Math.min(...before.map((r) => r.db));
-      if (db - minBefore >= c.onsetRiseDb && db >= c.minDb && db > prevDb + 1) onset = true;
+      // a big rise, or a sharp one-frame jump (a re-pluck over the same note still ringing)
+      // (the small sharp jump only counts near the loudness of recent attacks: a re-pluck returns
+      // to about the old peak, a beating string's swell does not)
+      const recentMax = Math.max(...hist.filter((r) => r.t >= t - 1.0).map((r) => r.db));
+      const sharpReplay = db - prevDb >= 3 && db - minBefore >= 3.5 && db >= recentMax - 6;
+      const bigRise = db - minBefore >= c.onsetRiseDb && db > prevDb + 1 && loudEnough;
+      if (db >= c.minDb && (bigRise || sharpReplay)) {
+        onset = true;
+        this.lastLevelOnsetT = t;
+      }
     }
-    if (!onset && n >= 6 && t - this.lastOnsetT >= 0.15) {
+    let onsetT = t;
+    let lead = 0.02;
+    // (not right after another attack, and not an octave/fifth jump: that is the detector
+    // flipping between readings of the same sound, not a new note)
+    if (!onset && signalDominant && loudEnough && n >= 6 && t - this.lastOnsetT >= 0.3) {
       const last = hist.slice(-3).map((r) => r.midi);
       const prior = hist.slice(-6, -3).map((r) => r.midi);
       if (last.every((m) => m !== null) && prior.every((m) => m !== null)) {
         const l = last as number[];
         const p = prior as number[];
-        if (Math.max(...l) - Math.min(...l) <= 0.4 && Math.max(...p) - Math.min(...p) <= 0.4 && Math.abs(median(l) - median(p)) >= 0.8) onset = true;
+        const jump = Math.abs(median(l) - median(p));
+        // a real hammer-on/pull-off adds energy; a dying chord whose reading wanders does not
+        const lv = hist.slice(-3).map((r) => r.db);
+        const pv = hist.slice(-6, -3).map((r) => r.db);
+        const notDying = mean(lv) >= mean(pv) - 0.5;
+        if (notDying && Math.max(...l) - Math.min(...l) <= 0.4 && Math.max(...p) - Math.min(...p) <= 0.4 && jump >= 0.8 && jump <= 5.5) {
+          onset = true;
+          // the new pitch started three frames ago; no attack noise to skip
+          onsetT = hist[n - 3].t;
+          lead = 0;
+        }
       }
     }
+    // A new note over others still ringing barely raises the level: recognise it from the
+    // "what changed" spectrum (a clear new pitch that differs from what was sounding).
+    // (rising edge only: the new power just appeared in this frame)
+    // (a hammer-on on a fast-dying high string can be well below the envelope of the pluck, so a
+    // looser level rule than for level attacks: the clear new pitch is the evidence here)
+    // (the new pitch may take a frame or two to read clearly after the edge)
+    if ((f.novShare ?? 0) >= 0.4 && this.prevNovShare < 0.3) this.novEdgeT = t;
+    if (!onset && signalDominant && db >= env - 20 && f.novFreq && (f.novShare ?? 0) >= 0.4 && (f.novClarity ?? 0) >= 0.85 && t - this.novEdgeT <= 0.045 && t - this.lastOnsetT >= 0.25 && before.length >= 2) {
+      const novM = freqToMidi(f.novFreq);
+      // (what was sounding just before the edge)
+      const earlier = hist.filter((r) => r.t < this.novEdgeT - 1e-6).slice(-4).map((r) => r.midi).filter((m): m is number => m !== null);
+      const minBefore = Math.min(...before.map((r) => r.db));
+      // (not an octave/fifth of what is already sounding: a beating string's swell reads that way)
+      const related = earlier.some((m) => [7, 12, 19, 24].some((iv) => Math.abs(Math.abs(m - novM) - iv) < 0.6));
+      if (earlier.length >= 2 && !related && earlier.every((m) => Math.abs(m - novM) >= 0.5) && (db - minBefore >= 1 || ((f.novShare ?? 0) >= 0.7 && (f.novClarity ?? 0) >= 0.95))) {
+        // (a hammer-on adds little level; then the new pitch must clearly dominate what changed)
+        onset = true;
+        lead = 0;
+      }
+    }
+    this.prevNovShare = f.novShare ?? 0;
     if (onset) {
-      const pre = hist.filter((r) => r.t >= t - 0.3 && r.t <= t - 0.04 + 1e-6);
+      const pre = hist.filter((r) => r.t >= onsetT - 0.3 && r.t <= onsetT - 0.04 + 1e-6);
       const preVoiced = pre.filter((r) => r.midi !== null && r.clarity >= 0.75).map((r) => r.midi as number);
+      const preMax = pre.length ? Math.max(...pre.map((r) => r.db)) : -Infinity;
+      const loudest = Math.max(...hist.filter((r) => r.t >= t - 1.5 && r.t < t - 0.03 && !r.voice).map((r) => r.db), -Infinity);
       this.cand = {
-        onsetT: t, peakT: t, peakDb: db,
+        onsetT, peakT: t, peakDb: db, lead, whileSinging: !this.armed,
+        loudest,
+        preSounding: preMax >= c.minDb + 10 && preMax >= db - 25,
         preMidi: preVoiced.length >= 3 ? median(preVoiced) : null,
         pre: pre.slice(-6),
         identity: null, lastWindowMidi: null, done: false, counted: false, decay: 'pending',
@@ -407,6 +582,7 @@ export class NoteMatcher {
     let accepted = false;
     let wrong = s.wrongAttempts;
     let accMidi: number | null = null;
+    let reason: MatchState['reason'];
 
     if (cand && !cand.done) {
       if (t - cand.onsetT > c.maxIdentityMs / 1000) cand.done = true;
@@ -417,39 +593,77 @@ export class NoteMatcher {
       if (c.strict) this.strictDecay(cand, t);
     }
 
-    if (cand && !cand.done && t >= cand.onsetT + 0.04) {
+    if (cand && !cand.done && t >= cand.onsetT + cand.lead) {
       const W = c.pitchWindowMs / 1000;
-      const from = Math.max(t - W, cand.onsetT + 0.04);
+      const from = Math.max(t - W, cand.onsetT + cand.lead);
       const win = hist.filter((r) => r.t > from - 1e-6);
       const span = (t - from) * 1000;
       const vw = win.filter((r) => r.midi !== null);
-      if (span >= c.pitchWindowMs - 25 && vw.length >= win.length - 1 && vw.length >= 3) {
-        let midis = vw.map((r) => r.midi as number);
+      // Over other sounds still ringing, read the note from what is NEW since the attack.
+      const nv = cand.preSounding && t - cand.onsetT <= 0.18 ? win.filter((r) => r.nov !== null) : [];
+      if (span >= c.pitchWindowMs - 25 && (nv.length >= 3 || vw.length >= 3)) {
+        let blind = vw.map((r) => r.midi as number);
         // New note an octave above a still-ringing note: the detector keeps reporting the lower,
         // common period, but periodicity one octave up jumped with this attack.
-        if (cand.preMidi !== null && Math.abs(median(midis) - cand.preMidi) < 0.5) {
+        if (cand.preMidi !== null && blind.length && Math.abs(median(blind) - cand.preMidi) < 0.5) {
           const upHz = midiToFreq(cand.preMidi + 12);
           const post = median(vw.map((r) => periodicityAt(r.nsdf, r.sr ?? 48000, upHz) || r.up));
           const preUp = cand.pre.length ? median(cand.pre.map((r) => periodicityAt(r.nsdf, r.sr ?? 48000, upHz) || r.up)) : 0;
-          if (post >= 0.8 && post - preUp >= 0.25) midis = midis.map((m) => m + 12);
+          if (post >= 0.8 && post - preUp >= 0.25) blind = blind.map((m) => m + 12);
         }
-        const half = Math.floor(midis.length / 2);
-        const a = mean(midis.slice(0, half));
-        const b = mean(midis.slice(midis.length - half));
-        const steady = Math.abs(a - b) * 100 <= c.maxStepCents && (Math.max(...midis) - Math.min(...midis)) * 100 <= 150;
+        // Majority reading: in noise or with other strings ringing, some frames read an octave or a
+        // sub-harmonic; the note is the largest cluster of readings (within ±40 c) if it holds at
+        // least 60 % of the window, and it must not be sliding (halves test). The "what's new"
+        // reading wins when it qualifies; otherwise the normal reading.
+        const nov = cluster(nv.map((r) => r.nov as number), win.length, c.maxStepCents);
+        const bl = cluster(blind, win.length, c.maxStepCents);
+        // (a blind reading must be clearly periodic: a muddled one is often a sub-octave misread)
+        const blClear = median(vw.map((r) => r.clarity)) >= 0.65;
+        let pickC = nov.steady ? nov : bl.steady && blClear ? bl : null;
+        // Near-silence or noise can make the normal reading drop an octave (the sub-harmonic period
+        // also repeats); right after an attack the "what's new" reading still shows the true note.
+        if (pickC === bl && t - cand.onsetT <= 0.18) {
+          const na = cluster(win.filter((r) => r.nov !== null).map((r) => r.nov as number), win.length, c.maxStepCents);
+          if (na.steady && Math.abs(median(na.members) - median(bl.members) - 12) < 0.6) pickC = na;
+        }
+        // A note an octave or a fifth away from a note heard in the last 2 s (a swell of a beating
+        // string, a dying note's misread) only counts after a full-strength attack, and then (if
+        // that note may still be sounding) only when the "what's new" reading confirms it.
+        if (pickC && cand.identity === null) {
+          const wm0 = median(pickC.members);
+          const related = this.identities.some((p) => t - p.t < 2 && [7, 12, 19, 24].some((iv) => Math.abs(Math.abs(wm0 - p.midi) - iv) < 0.6));
+          // (a full-strength attack: its peak about as loud as anything in the 1.5 s before; not a swell)
+          // (when nothing was still sounding, e.g. the wrong note was damped, a full attack is enough)
+          if (related && (cand.peakDb < cand.loudest - 4 || (cand.preSounding && pickC !== nov))) pickC = null;
+        }
+        const steady = pickC !== null;
+        const midis = pickC ? pickC.members : bl.members;
         if (steady) {
           const wm = median(midis);
-          if (cand.lastWindowMidi !== null && Math.abs(wm - cand.lastWindowMidi) > 1.0) {
+          if (cand.lastWindowMidi !== null && Math.abs(wm - cand.lastWindowMidi) > 1.5) {
             // the reading jumped (octave flip of a dying note, hum): this attack is not trusted any more
             cand.done = true;
           } else {
             cand.lastWindowMidi = wm;
-            cand.identity ??= wm;
+            if (cand.identity === null) {
+              cand.identity = wm;
+              this.identities.push({ midi: wm, t });
+              while (this.identities.length && this.identities[0].t < t - 2) this.identities.shift();
+            }
             const dev = this.deviation(wm);
-            if (Math.abs(dev) <= c.toleranceCents) {
-              if (!c.strict || cand.decay === 'confirmed') {
+            const sungTail = cand.whileSinging && c.voiceMidi !== undefined && Math.abs(wm - c.voiceMidi) < 0.6;
+            if (sungTail) {
+              // the student's own sung answer (or a pluck drowned in it): not a pluck we can trust
+              hint = 'noAttack';
+            } else if (Math.abs(dev) <= c.toleranceCents) {
+              // the note must hold steady for a moment (speech syllables rarely do)
+              cand.steadySince ??= t;
+              if (t - cand.steadySince < c.persistMs / 1000 - 1e-6) {
+                // keep waiting
+              } else if (!c.strict || cand.decay === 'confirmed') {
                 accepted = !c.neverAccept;
                 accMidi = wm;
+                reason = 'window';
               } else if (cand.decay === 'rejected') {
                 hint = 'sustained';
               }
@@ -463,29 +677,16 @@ export class NoteMatcher {
               }
             }
           }
+        } else if (cand.steadySince !== undefined && !c.strict && t - cand.steadySince >= c.persistMs / 1000 - 1e-6 &&
+          [nov, bl].some((k) => k.members.length >= 3 && Math.abs(this.deviation(median(k.members))) <= c.toleranceCents)) {
+          // The note read steady on the target in the previous window and still reads it in at least
+          // three frames now (a fast-dying note slipping into noise): that is enough.
+          accepted = !c.neverAccept;
+          accMidi = cand.lastWindowMidi;
+          reason = 'window';
         } else {
           hint = 'moving';
-        }
-        // Target-aware fallback for mixtures (a new note over a different ringing note can make
-        // the detector report a common sub-harmonic): accept when periodicity at the target
-        // appeared with this attack, there is no periodicity an octave above it, and the blind
-        // reading is not the target's octave neighbour.
-        if (!accepted && !c.strict && !c.neverAccept && !cand.done) {
-          const tHz = midiToFreq(this.cfg.targetMidi);
-          const withN = vw.filter((r) => r.nsdf);
-          if (withN.length >= 3 && cand.pre.length) {
-            const sr = withN[0].sr ?? 48000;
-            const postT = median(withN.map((r) => periodicityAt(r.nsdf, sr, tHz)));
-            const postUp = median(withN.map((r) => periodicityAt(r.nsdf, sr, tHz * 2)));
-            const preT = median(cand.pre.map((r) => (r.nsdf ? periodicityAt(r.nsdf, sr, tHz) : 0)));
-            const blind = median(midis);
-            const octaveReading = [12, -12, 24, -24].some((iv) => Math.abs(blind - (this.cfg.targetMidi + iv)) < 0.5);
-            const targetReading = Math.abs(blind - this.cfg.targetMidi) < 0.5;
-            if (postT >= 0.75 && postUp <= 0.6 && postT - preT >= 0.25 && !octaveReading && !targetReading) {
-              accepted = true;
-              accMidi = this.cfg.targetMidi;
-            }
-          }
+          cand.steadySince = undefined;
         }
       }
     }
@@ -507,6 +708,7 @@ export class NoteMatcher {
       meanAbsCents: accepted && cents !== null ? Math.abs(cents) : null,
       wrongAttempts: wrong,
       hint: accepted ? null : hint,
+      reason,
     };
   }
 
@@ -517,7 +719,7 @@ export class NoteMatcher {
     const seg = c.decaySegMs / 1000;
     if (t < cand.peakT + 2 * seg - 1e-6) return;
     const meanDb = (a: number, b: number) => {
-      const xs = this.hist.filter((r) => r.t >= a - 1e-6 && r.t <= b + 1e-6).map((r) => r.db);
+      const xs = this.hist.filter((r) => r.t >= a - 1e-6 && r.t <= b + 1e-6).map((r) => r.rawDb);
       return xs.length ? mean(xs) : NaN;
     };
     const s0 = t - 2 * seg;

@@ -13,6 +13,11 @@ import { guitar, silence, voice, whiteNoise, type VoiceOpts } from './fixtures2.
 import { pluck as ksPluck, voice as v1voice } from './fixtures.ts';
 
 const SR = 48000;
+let simOverrides: Partial<Settings> = {};
+/** Settings applied on top of every simulated session (e.g. the strict instrument check). */
+export function setSimSettings(o: Partial<Settings>): void {
+  simOverrides = o;
+}
 const FLOOR = 0.0018; // about -55 dBFS room noise
 
 type Src = 'voice' | 'guitar' | 'silence';
@@ -25,7 +30,7 @@ class Rig {
   samples = 0;
   log: { index: number; phase: string; src: Src }[] = [];
   constructor(settings: Settings) {
-    this.s = new Session(STAR_SPANGLED_BANNER, 48, settings);
+    this.s = new Session(STAR_SPANGLED_BANNER, 48, { ...settings, ...simOverrides });
     this.s.start(0);
   }
   feed(buf: Float32Array, src: Src): void {

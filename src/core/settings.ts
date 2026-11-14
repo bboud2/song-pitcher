@@ -15,6 +15,12 @@ export interface Settings {
   allowSkip: boolean;
   /** Play the tonic chord (key context) before the first note. */
   playKeyAtStart: boolean;
+  /**
+   * Strict instrument check: also judge the sound's envelope (a sung note must hold, a plucked
+   * note must ring down freely). Off by default because it can reject honest students
+   * (fading singers, compressed or long-sustain guitars).
+   */
+  strictCheck: boolean;
 }
 
 /** Defaults are the easy end: all hints on, widest tolerance. */
@@ -30,6 +36,7 @@ export const DEFAULT_SETTINGS: Settings = {
   phraseReview: true,
   allowSkip: true,
   playKeyAtStart: true,
+  strictCheck: false,
 };
 
 /** Merge unknown/partial input (e.g. from localStorage) into valid settings. */

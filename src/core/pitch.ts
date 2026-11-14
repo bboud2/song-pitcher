@@ -17,6 +17,10 @@ export interface PitchResult {
   cleanRms?: number;
   /** Copy of the NSDF (index = lag in samples) for target-aware periodicity checks. */
   nsdf?: Float32Array;
+  /** Pitch of the power that is new since 160 ms ago (0 if none), its clarity, and its share of the frame power. */
+  novFreq?: number;
+  novClarity?: number;
+  novShare?: number;
 }
 
 /**
@@ -44,8 +48,8 @@ export interface PitchDetectorOptions {
   octaveMargin?: number;
   /**
    * Remove stationary noise (fan, hiss, mains hum) before pitch analysis: a per-bin noise
-   * spectrum is tracked (smoothed periodogram, fast-down / slow-up minimum, about +3 dB/s) and
-   * subtracted from each frame's power spectrum. Needs `hopSec` to set the rise rate.
+   * spectrum is tracked (smoothed periodogram, slew-limited +8 / −12 dB/s) and
+   * subtracted from each frame’s power spectrum. Needs `hopSec` to set the rise rate.
    */
   denoise?: boolean;
   hopSec?: number;
@@ -117,9 +121,15 @@ export class PitchDetector {
   private octaveMargin: number;
   private denoise: boolean;
   private rise: number;
+  private fall: number;
+  private frames = 0;
   private smooth: Float64Array | null = null;
   private noise: Float64Array | null = null;
   private fft: FFT;
+  private lastPower: Float64Array | null = null;
+  private history: (Float64Array | undefined)[] = new Array(8);
+  private histPos = 0;
+  private acf: Float64Array;
   private re: Float64Array;
   private im: Float64Array;
   /** Last computed NSDF (exposed for debugging/tests). */
@@ -133,7 +143,8 @@ export class PitchDetector {
     this.cutoff = opts.cutoff ?? 0.9;
     this.octaveMargin = opts.octaveMargin ?? 0.04;
     this.denoise = opts.denoise ?? false;
-    this.rise = Math.pow(10, (3 * (opts.hopSec ?? 0.02)) / 10); // +3 dB per second
+    this.rise = Math.pow(10, (8 * (opts.hopSec ?? 0.02)) / 10); // +8 dB per second
+    this.fall = Math.pow(10, (-12 * (opts.hopSec ?? 0.02)) / 10); // -12 dB per second
     this.minLag = Math.max(2, Math.floor(sampleRate / maxFreq));
     this.maxLag = Math.min(Math.floor(size * 0.6), Math.ceil(sampleRate / minFreq));
     let n = 1;
@@ -142,6 +153,7 @@ export class PitchDetector {
     this.re = new Float64Array(n);
     this.im = new Float64Array(n);
     this.nsdf = new Float64Array(this.maxLag + 2);
+    this.acf = new Float64Array(this.maxLag + 2);
   }
 
   detect(frame: Float32Array): PitchResult {
@@ -161,7 +173,16 @@ export class PitchDetector {
       energy += v * v;
     }
     const rms = Math.sqrt(energy / N);
-    if (energy < 1e-12) return { freq: 0, clarity: 0, rms, cleanRms: 0 };
+    if (energy < 1e-12) {
+      // digital silence (no mic noise at all): nothing to learn, start the noise estimate empty
+      if (this.denoise && !this.noise) {
+        const nb0 = this.re.length;
+        this.smooth = new Float64Array(nb0);
+        this.noise = new Float64Array(nb0).fill(1e-15);
+        this.frames = 1e9; // no warm-up
+      }
+      return { freq: 0, clarity: 0, rms, cleanRms: 0 };
+    }
 
     // Autocorrelation via FFT: r = IFFT(|X|^2)
     this.fft.transform(re, im, false);
@@ -174,24 +195,30 @@ export class PitchDetector {
     if (this.denoise) {
       if (!this.smooth || !this.noise) {
         this.smooth = Float64Array.from(re);
-        this.noise = Float64Array.from(re);
+        // start 6 dB under the first sound heard (normally the room: the mic check comes first)
+        // and learn fast for the first ~1.5 s
+        this.noise = Float64Array.from(re, (p) => p * 0.25);
       }
       const sm = this.smooth;
       const nz = this.noise;
+      // warm-up: learn the room faster during the first ~3 s
+      const rise = this.frames++ < 75 ? Math.pow(this.rise, 4) : this.rise;
       let before = 0;
       let after = 0;
       for (let i = 0; i < nb; i++) {
         const p = re[i];
         sm[i] = 0.8 * sm[i] + 0.2 * p;
-        nz[i] = Math.min(nz[i] * this.rise, sm[i]);
-        // over-subtract (the running minimum under-estimates the mean noise power), keep a floor
-        const c = Math.max(p - 3 * nz[i], 0.03 * p);
+        // Slew-limited tracking in both directions: a note (which rises fast and dies away at
+        // ≥ 5–10 dB/s) never drags the estimate with it, stationary noise and hum are learned.
+        nz[i] = sm[i] > nz[i] ? Math.min(sm[i], nz[i] * rise) : Math.max(sm[i], nz[i] * this.fall);
+        const c = Math.max(p - 2 * nz[i], 0.03 * p);
         before += p;
         after += c;
         re[i] = c;
       }
       cleanFactor = before > 0 ? after / before : 1;
     }
+    this.lastPower = Float64Array.from(re);
     this.fft.transform(re, im, true);
     const scale = 1 / re.length;
     const cleanRms = rms * Math.sqrt(cleanFactor);
@@ -205,11 +232,27 @@ export class PitchDetector {
       const a = frame[off + tau - 1] - mean;
       const b = frame[off + N - tau] - mean;
       m -= a * a + b * b;
-      // with denoising, the energy terms are scaled by the same factor as the spectrum
+      // with noise removed from the spectrum, scale the energy terms by the same factor
       const mm = m * cleanFactor;
-      nsdf[tau] = mm > 1e-12 ? (2 * re[tau] * scale) / mm : 0;
+      nsdf[tau] = mm > 1e-12 ? Math.min(1, (2 * re[tau] * scale) / mm) : 0;
     }
 
+    const nov = this.noveltyPitch();
+    const picked = this.pick(nsdf);
+    if (!picked) return { freq: 0, clarity: 0, rms, cleanRms, nsdf: Float32Array.from(nsdf), ...nov };
+    const { period, peakVal } = picked;
+    // Periodicity one octave above the detected pitch (local max of the NSDF around period/2).
+    let upClarity = 0;
+    const half = period / 2;
+    const lo = Math.max(1, Math.floor(half * 0.97));
+    const hi = Math.min(maxLag, Math.ceil(half * 1.03));
+    for (let k = lo; k <= hi; k++) if (nsdf[k] > upClarity) upClarity = nsdf[k];
+    return { freq: this.sampleRate / period, clarity: Math.min(1, peakVal), rms, upClarity, cleanRms, nsdf: Float32Array.from(nsdf), ...nov };
+  }
+
+  /** MPM peak picking on an NSDF-like array: returns the fractional period and its height. */
+  private pick(nsdf: Float64Array, octaveGuard = true): { period: number; peakVal: number } | null {
+    const maxLag = this.maxLag;
     // Key maxima: highest point of each positive lobe after the first negative zero crossing.
     const peaks: number[] = [];
     let tau = 1;
@@ -233,7 +276,7 @@ export class PitchDetector {
 
     let best = -Infinity;
     for (const p of peaks) if (p >= this.minLag && nsdf[p] > best) best = nsdf[p];
-    if (!(best > 0)) return { freq: 0, clarity: 0, rms, cleanRms, nsdf: Float32Array.from(nsdf) };
+    if (!(best > 0)) return null;
     const threshold = this.cutoff * best;
     let chosen = -1;
     for (const p of peaks) {
@@ -242,12 +285,12 @@ export class PitchDetector {
         break;
       }
     }
-    if (chosen < 0) return { freq: 0, clarity: 0, rms, cleanRms, nsdf: Float32Array.from(nsdf) };
+    if (chosen < 0) return null;
 
     // Octave-up guard: when the fundamental is weak (e.g. a vowel formant sitting on the 2nd
     // harmonic), the half-period lobe can clear the MPM cutoff. If a lobe at ~2x the lag is
     // clearly more periodic, the true period is the longer one.
-    for (let guard = 0; guard < 2; guard++) {
+    for (let guard = 0; octaveGuard && guard < 2; guard++) {
       const target = chosen * 2;
       let better = -1;
       for (const p of peaks) {
@@ -271,14 +314,44 @@ export class PitchDetector {
       if (shift > 0.5 || shift < -0.5) shift = 0;
       peakVal = y1 - 0.25 * (y0 - y2) * shift;
     }
-    const period = chosen + shift;
-    // Periodicity one octave above the detected pitch (local max of the NSDF around period/2).
-    let upClarity = 0;
-    const half = period / 2;
-    const lo = Math.max(1, Math.floor(half * 0.97));
-    const hi = Math.min(maxLag, Math.ceil(half * 1.03));
-    for (let k = lo; k <= hi; k++) if (nsdf[k] > upClarity) upClarity = nsdf[k];
-    return { freq: this.sampleRate / period, clarity: Math.min(1, peakVal), rms, upClarity, cleanRms, nsdf: Float32Array.from(nsdf) };
+    return { period: chosen + shift, peakVal };
+  }
+
+  /**
+   * "What changed" pitch: the pitch of the power that is new compared with 160 ms ago (the
+   * spectrum now minus the earlier one). Right after an attack this is the new note alone, even
+   * over other strings still ringing (let-ring playing) whose sum would mislead the normal
+   * pitch. Returns novelty fields for the frame.
+   */
+  private noveltyPitch(): { novFreq: number; novClarity: number; novShare: number } {
+    const P = this.lastPower;
+    if (!P) return { novFreq: 0, novClarity: 0, novShare: 0 };
+    const ref = this.history[this.histPos];
+    // store the current spectrum for later frames (ring of NOVELTY_LAG frames)
+    this.history[this.histPos] = Float64Array.from(P);
+    this.histPos = (this.histPos + 1) % this.history.length;
+    if (!ref) return { novFreq: 0, novClarity: 0, novShare: 0 };
+    const re = this.re;
+    const im = this.im;
+    let tot = 0;
+    let nov = 0;
+    for (let i = 0; i < P.length; i++) {
+      const d = P[i] - 1.25 * ref[i];
+      tot += P[i];
+      re[i] = d > 0 ? d : 0;
+      nov += re[i];
+      im[i] = 0;
+    }
+    if (!(nov > 0) || !(tot > 0)) return { novFreq: 0, novClarity: 0, novShare: 0 };
+    this.fft.transform(re, im, true);
+    const N = this.size;
+    const r0 = re[0];
+    const acf = this.acf;
+    for (let tau = 0; tau <= this.maxLag + 1; tau++) acf[tau] = (re[tau] * N) / ((N - tau) * r0);
+    // (no octave-down guard here: the rectified difference spectrum has spurious sub-harmonic periodicity)
+    const picked = this.pick(acf, false);
+    if (!picked) return { novFreq: 0, novClarity: 0, novShare: nov / tot };
+    return { novFreq: this.sampleRate / picked.period, novClarity: Math.min(1, picked.peakVal), novShare: nov / tot };
   }
 }
 

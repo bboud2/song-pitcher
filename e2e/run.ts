@@ -208,14 +208,17 @@ async function correctRun(device: { name: string; slug: string }, wav: string): 
   await browser.close();
 }
 
-async function negativeRun(device: { name: string; slug: string }, wav: string, label: string, expectPhase: string): Promise<void> {
+async function negativeRun(device: { name: string; slug: string }, wav: string, label: string, expectPhase: string, settings?: object): Promise<void> {
   const browser = await launch(wav);
   const ctx = await browser.newContext({ ...pw.devices[device.name] });
   await ctx.grantPermissions(['microphone'], { origin: URL });
   const page = await ctx.newPage();
   const tag = `[${device.name} ${label}]`;
   await page.goto(URL);
-  await page.evaluate(() => localStorage.clear());
+  await page.evaluate((st?: object) => {
+    localStorage.clear();
+    if (st) localStorage.setItem('songPitcher.v1', JSON.stringify({ settings: st }));
+  }, settings);
   await page.reload();
   await page.click('[data-testid="start"]');
   await page.waitForSelector('[data-testid="begin"]:not([disabled])', { timeout: 12000 });
@@ -224,7 +227,7 @@ async function negativeRun(device: { name: string; slug: string }, wav: string, 
   const advanced = await waitSession(page, `index > 0`, 45000);
   const phase = await attr(page, 'data-phase');
   check(!advanced, `${tag} never advanced past note 1 in 45 s (ended in phase '${phase}')`);
-  check(phase === expectPhase, `${tag} stuck in the expected step: ${expectPhase} (got ${phase})`);
+  check(expectPhase.split('|').includes(phase ?? ''), `${tag} stuck in the expected step: ${expectPhase} (got ${phase})`);
   await browser.close();
 }
 
@@ -335,11 +338,17 @@ async function main(): Promise<void> {
     const devs = DEVICES.filter((d) => !only || d.slug === only);
     await Promise.all(devs.map((d) => correctRun(d, correct)));
     if (!process.argv.includes('--skip-negatives')) {
-      await Promise.all(devs.map((d) => negativeRun(d, wrong, 'wrong notes', 'sing')));
+      // Wrong notes: never past note 1. (By default the singing step accepts any octave and does not
+      // check the instrument, so the G4 pluck in the file can pass note 1's singing step; the guitar
+      // step must still hold. With the strict check on it must stay in the singing step.)
+      await Promise.all(devs.map((d) => negativeRun(d, wrong, 'wrong notes', 'sing|play')));
+      await Promise.all(devs.map((d) => negativeRun(d, wrong, 'wrong notes, strict check', 'sing', { strictCheck: true })));
+      // Deliberately singing in the guitar step / plucking in the singing step is only caught with the
+      // "strict instrument check" setting (off by default, so honest students are never held up).
       // Sings every note in the guitar's octave and never plays: must get stuck in the guitar step.
-      await Promise.all(devs.map((d) => negativeRun(d, voiceOnly, 'voice only, no guitar', 'play')));
+      await Promise.all(devs.map((d) => negativeRun(d, voiceOnly, 'voice only, no guitar, strict check', 'play', { strictCheck: true })));
       // Plucks every note and never sings: must get stuck in the singing step.
-      await Promise.all(devs.map((d) => negativeRun(d, guitarOnly, 'guitar only, no singing', 'sing')));
+      await Promise.all(devs.map((d) => negativeRun(d, guitarOnly, 'guitar only, no singing, strict check', 'sing', { strictCheck: true })));
     }
     await toneRun();
     await insecureRun();

@@ -24,12 +24,13 @@ export const BUTTERWORTH4_Q = [0.5411961, 1.3065630];
 
 export type AnalysisPath = 'voice' | 'guitar';
 
-export function singConfig(targetMidi: number, toleranceCents: number, exactOctave: boolean): MatchConfig {
-  return { ...SUNG_DEFAULTS, targetMidi, toleranceCents, mode: exactOctave ? 'exact' : 'pitchClass' };
+export function singConfig(targetMidi: number, toleranceCents: number, exactOctave: boolean, strict = false): MatchConfig {
+  return { ...SUNG_DEFAULTS, targetMidi, toleranceCents, mode: exactOctave ? 'exact' : 'pitchClass', strict };
 }
 
-export function guitarConfig(targetMidi: number): MatchConfig {
-  return { ...PLUCKED_DEFAULTS, targetMidi, toleranceCents: GUITAR_TOLERANCE_CENTS, mode: 'exact' };
+export function guitarConfig(targetMidi: number, strict = false, fast = false): MatchConfig {
+  // Phrase review uses a shorter steady window so sixteenth notes at the written tempo (≈180 ms) fit.
+  return { ...PLUCKED_DEFAULTS, targetMidi, toleranceCents: GUITAR_TOLERANCE_CENTS, mode: 'exact', strict, ...(fast ? { pitchWindowMs: 90 } : {}) };
 }
 
 export function makeDetector(sampleRate: number, path: AnalysisPath = 'voice'): PitchDetector {
@@ -38,6 +39,11 @@ export function makeDetector(sampleRate: number, path: AnalysisPath = 'voice'): 
     // guitar tops out at E5 (659 Hz); a high voice singing two octaves up can reach G6 (1568 Hz)
     maxFreq: path === 'guitar' ? 1200 : 1700,
     cutoff: 0.9,
+    // Guitar path: stationary noise (fan, hiss, mains hum) is tracked and removed from every
+    // frame. Not on the voice path: a held sung note is itself steady, and the tracker would
+    // slowly learn it as "noise".
+    denoise: path === 'guitar',
+    hopSec: HOP_MS / 1000,
   });
 }
 
@@ -94,7 +100,7 @@ export class StreamAnalyzer {
 
   frame(path: AnalysisPath, t: number): PitchFrame {
     const r = this.det[path].detect(path === 'guitar' ? this.hp : this.lp);
-    return { t, freq: r.freq, clarity: r.clarity, rms: r.rms, upClarity: r.upClarity ?? 0 };
+    return { t, freq: r.freq, clarity: r.clarity, rms: r.rms, upClarity: r.upClarity ?? 0, cleanRms: r.cleanRms, nsdf: r.nsdf, sr: this.sampleRate, novFreq: r.novFreq, novClarity: r.novClarity, novShare: r.novShare };
   }
 }
 

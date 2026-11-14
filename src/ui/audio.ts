@@ -22,6 +22,17 @@ export class AudioEngine {
   private analysers: Partial<Record<AnalysisPath, AnalyserNode>> = {};
   private detectors: Partial<Record<AnalysisPath, PitchDetector>> = {};
   private buf: Float32Array<ArrayBuffer> = new Float32Array(FRAME_SIZE);
+  private rawAnalyser: AnalyserNode | null = null;
+  private specBuf: Float32Array<ArrayBuffer> | null = null;
+
+  /** dB magnitude spectrum of the raw mic signal (for hum detection), or null. */
+  spectrumDb(): { db: Float32Array; sampleRate: number; fftSize: number } | null {
+    const a = this.rawAnalyser;
+    if (!a || !this.ctx) return null;
+    this.specBuf ??= new Float32Array(a.frequencyBinCount);
+    a.getFloatFrequencyData(this.specBuf);
+    return { db: this.specBuf, sampleRate: this.ctx.sampleRate, fftSize: a.fftSize };
+  }
   private timer: number | null = null;
   private onFrame: ((f: PitchFrame) => void) | null = null;
   private pathFn: () => AnalysisPath = () => 'voice';
@@ -99,6 +110,11 @@ export class AudioEngine {
         this.analysers[path] = a;
         this.detectors[path] = makeDetector(ctx.sampleRate, path);
       }
+      // unfiltered, high-resolution spectrum for the mic/room check (hum lines)
+      this.rawAnalyser = ctx.createAnalyser();
+      this.rawAnalyser.fftSize = 8192;
+      this.rawAnalyser.smoothingTimeConstant = 0.5;
+      src.connect(this.rawAnalyser);
     }
     await resume;
   }
@@ -130,7 +146,10 @@ export class AudioEngine {
     if (this.playing || t < this.mutedUntil) return; // never analyse our own reference tone
     an.getFloatTimeDomainData(this.buf);
     const r = det.detect(this.buf);
-    this.onFrame({ t, freq: r.freq, clarity: r.clarity, rms: r.rms, upClarity: r.upClarity ?? 0 });
+    this.onFrame({
+      t, freq: r.freq, clarity: r.clarity, rms: r.rms, upClarity: r.upClarity ?? 0, cleanRms: r.cleanRms, nsdf: r.nsdf,
+      sr: ctx.sampleRate, novFreq: r.novFreq, novClarity: r.novClarity, novShare: r.novShare,
+    });
   }
 
   /** Current audio-clock time (seconds). */
