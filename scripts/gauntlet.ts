@@ -24,28 +24,44 @@ const nJobs = Number(args.find((a) => a.startsWith('--jobs='))?.slice(7) ?? Math
 /** Cases known to fail today. They still print FAIL and still fail the run; this only explains them. */
 const KNOWN_FAILING: Record<string, string> = {
   'guitar P add detuned +35c':
-    'a string 35 c flat/sharp reads +41..+54 c on low notes (the synthetic partials are stretched); the ±50 c window is kept so a wrong fret never passes — the tuner screen shows the string is out of tune',
-  'guitar P add quiet -34dBFS + 60Hz hum -40dBFS': 'display only: the live note readout shows an octave/fifth for a few frames on one note; acceptance is right',
+    'E2–B2 of this additive model have stretched (inharmonic) partials, so a string 35 c out reads +41…+54 c there, past the ±45 c window; the student sees "string out of tune?" and the tuner. (Round 3 blamed only this; most of the old loss was the in-session sharp bias, now gone: 75.7 % → 86.5 %.)',
+  'guitar P add quiet -34dBFS + 60Hz hum -40dBFS': 'the guitar is only 6 dB above a 60 Hz hum whose 120/180 Hz lines sit on E2–B2 partials; 3 of 37 low notes missed and one live readout shows an octave for a few frames (acceptance right)',
   'guitar P over ringing previous note +12 st': 'display only: the live note readout shows the ringing octave for a few frames on one note; acceptance is right',
+  'guitar3 P beating 5 Hz': 'trade-off with the default hum guard: a 5 Hz beat with two equal polarisations swings the level ±several dB every 0.1 s, which on low notes can hide the decay in the first 0.2 s (90 %); a re-pluck passes',
+  'guitar3 P sympathetic partial at f, -8 dB, swells 0.15 s':
+    'trade-off with the default hum guard: a resonance as loud as −8 dB that swells for 0.15 s holds the level flat for 0.2 s like a hum; a second look at 0.6 s recovers some (33 % → 74.5 %); loosening it further let 6–8 of 40 hummed targets through in the third review\'s rig',
   'guitar3 P open string ringing sympathetically (-12 dB)':
-    'fixture puts the sympathetic string at its own fundamental an octave below the played note; a real open string driven by a note an octave up vibrates at that note (its 2nd harmonic), which the "sympathetic partial at f" row covers and passes',
+    'fixture puts the sympathetic string at its own fundamental an octave below the played note; a real open string driven by a note an octave up vibrates at that note (its 2nd harmonic), which the "sympathetic partial at f" row covers',
   'guitar3 N open string ringing sympathetically (-12 dB) — accepted as the wrong octave or a fifth':
     'same fixture: a sound with a steady octave-below component from the attack onwards is, to the detector, the lower note',
   'guitar3 P quiet: -46 dBFS peak': 'the note is only ~16 dB above the room floor and dies in ~0.3 s; a second, harder pluck passes',
   'guitar3 P TV speech -40 dBFS rms': 'a voice talking over the attack at about the guitar\'s level can make the mixture read as a common sub-harmonic; the student re-plucks',
-  'guitar3 N TV speech -40 dBFS rms — accepted as the wrong octave or a fifth': 'the TV voice itself lands on the octave/fifth of the target for a syllable (speech false accept, not the student\'s playing); strict check reduces it',
+  'guitar3 N TV speech -40 dBFS rms — accepted as the wrong octave or a fifth': 'the TV voice itself lands on the octave/fifth of the target for a syllable (a speech false accept, not the student\'s playing)',
   'guitar3 P TV speech -30 dBFS rms': 'TV louder than the decaying guitar: see -40 row',
   'guitar3 N TV speech -30 dBFS rms — accepted as the wrong octave or a fifth': 'the TV voice itself lands on the octave/fifth of the target (speech false accept, see speech rows)',
   'voice3 N falsetto (near sine, breathy) — exact-octave mode accepted the wrong octave': 'opt-in exact-octave mode only: a near-sine falsetto at D4 reads an octave low; default mode is octave-free',
-  'voice3 N vocal fry 50% — exact-octave mode accepted the wrong octave': 'opt-in exact-octave mode only: with fry the waveform really repeats every two periods; correcting it (periodicity at half the period ≥ 0.8) caused octave-up misreads on clean voices, so it was left out',
+  'voice3 N vocal fry 50% — exact-octave mode accepted the wrong octave': 'opt-in exact-octave mode only: with fry the waveform really repeats every two periods; an octave-up correction (periodicity at half the period ≥ 0.8) caused octave-up misreads on clean voices, so it was left out',
   'voice3 N vocal fry 85% — exact-octave mode accepted the wrong octave': 'as vocal fry 50%',
   'voice3 P vocal fry 85%': 'G2/A2 with heavy fry read below the 60 Hz voice floor',
   'voice3 P low bass octave down (-12)': 'G1/A1 (49/55 Hz) are below the 60 Hz voice floor (raising it lets mains hum through)',
-  'voice3 P hum 50 Hz -30 dBFS': 'very loud hum (the mic check warns about it); low notes near the hum harmonics are missed',
+  'critic3 octDown': 'same as the low bass row: a singer an octave below comfortable sings G1–B1, below the 60 Hz voice floor',
+  'voice3 P hum 50 Hz -30 dBFS': 'very loud hum (the mic check warns about it); low notes near the hum harmonics are missed (the voice path does no noise removal: trying it fixed this but cost 13/40 notes a second breath with a fan)',
+  'critic3 hum60loud': 'as voice3 hum 50 Hz -30: the singing step in very loud hum (the mic check warns)',
   'voice3 P TV speech -30 dBFS rms': 'TV as loud as the singer',
+  'critic3 talker': 'background talking at -38 dBFS: the voice path hears it during the singing step (extra breaths) and some plucks land under a syllable',
+  'critic3 tv': 'TV at -40 dBFS: as talker; one sing step passed on the ringing guitar mixed with TV speech',
   'voice3 P metronome click 120 bpm -20 dBFS': 'one of 36: a loud click lands inside the hold; singing on passes',
-  'speech female speech 170-300Hz [strict]: false accepts per minute per target (target ≤ 0.5 guitar step)': 'strict check is 0.56/min vs 0.5 target',
-  'student C1s same, strict instrument check on': 'a short "hm" that dies away looks like a free decay; strict check does not catch it (deliberate gaming, lowest priority)',
+  'speech female speech 170-300Hz [strict]: false accepts per minute per target (target ≤ 0.5 guitar step)': 'strict check 0.53/min vs 0.5 target',
+  'student C1s same, strict instrument check on': 'this model\'s "hm" dies away like a string (14 dB/s) — neither the default hum guard nor the strict check can tell it from a soft pluck (deliberate gaming, lowest priority). The third review\'s held hums are stopped by default.',
+  'critic3 idleTalk': 'talking while hunting: a decaying spoken syllable that holds the target pitch for ~0.2 s can pass (1/101 male, 4/101 female; round 3: 12/101)',
+  'critic3 idleTalkF': 'as idleTalk',
+  'critic3 huntOctFast': 'a right note 0.35 s after a wrong octave/fifth that is still ringing needs the "what is new" reading to confirm it (so octave flips can never pass); 37/101 need a second pluck (round 3: 55)',
+  'critic3 huntDamped': 'as huntOctFast, after a damped wrong octave/fifth: 7/101 need a second pluck',
+  'critic3 fanQuiet': 'soft player 6 dB above a fan: 17/101 need a second pluck (round 3: 23)',
+  'critic3 review03': 'phrase review at 0.3 s per note over all strings ringing: 8/16 first try (round 3: 0/16); remaining misses are a C4 read as the C3 still ringing an octave below',
+  'critic3 review03LoudG': 'as review03',
+  'critic3 phoneAll': 'phone chain + irregular timer + technique mix: 7/101 need a second pluck (round 3: 21)',
+  'critic3 electric': 'unplugged electric, very slow early decay: some plucks look like a held hum to the default guard',
 };
 
 function selected(): Job[] {

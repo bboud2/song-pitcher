@@ -40,7 +40,7 @@ body {
 h1 { font-size: 1.5rem; margin: 0; letter-spacing: -0.01em; }
 h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 10px; font-weight: 700; }
 .muted { color: var(--muted); }
-.small { font-size: 0.85rem; }
+.small { font-size: 0.95rem; }
 .center { text-align: center; }
 p { margin: 0; }
 
@@ -213,7 +213,7 @@ body.flash .stage { animation: flash 0.6s ease-out; }
 .tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
 .tile { background: var(--card); border-radius: 14px; padding: 14px; }
 .tile-value { font-size: 1.6rem; font-weight: 800; }
-.tile-label { color: var(--muted); font-size: 0.85rem; }
+.tile-label { color: var(--muted); font-size: 0.95rem; }
 .table-card { padding: 12px; }
 .table-scroll { max-height: 40vh; overflow: auto; -webkit-overflow-scrolling: touch; }
 .stats-table { width: 100%; border-collapse: collapse; font-size: 0.95rem; font-variant-numeric: tabular-nums; }
@@ -234,7 +234,7 @@ body.flash .stage { animation: flash 0.6s ease-out; }
   background: var(--card); border-radius: 14px; padding: 10px 14px; cursor: pointer;
 }
 .toggle-text { display: flex; flex-direction: column; }
-.toggle-text small { font-size: 0.8rem; }
+.toggle-text small { font-size: 0.95rem; }
 .toggle-row input[type='checkbox'] {
   appearance: none; -webkit-appearance: none; width: 60px; height: 36px; border-radius: 18px; background: var(--line);
   position: relative; flex: none; cursor: pointer; transition: background 0.15s; margin: 0;

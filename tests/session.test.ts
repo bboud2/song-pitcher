@@ -92,7 +92,8 @@ describe('session state machine', () => {
       c.t += 0.02;
       expect(s.pitch({ t: c.t, freq: midiToFreq(55), clarity: 0.95, rms: 0.1 * Math.pow(0.85, k) })).toBe(false);
     }
-    expect(s.view().match?.hint).toBe('noAttack');
+    // (says why: still singing, or — once the voice has died away — only a note still sounding)
+    expect(['noAttack', 'ringing']).toContain(s.view().match?.hint);
     c.quiet(s, 300);
     expect(c.pluck(s, 55, 400)).toBe(true);
   });

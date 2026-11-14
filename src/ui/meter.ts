@@ -4,7 +4,7 @@ import { h } from './dom.ts';
 export interface MeterHandle {
   el: HTMLElement;
   /** cents = null → no pitch. tolerance = green zone half-width. */
-  set(cents: number | null, tolerance: number, opts?: { label?: string; idle?: string }): void;
+  set(cents: number | null, tolerance: number, opts?: { label?: string; idle?: string; fretted?: boolean }): void;
   /** Replace the readout with a message (e.g. "That sounds like singing"). */
   note(text: string): void;
 }
@@ -44,7 +44,11 @@ export function createMeter(range = 100): MeterHandle {
       el.dataset.state = inTol ? 'ok' : Math.abs(cents) > RANGE ? 'far' : 'near';
       const c = Math.round(cents);
       let txt: string;
-      if (Math.abs(cents) > 150) txt = cents < 0 ? 'Too low — go up' : 'Too high — go down';
+      if (opts.fretted && !inTol) {
+        // Guitar: a reading near the target fret but outside the window is an out-of-tune string,
+        // not a reason to move to another fret.
+        txt = Math.abs(cents) < 75 ? `${Math.abs(c)}¢ ${c < 0 ? 'flat' : 'sharp'} — string out of tune?` : cents < 0 ? 'Too low — higher fret' : 'Too high — lower fret';
+      } else if (Math.abs(cents) > 150) txt = cents < 0 ? 'Too low — go up' : 'Too high — go down';
       else if (inTol) txt = Math.abs(c) <= 5 ? 'In tune' : `${Math.abs(c)}¢ ${c < 0 ? 'flat' : 'sharp'} — OK`;
       else txt = `${Math.abs(c)}¢ ${c < 0 ? 'flat — go up' : 'sharp — go down'}`;
       readout.textContent = opts.label ? `${opts.label} · ${txt}` : txt;

@@ -21,6 +21,8 @@ export interface PitchResult {
   novFreq?: number;
   novClarity?: number;
   novShare?: number;
+  /** Level (dB) of the 2–6 kHz band: the pick/finger noise of an attack shows up here. */
+  hfDb?: number;
 }
 
 /**
@@ -47,11 +49,11 @@ export interface PitchDetectorOptions {
   /** A lobe at twice the chosen lag wins if it is this much more periodic. Default 0.04. */
   octaveMargin?: number;
   /**
-   * Track the stationary room noise (fan, hiss) to report `cleanRms`, the level of what is NOT
-   * room noise. A per-bin noise spectrum is learned only from frames that are room noise alone
-   * (no clear pitch in the frame before, level within 6 dB of the quietest recent frame).
-   * The noise is NOT subtracted from the spectrum used for pitch: subtracting an estimate that
-   * has absorbed even a little of the student's own notes biases every later reading sharp.
+   * Remove stationary room noise (fan, hiss, mains hum) before pitch analysis. A per-bin noise
+   * spectrum is learned only from frames that are room noise alone (level within 6 dB of the
+   * quietest frame heard, which forgets only 0.5 dB/s), from a spectrum smoothed over those
+   * frames alone. The student's voice and notes never feed it: an estimate that absorbed them
+   * would carve their partials out of every later frame and bias the pitch sharp.
    */
   denoise?: boolean;
   /** Nominal time between frames (s), used when `detect` is not given timestamps. */
@@ -128,9 +130,8 @@ export class PitchDetector {
   private learned = 0;
   private smooth: Float64Array | null = null;
   private noise: Float64Array | null = null;
-  /** quietest recent frame power (slowly forgets: +3 dB/s) */
+  /** quietest recent frame power (slowly forgets: +0.5 dB/s) */
   private quietPower = Infinity;
-  private prevClarity = 1;
   private seen = 0;
   private lastT: number | null = null;
   private fft: FFT;
@@ -189,7 +190,6 @@ export class PitchDetector {
     const rms = Math.sqrt(energy / N);
     if (energy < 1e-12) {
       // digital silence (no mic noise at all): nothing to learn, and nothing is quieter
-      this.prevClarity = 0;
       this.quietPower = 0;
       this.seen++;
       return { freq: 0, clarity: 0, rms, cleanRms: 0 };
@@ -202,33 +202,50 @@ export class PitchDetector {
       re[i] = re[i] * re[i] + im[i] * im[i];
       im[i] = 0;
     }
+    let hf = 0;
+    const hfLo = Math.round((2000 * nb) / this.sampleRate);
+    const hfHi = Math.min(nb >> 1, Math.round((6000 * nb) / this.sampleRate));
+    for (let i = hfLo; i <= hfHi; i++) hf += re[i];
+    const hfDb = 10 * Math.log10(hf / (nb * N) + 1e-20);
     let cleanFactor = 1;
     if (this.denoise) {
-      // Is this frame room noise alone? No clear pitch just before, and about as quiet as the
-      // quietest recent frame.
-      // (compared with the quietest EARLIER frame, and only after a few frames: the very first
-      // sound heard may be a note)
+      // Is this frame room noise alone? About as quiet as the quietest earlier frame (within
+      // 6 dB): the student's voice and notes are louder than the room, so they never qualify.
+      // (only after a few frames: the very first sound heard may be a note)
       const power = energy / N;
-      const roomOnly = this.seen >= 5 && this.prevClarity < 0.6 && power <= 4 * this.quietPower;
-      this.quietPower = Math.min(power, this.quietPower * Math.pow(10, (3 * dt) / 10));
+      const roomOnly = this.seen >= 5 && power <= 4 * this.quietPower;
+      // (the quietest level forgets very slowly, 0.5 dB/s: a session is almost never silent —
+      // voice, ringing strings — and a fast-forgetting floor would climb up to the student's sound)
+      this.quietPower = Math.min(power, this.quietPower * Math.pow(10, (0.5 * dt) / 10));
       this.seen++;
-      if (!this.smooth) this.smooth = Float64Array.from(re);
+      // (the smoothed spectrum it learns from is built from room-only frames alone, so the
+      // tail of a louder sound just before cannot leak in)
+      if (roomOnly) {
+        if (!this.smooth) this.smooth = Float64Array.from(re);
+        const sm0 = this.smooth;
+        for (let i = 0; i < nb; i++) sm0[i] = 0.8 * sm0[i] + 0.2 * re[i];
+        if (!this.noise) this.noise = Float64Array.from(sm0);
+      }
       const sm = this.smooth;
-      for (let i = 0; i < nb; i++) sm[i] = 0.8 * sm[i] + 0.2 * re[i];
-      if (roomOnly && !this.noise) this.noise = Float64Array.from(sm);
       const nz = this.noise;
-      if (nz) {
-        // learn fast for the first 1.5 s of room noise, then at most +8 dB/s; fall at 12 dB/s
-        const rise = roomOnly ? Math.pow(10, ((this.learned < 1.5 ? 32 : 8) * dt) / 10) : 1;
-        const fall = Math.pow(10, (-12 * dt) / 10);
-        if (roomOnly) this.learned += dt;
+      if (nz && sm) {
+        // learn fast for the first 1.5 s of room noise (the mic check), then slowly (+4 dB/s)
+        // so a faint note tail that is as quiet as the room only nudges it; fall at 12 dB/s
+        if (roomOnly) {
+          const rise = Math.pow(10, ((this.learned < 1.5 ? 32 : 4) * dt) / 10);
+          const fall = Math.pow(10, (-12 * dt) / 10);
+          this.learned += dt;
+          for (let i = 0; i < nb; i++) nz[i] = sm[i] > nz[i] ? Math.min(sm[i], nz[i] * rise) : Math.max(sm[i], nz[i] * fall);
+        }
+        const fl = nz;
         let before = 0;
         let after = 0;
         for (let i = 0; i < nb; i++) {
           const p = re[i];
-          nz[i] = sm[i] > nz[i] ? Math.min(sm[i], nz[i] * rise) : Math.max(sm[i], nz[i] * fall);
+          const c = Math.max(p - 2 * fl[i], 0.03 * p);
           before += p;
-          after += Math.max(p - 2 * nz[i], 0.03 * p);
+          after += c;
+          re[i] = c;
         }
         cleanFactor = before > 0 ? after / before : 1;
       }
@@ -247,13 +264,14 @@ export class PitchDetector {
       const a = frame[off + tau - 1] - mean;
       const b = frame[off + N - tau] - mean;
       m -= a * a + b * b;
-      nsdf[tau] = m > 1e-12 ? Math.min(1, (2 * re[tau] * scale) / m) : 0;
+      // with noise removed from the spectrum, scale the energy terms by the same factor
+      const mm = m * cleanFactor;
+      nsdf[tau] = mm > 1e-12 ? Math.min(1, (2 * re[tau] * scale) / mm) : 0;
     }
 
     const nov = this.noveltyPitch(now);
     const picked = this.pick(nsdf);
-    this.prevClarity = picked ? Math.min(1, picked.peakVal) : 0;
-    if (!picked) return { freq: 0, clarity: 0, rms, cleanRms, nsdf: Float32Array.from(nsdf), ...nov };
+    if (!picked) return { freq: 0, clarity: 0, rms, cleanRms, nsdf: Float32Array.from(nsdf), hfDb, ...nov };
     const { period, peakVal } = picked;
     // Periodicity one octave above the detected pitch (local max of the NSDF around period/2).
     let upClarity = 0;
@@ -261,7 +279,7 @@ export class PitchDetector {
     const lo = Math.max(1, Math.floor(half * 0.97));
     const hi = Math.min(maxLag, Math.ceil(half * 1.03));
     for (let k = lo; k <= hi; k++) if (nsdf[k] > upClarity) upClarity = nsdf[k];
-    return { freq: this.sampleRate / period, clarity: Math.min(1, peakVal), rms, upClarity, cleanRms, nsdf: Float32Array.from(nsdf), ...nov };
+    return { freq: this.sampleRate / period, clarity: Math.min(1, peakVal), rms, upClarity, cleanRms, nsdf: Float32Array.from(nsdf), hfDb, ...nov };
   }
 
   /** MPM peak picking on an NSDF-like array: returns the fractional period and its height. */

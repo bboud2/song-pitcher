@@ -23,6 +23,7 @@ export class AudioEngine {
   private detectors: Partial<Record<AnalysisPath, PitchDetector>> = {};
   private lastT: Partial<Record<AnalysisPath, number>> = {};
   private buf: Float32Array<ArrayBuffer> = new Float32Array(FRAME_SIZE);
+  private warmBuf: Float32Array<ArrayBuffer> = new Float32Array(FRAME_SIZE);
   private rawAnalyser: AnalyserNode | null = null;
   private specBuf: Float32Array<ArrayBuffer> | null = null;
 
@@ -37,6 +38,8 @@ export class AudioEngine {
   private timer: number | null = null;
   private onFrame: ((f: PitchFrame) => void) | null = null;
   private pathFn: () => AnalysisPath = () => 'voice';
+  /** paths analysed every tick without delivering frames (so they learn the room) */
+  private warm: AnalysisPath[] = [];
   private mutedUntil = 0;
   private playing: { stop: () => void } | null = null;
   private master: GainNode | null = null;
@@ -121,7 +124,8 @@ export class AudioEngine {
   }
 
   /** Start delivering analysed frames every HOP_MS, from the path `pathFn` names at each tick. */
-  listen(cb: (f: PitchFrame) => void, pathFn: () => AnalysisPath = () => 'voice'): void {
+  listen(cb: (f: PitchFrame) => void, pathFn: () => AnalysisPath = () => 'voice', warm: AnalysisPath[] = []): void {
+    this.warm = warm;
     this.onFrame = cb;
     this.pathFn = pathFn;
     if (this.timer !== null) return;
@@ -150,9 +154,19 @@ export class AudioEngine {
     this.lastT[path] = t;
     an.getFloatTimeDomainData(this.buf);
     const r = det.detect(this.buf, t);
+    // (e.g. the mic check also runs the guitar detector, so it has learned the room's noise
+    // before the first guitar step)
+    for (const w of this.warm) {
+      const wa = this.analysers[w];
+      const wd = this.detectors[w];
+      if (w === path || !wa || !wd || this.lastT[w] === t) continue;
+      this.lastT[w] = t;
+      wa.getFloatTimeDomainData(this.warmBuf);
+      wd.detect(this.warmBuf, t);
+    }
     this.onFrame({
       t, freq: r.freq, clarity: r.clarity, rms: r.rms, upClarity: r.upClarity ?? 0, cleanRms: r.cleanRms, nsdf: r.nsdf,
-      sr: ctx.sampleRate, novFreq: r.novFreq, novClarity: r.novClarity, novShare: r.novShare,
+      sr: ctx.sampleRate, novFreq: r.novFreq, novClarity: r.novClarity, novShare: r.novShare, hfDb: r.hfDb,
     });
   }
 

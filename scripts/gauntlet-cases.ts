@@ -16,6 +16,9 @@ import { G as G2, V as V2, gbase, pre as PRE2, wrap as wrap2, type Fx } from './
 import { guitarOnly, guitarOnlyRepeated, honest, setSimSettings, voiceOnly, type SimRow } from './sessionsim.ts';
 import { student, type Style } from './students.ts';
 import type { RigOpts } from './students.ts';
+import { CONDS as C3CONDS } from './critic3/run.ts';
+import { student as c3student, type Res as C3Res } from './critic3/student.ts';
+import { BIAS_NOTES, biasTable, sessionSnapshots } from './bias.ts';
 
 export type Kind = 'P' | 'N' | 'I' | 'S';
 export interface GroupResult {
@@ -528,6 +531,11 @@ const students: StudentSpec[] = [
   { st: { name: 'E8 honest, sloppy singer (intonation sd 30c)', noReview: true, intonSd: 30 }, expect: honestExpect() },
   { st: { name: 'H1 wrong octave first (+12, rings 1.6 s); 60 Hz hum -50 dBFS', wrongFirst: [12], wrongGap: 1.6, noReview: true }, o: { humDb: -50 }, expect: honestExpect(), quick: true },
   { st: { name: 'H4 key of G: wrong octave first (+12, 1.6 s); hum -50', wrongFirst: [12], wrongGap: 1.6, noReview: true }, o: { humDb: -50, tonic: 43 }, expect: honestExpect() },
+  // round 4: a neighbouring fret first, left ringing; whole guitar sharp/flat (in-session detune sweep)
+  { st: { name: 'W1 one fret BELOW first (rings 1.3 s), then right', wrongFirst: [-1], wrongGap: 1.3, ring: true, noReview: true }, expect: honestExpect(), quick: true },
+  { st: { name: 'W2 one fret below first (1.3 s), quiet guitar -26 dBFS, strings +20 c', wrongFirst: [-1], wrongGap: 1.3, ring: true, noReview: true, gPeak: 0.05, guitar: { cents: 20 } }, expect: honestExpect() },
+  { st: { name: 'W3 one fret ABOVE first (rings 1.3 s), strings -20 c', wrongFirst: [1], wrongGap: 1.3, ring: true, noReview: true, guitar: { cents: -20 } }, expect: honestExpect() },
+  ...[-30, -15, 15, 30].map((c) => ({ st: { name: `T${c > 0 ? '+' : ''}${c} honest, lets ring, whole guitar ${c > 0 ? '+' : ''}${c} c`, ring: true, noReview: true, guitar: { cents: c } } as Style, expect: honestExpect(), quick: c === 30 })),
 ];
 for (const sp of students) {
   job(`student ${sp.st.name}`, 6, sp.quick ?? false, (quick) => {
@@ -570,6 +578,69 @@ simJob('voice-only', () => voiceOnly(0, 1.2), (r) => (r.passedPlay.voice + r.pas
 simJob('guitar-only', () => guitarOnly('additive'), () => null, false, true);
 simJob('guitar-only', () => guitarOnly('additive'), (r) => (r.passedSing.guitar > 0 ? `guitar passed ${r.passedSing.guitar} sing steps` : null), true);
 simJob('guitar-only re-plucks', () => guitarOnlyRepeated('ks'), (r) => (r.passedSing.guitar > 0 ? `guitar passed ${r.passedSing.guitar} sing steps` : null), true);
+
+// ========================================================================== third review's rig (permanent)
+// Its own synthesis (modal guitar, glottal voice, speech, TV) and session rig that mirrors the app's
+// timing (700 ms gap with the guitar detector still running, frames dropped during the reference).
+// The detector carries its state through the whole session, so in-session effects are measured.
+interface C3Spec { cond: string; quick?: boolean; kind?: 'S' | 'I'; extraPluck?: number; extraBreath?: number; reviewFirst?: number; note?: string }
+const C3: C3Spec[] = [
+  { cond: 'base', quick: true, reviewFirst: 0.8 },
+  { cond: 'baseDamp' }, { cond: 'loudG' }, { cond: 'quietV' }, { cond: 'loudV' }, { cond: 'base441' }, { cond: 'female' },
+  { cond: 'electric', extraPluck: 0.25 },
+  { cond: 'detune10' }, { cond: 'detune20' }, { cond: 'detune20s', quick: true }, { cond: 'detune30' }, { cond: 'detune35' }, { cond: 'detuneM30' },
+  { cond: 'gvars', reviewFirst: 0.6 }, { cond: 'svars' }, { cond: 'svarsF' }, { cond: 'sloppy', extraBreath: 0.15 }, { cond: 'octDown' },
+  { cond: 'huntOct' }, { cond: 'huntOctFast' }, { cond: 'huntDamped' }, { cond: 'huntStep', quick: true }, { cond: 'huntStepSlow' }, { cond: 'huntStepLoudG' },
+  { cond: 'idleTalk' }, { cond: 'idleTalkF', quick: true }, { cond: 'idleHum' }, { cond: 'idleHumF' }, { cond: 'idleHumStrict' },
+  { cond: 'strict' }, { cond: 'strictVars' },
+  { cond: 'fan' }, { cond: 'fanQuiet' }, { cond: 'hum50' }, { cond: 'hum60loud' }, { cond: 'talker' }, { cond: 'talkerLoud', kind: 'I' }, { cond: 'tv' }, { cond: 'tvLoud', kind: 'I' },
+  { cond: 'bathroom' }, { cond: 'agc' }, { cond: 'agcFast' }, { cond: 'gate' }, { cond: 'gateSoft' }, { cond: 'hp200' },
+  { cond: 'jitter' }, { cond: 'jitterMild', quick: true }, { cond: 'slow40' }, { cond: 'burst20' }, { cond: 'burst40' }, { cond: 'phoneAll', reviewFirst: 0.6 },
+  { cond: 'review03', quick: true, reviewFirst: 0.6 }, { cond: 'review045', reviewFirst: 0.8 }, { cond: 'review06LoudG', reviewFirst: 0.8 }, { cond: 'review03Damp', reviewFirst: 0.6 }, { cond: 'review03LoudG', reviewFirst: 0.6 }, { cond: 'review1', reviewFirst: 0.9 },
+];
+for (const sp of C3) {
+  job(`critic3 ${sp.cond}`, 12, sp.quick ?? false, (quick) => {
+    const [st, ro] = C3CONDS[sp.cond]();
+    const keepReview = sp.reviewFirst !== undefined;
+    const log = console.log;
+    console.log = () => {};
+    let r: C3Res;
+    try {
+      r = c3student({ ...st, maxNotes: quick ? 14 : 101, noReview: !keepReview }, ro);
+    } finally {
+      console.log = log;
+    }
+    const acc = r.accidental.filter((a) => a.phase !== 'review');
+    const problems: string[] = [];
+    if (r.stuckSing + r.stuckPlay) problems.push(`stuck on ${r.stuckSing + r.stuckPlay} notes`);
+    if (acc.length) problems.push(`${acc.length} accidental advances (${acc.slice(0, 2).map((a) => `#${a.idx + 1} ${a.phase}: ${a.why}`).join('; ')})`);
+    if (r.wrongOctFifth) problems.push(`${r.wrongOctFifth} wrong octave/fifth`);
+    if (r.notesNeedingExtraPluck > Math.ceil((sp.extraPluck ?? 0.05) * r.total)) problems.push(`${r.notesNeedingExtraPluck} notes needed another pluck`);
+    if (r.notesNeedingExtraBreath > Math.ceil((sp.extraBreath ?? 0.05) * r.total)) problems.push(`${r.notesNeedingExtraBreath} notes needed another breath`);
+    if (keepReview && r.reviews && r.reviewFirstTry < Math.floor((sp.reviewFirst ?? 0) * r.reviews)) problems.push(`review first try ${r.reviewFirstTry}/${r.reviews}`);
+    if (r.reviewAccidental) problems.push(`${r.reviewAccidental} accidental review advances`);
+    const q = (xs: number[]) => (xs.length ? [...xs].sort((a, b) => a - b)[xs.length >> 1].toFixed(0) : '-');
+    const summary = `${st.name}: clean ${r.clean}/${r.total}, stuck ${r.stuckSing}/${r.stuckPlay}, accidental ${acc.length}, extra plucks on ${r.notesNeedingExtraPluck}, extra breaths on ${r.notesNeedingExtraBreath}, play median ${q(r.playTta)} ms${keepReview ? `, review first try ${r.reviewFirstTry}/${r.reviews}` : ''}`;
+    const info = sp.kind === 'I';
+    return [{ name: `critic3 ${sp.cond}`, kind: info ? 'I' : 'S', n: 1, acc: 0, tta: [], oct: 0, fails: problems, ok: info || problems.length === 0, summary: problems.length ? `${summary} — ${problems.join('; ')}` : summary }];
+  });
+}
+
+// ========================================================================== in-session pitch bias
+// A detector that has heard a realistic session must read a new pluck as a fresh one does.
+job('in-session bias: state learned in a session vs fresh detector', 10, true, (quick) => {
+  const snaps = sessionSnapshots(quick ? 12 : 61, quick ? [2, 10] : [2, 10, 30, 60]);
+  const rows = biasTable(snaps, quick ? [40, 52, 64, 76] : BIAS_NOTES);
+  // (a reading off by a large interval — the faint high E read as its fifth above — is a detector
+  // limit on that note that comes and goes with the noise, counted separately)
+  const off = (c: number | null) => c === null || Math.abs(c) >= 100;
+  const usable = rows.filter((r) => !off(r.fresh) && r.state.every((c) => !off(c)));
+  const misreads = rows.filter((r) => off(r.fresh) || r.state.some(off)).map((r) => `${r.synth} ${r.midi} ${r.level} dBFS`);
+  const worst = usable.reduce((a, r) => (r.worst > a.worst ? r : a), usable[0]);
+  const bad = usable.filter((r) => r.worst > 3);
+  const summary = `${usable.length} note/level/synth cases, ${snaps.length} session snapshots: worst |in-session − fresh| ${worst.worst.toFixed(1)} c (${worst.synth} midi ${worst.midi} at ${worst.level} dBFS)${misreads.length ? `; interval misreads (fresh or in session) on ${misreads.join(', ')}` : ''}`;
+  return [{ name: 'in-session bias (target ≤ 3 c everywhere)', kind: 'S', n: 1, acc: 0, tta: [], oct: 0, fails: bad.map((r) => `${r.synth} ${r.midi} ${r.level} dBFS: ${r.worst.toFixed(1)} c`), ok: bad.length === 0, summary: bad.length ? `${summary} — ${bad.length} over 3 c` : summary }];
+});
 
 export function allJobs(): Job[] {
   return jobs;

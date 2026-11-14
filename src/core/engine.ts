@@ -7,8 +7,12 @@ import { PitchDetector } from './pitch.ts';
 export const FRAME_SIZE = 2048;
 /** Analysis hop (the app polls the analysers at this interval). */
 export const HOP_MS = 20;
-/** Guitar exact-octave tolerance. */
-export const GUITAR_TOLERANCE_CENTS = 40;
+/**
+ * Guitar exact-octave tolerance. Beginners' fretted notes are often 10–30 c sharp (pressing hard,
+ * high action) and a hard pick reads a few cents sharp at the attack; a neighbouring fret is
+ * 100 c away, and the identity read at the attack must also be on the target fret.
+ */
+export const GUITAR_TOLERANCE_CENTS = 45;
 /**
  * The guitar path is high-passed (4th-order Butterworth) at this frequency before detection, and
  * searches no lower than GUITAR_MIN_HZ: mains hum (50/60 Hz) is attenuated and cannot be
@@ -30,7 +34,7 @@ export function singConfig(targetMidi: number, toleranceCents: number, exactOcta
 
 export function guitarConfig(targetMidi: number, strict = false, fast = false): MatchConfig {
   // Phrase review uses a shorter steady window so sixteenth notes at the written tempo (≈180 ms) fit.
-  return { ...PLUCKED_DEFAULTS, targetMidi, toleranceCents: GUITAR_TOLERANCE_CENTS, mode: 'exact', strict, ...(fast ? { pitchWindowMs: 90 } : {}) };
+  return { ...PLUCKED_DEFAULTS, targetMidi, toleranceCents: GUITAR_TOLERANCE_CENTS, mode: 'exact', strict, humGuard: !fast, ...(fast ? { pitchWindowMs: 90, repeatOnsets: true } : {}) };
 }
 
 export function makeDetector(sampleRate: number, path: AnalysisPath = 'voice'): PitchDetector {
@@ -100,7 +104,7 @@ export class StreamAnalyzer {
 
   frame(path: AnalysisPath, t: number): PitchFrame {
     const r = this.det[path].detect(path === 'guitar' ? this.hp : this.lp, t);
-    return { t, freq: r.freq, clarity: r.clarity, rms: r.rms, upClarity: r.upClarity ?? 0, cleanRms: r.cleanRms, nsdf: r.nsdf, sr: this.sampleRate, novFreq: r.novFreq, novClarity: r.novClarity, novShare: r.novShare };
+    return { t, freq: r.freq, clarity: r.clarity, rms: r.rms, upClarity: r.upClarity ?? 0, cleanRms: r.cleanRms, nsdf: r.nsdf, sr: this.sampleRate, novFreq: r.novFreq, novClarity: r.novClarity, novShare: r.novShare, hfDb: r.hfDb };
   }
 }
 

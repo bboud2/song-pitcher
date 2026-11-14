@@ -171,6 +171,11 @@ async function enableMic(): Promise<void> {
 
 let tunerHeard = false;
 
+/** Within 1 Hz of k·50 or k·60 Hz (k = 1..3): an electrical hum line, not a sung or played note (open D, 146.8 Hz, is 3 Hz from 150). */
+function isMainsHum(hz: number): boolean {
+  return [50, 60].some((b) => [1, 2, 3].some((k) => Math.abs(hz - b * k) <= 1));
+}
+
 function tunerScreen(): HTMLElement {
   const noteEl = h('div', { class: 'tuner-note placeholder', attrs: { 'data-testid': 'tuner-note' }, text: '– –' });
   const hzEl = h('div', { class: 'tuner-hz muted', text: 'Play an open string or sing' });
@@ -199,14 +204,17 @@ function tunerScreen(): HTMLElement {
       const db = 20 * Math.log10(Math.max(f.rms, 1e-6));
       peakDb = Math.max(db, peakDb - 1.5);
       level.style.width = `${Math.max(0, Math.min(100, ((peakDb + 80) / 70) * 100))}%`;
-      const m = stable.push(f);
+      let m = stable.push(f);
+      // Mains hum (50/60 Hz and its low harmonics) is not a note: never show it or count it as heard.
+      if (m !== null && isMainsHum(440 * Math.pow(2, (m - 69) / 12))) m = null;
       if (m !== null) heardFrames++;
       room.frame(f.t, db, m !== null);
       if (++n % 10 === 0) {
         const sp = audio.spectrumDb();
         if (sp) room.spectrum(sp.db, sp.sampleRate, sp.fftSize);
         const v = room.verdict();
-        const msg = v.messages.join(' ');
+        // (the most important point only: a stack of advice would run under the Begin button)
+        const msg = v.messages[0] ?? '';
         if (advice.textContent !== msg) advice.textContent = msg;
         advice.dataset.level = v.level;
         advice.dataset.margin = v.marginDb === null ? '' : String(Math.round(v.marginDb));
@@ -228,7 +236,7 @@ function tunerScreen(): HTMLElement {
       hzEl.textContent = `${hz.toFixed(1)} Hz`;
       meter.set(nn.cents, 5);
       for (const st of strings.children) (st as HTMLElement).dataset.on = String(Number((st as HTMLElement).dataset.midi) === nn.midi);
-    });
+    }, () => 'voice', ['guitar']);
   }
 
   return h('main', { class: 'screen tuner', attrs: { 'data-testid': 'tuner' } },
@@ -424,15 +432,18 @@ const HINT_TEXT: Record<string, Record<string, string>> = {
     decaying: 'Strict check: that sounds like the guitar — sing it',
   },
   play: {
-    noAttack: 'I hear that pitch, but no new pluck — stop singing, then pluck the string',
+    noAttack: 'Stop singing, then pluck the string',
+    ringing: 'That’s a note still ringing — pluck again',
+    outOfTune: 'Close — this string may be out of tune (check the tuner)',
     moving: 'Stop on the note (no sliding)',
     octaveHigh: 'Right note, one octave too high',
     octaveLow: 'Right note, one octave too low',
-    sustained: 'Strict check: that sounds like singing — pluck the string',
+    sustained: 'That sounded like humming — pluck the string',
   },
 };
 HINT_TEXT.review = HINT_TEXT.play;
-const PITCH_REVEALING_HINTS = new Set(['octaveHigh', 'octaveLow']);
+// Hints that only appear when the pitch is (nearly) right: hidden when the meter is off.
+const PITCH_REVEALING_HINTS = new Set(['octaveHigh', 'octaveLow', 'noAttack', 'ringing', 'outOfTune', 'carryOver']);
 
 function targetLabel(midi: number, s: Settings, tonic: number, keyPc: number): { name: string | null; degree: string | null } {
   const off = midi - tonic;
@@ -497,7 +508,7 @@ function sessionScreen(): HTMLElement {
     if (showMeter) {
       let label: string | undefined;
       if (m?.detectedMidi != null && settings.showNoteName) label = `You: ${noteName(Math.round(m.detectedMidi), keyPc)}`;
-      meter.set(m?.cents ?? null, tol, { label, idle: effPhase === 'sing' ? 'Sing now…' : 'Play now…' });
+      meter.set(m?.cents ?? null, tol, { label, idle: effPhase === 'sing' ? 'Sing now…' : 'Play now…', fretted: effPhase !== 'sing' });
     }
     let hintText = m?.hint ? HINT_TEXT[effPhase]?.[m.hint] : undefined;
     if (hintText && m?.hint && !showMeter && PITCH_REVEALING_HINTS.has(m.hint)) hintText = undefined;
@@ -696,7 +707,7 @@ function settingsPanel(): HTMLElement {
       toggle('phraseReview', 'Phrase review', s.skipGuitar ? 'needs the guitar step — off while “Skip guitar step” is on' : 'play each phrase back in order', s.skipGuitar),
       toggle('allowSkip', 'Allow “Skip note” button'),
       h('h2', { class: 'section-title', text: 'Checking' }),
-      toggle('strictCheck', 'Strict instrument check', 'also judge the sound: a sung note must hold, a guitar note must ring down. Can reject fading singers and very sustained guitars.'),
+      toggle('strictCheck', 'Strict instrument check', 'a plucked string never passes the singing step; a guitar note must clearly ring down. Can reject fading singers and very sustained guitars.'),
       h('h2', { class: 'section-title', text: 'Sound' }),
       toggle('playKeyAtStart', 'Play the key at the start', 'do–mi–sol chord before the first note (also on the “Key” button)'),
       h('div', { class: 'actions' },

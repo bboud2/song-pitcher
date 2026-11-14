@@ -180,7 +180,3 @@ export function transpose(song: Song, tonicMidi: number): number[] {
 export function phraseEndingAt(song: Song, i: number): Phrase | undefined {
   return song.phrases.find((p) => p.end === i);
 }
-
-export function phraseContaining(song: Song, i: number): Phrase | undefined {
-  return song.phrases.find((p) => i >= p.start && i <= p.end);
-}
