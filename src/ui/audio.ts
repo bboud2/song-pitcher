@@ -21,6 +21,7 @@ export class AudioEngine {
   /** Two analysis paths, the same as the offline engine: voice (low-passed) and guitar (high-passed). */
   private analysers: Partial<Record<AnalysisPath, AnalyserNode>> = {};
   private detectors: Partial<Record<AnalysisPath, PitchDetector>> = {};
+  private lastT: Partial<Record<AnalysisPath, number>> = {};
   private buf: Float32Array<ArrayBuffer> = new Float32Array(FRAME_SIZE);
   private rawAnalyser: AnalyserNode | null = null;
   private specBuf: Float32Array<ArrayBuffer> | null = null;
@@ -144,8 +145,11 @@ export class AudioEngine {
     if (ctx.state !== 'running') void ctx.resume().catch(() => {});
     const t = ctx.currentTime;
     if (this.playing || t < this.mutedUntil) return; // never analyse our own reference tone
+    // (no new audio since this path's last frame: the timer ran early or twice)
+    if (this.lastT[path] === t) return;
+    this.lastT[path] = t;
     an.getFloatTimeDomainData(this.buf);
-    const r = det.detect(this.buf);
+    const r = det.detect(this.buf, t);
     this.onFrame({
       t, freq: r.freq, clarity: r.clarity, rms: r.rms, upClarity: r.upClarity ?? 0, cleanRms: r.cleanRms, nsdf: r.nsdf,
       sr: ctx.sampleRate, novFreq: r.novFreq, novClarity: r.novClarity, novShare: r.novShare,

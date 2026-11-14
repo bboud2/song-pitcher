@@ -39,9 +39,9 @@ export function makeDetector(sampleRate: number, path: AnalysisPath = 'voice'): 
     // guitar tops out at E5 (659 Hz); a high voice singing two octaves up can reach G6 (1568 Hz)
     maxFreq: path === 'guitar' ? 1200 : 1700,
     cutoff: 0.9,
-    // Guitar path: stationary noise (fan, hiss, mains hum) is tracked and removed from every
-    // frame. Not on the voice path: a held sung note is itself steady, and the tracker would
-    // slowly learn it as "noise".
+    // Guitar path: stationary room noise (fan, hiss) is learned from frames that hold nothing
+    // else and removed from every frame. Not on the voice path (its notes are what it listens to
+    // for seconds at a time).
     denoise: path === 'guitar',
     hopSec: HOP_MS / 1000,
   });
@@ -99,7 +99,7 @@ export class StreamAnalyzer {
   }
 
   frame(path: AnalysisPath, t: number): PitchFrame {
-    const r = this.det[path].detect(path === 'guitar' ? this.hp : this.lp);
+    const r = this.det[path].detect(path === 'guitar' ? this.hp : this.lp, t);
     return { t, freq: r.freq, clarity: r.clarity, rms: r.rms, upClarity: r.upClarity ?? 0, cleanRms: r.cleanRms, nsdf: r.nsdf, sr: this.sampleRate, novFreq: r.novFreq, novClarity: r.novClarity, novShare: r.novShare };
   }
 }
