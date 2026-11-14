@@ -19,6 +19,8 @@ import type { RigOpts } from './students.ts';
 import { CONDS as C3CONDS } from './critic3/run.ts';
 import { student as c3student, type Res as C3Res } from './critic3/student.ts';
 import { BIAS_NOTES, biasTable, sessionSnapshots } from './bias.ts';
+import { CASES as C4CASES } from './critic4/cases.ts';
+import { student as c4student, type Res as C4Res } from './critic4/rig4.ts';
 
 export type Kind = 'P' | 'N' | 'I' | 'S';
 export interface GroupResult {
@@ -41,7 +43,7 @@ export interface Job {
   quick: boolean;
   /** rough cost, for balancing shards */
   cost: number;
-  run: (quick: boolean) => GroupResult[];
+  run: (quick: boolean) => GroupResult[] | Promise<GroupResult[]>;
 }
 
 const ONSET = 0.3;
@@ -110,7 +112,7 @@ class Group {
 }
 
 const jobs: Job[] = [];
-function job(name: string, cost: number, quick: boolean, run: (quick: boolean) => GroupResult[]): void {
+function job(name: string, cost: number, quick: boolean, run: (quick: boolean) => GroupResult[] | Promise<GroupResult[]>): void {
   jobs.push({ name, cost, quick, run });
 }
 
@@ -347,7 +349,7 @@ for (const [cname, cond] of Object.entries(G2)) {
   job(full, 2, ['base pick, -14 dBFS peak', 'quiet: -40 dBFS peak', 'fan noise -35 dBFS', 'hum 60 Hz -40 dBFS', 'hammer-on from 2 frets below', 'vibrato +-35c 6 Hz', 'previous note (octave below) still ringing', 'TV speech -30 dBFS rms'].includes(cname), (quick) => {
     const acc = new Group(full, 'P');
     const oct = new Group(`guitar3 N ${cname} — accepted as the wrong octave or a fifth`, 'N');
-    const sing = new Group(`guitar3 I ${cname} — the same pluck accepted by the singing step`, 'I');
+    const sing = new Group(`guitar3 N ${cname} — the same pluck accepted by the singing step`, 'N');
     for (const m of pickNotes(GM, quick, 3)) {
       for (const s0 of quick ? [1] : [1, 2, 3]) {
         const fx: Fx = cond(m, s0 * 17 + m);
@@ -364,12 +366,12 @@ for (const [cname, cond] of Object.entries(G2)) {
   });
 }
 for (const [cname, cond] of Object.entries(V2)) {
-  const kind: Kind = V_TOO_SHORT.has(cname) ? 'I' : 'P';
-  const full = `voice3 ${kind} ${cname}${kind === 'I' ? ' (shorter than the ~0.5 s hold)' : ''}`;
+  const kind: Kind = 'P';
+  const full = `voice3 ${kind} ${cname}${V_TOO_SHORT.has(cname) ? ' (shorter than the ~0.5 s hold)' : ''}`;
   job(full, 2, ['base 1.5 s, vibrato 10-30c', 'fades out -15 dB/s from the start', 'out of breath: 0.3 s steady then -25 dB/s', 'short accented "da" 0.5 s, 12 dB/s decay', 'already singing when the step opens (sang along with the tone)', 'vocal fry 85%'].includes(cname), (quick) => {
     const acc = new Group(full, kind);
     const octX = new Group(`voice3 N ${cname} — exact-octave mode accepted the wrong octave`, 'N');
-    const play = new Group(`voice3 I ${cname} — the same voice accepted by the guitar step`, 'I');
+    const play = new Group(`voice3 N ${cname} — the same voice accepted by the guitar step`, 'N');
     for (const m of pickNotes(VM, quick, 3)) {
       for (const s0 of quick ? [1] : [1, 2, 3]) {
         const fx: Fx = cond(m, s0 * 17 + m);
@@ -464,12 +466,13 @@ for (const [sname, mk] of [
       }
       const sRate = singFA / singT;
       const pRate = playFA / playT;
-      // Default mode has no timbre test, so talking at the right pitch can advance a step (a
-      // documented trade-off, informational); the strict instrument check must keep it rare.
+      // Speech must rarely advance a step, default settings included (it is not the student
+      // playing): target ≤ 0.5 per minute per target in the guitar step, ≤ 1 in the singing step.
+      const bad = [pRate > 0.5 ? `guitar step ${pRate.toFixed(2)}/min` : '', sRate > 1 ? `singing step ${sRate.toFixed(2)}/min` : ''].filter(Boolean);
       out.push({
-        name: `speech ${sname}${strict ? ' [strict]' : ' [default]'}: false accepts per minute per target${strict ? ' (target ≤ 0.5 guitar step)' : ''}`,
-        kind: strict ? 'S' : 'I', n: 1, acc: 0, tta: [], oct: 0, fails: strict && pRate > 0.5 ? [`guitar step ${pRate.toFixed(2)}/min`] : [],
-        ok: !strict || pRate <= 0.5, summary: `sing ${sRate.toFixed(2)}/min, guitar ${pRate.toFixed(2)}/min`,
+        name: `speech ${sname}${strict ? ' [strict]' : ' [default]'}: false accepts per minute per target (target ≤ 0.5 guitar, ≤ 1 singing)`,
+        kind: 'S', n: 1, acc: 0, tta: [], oct: 0, fails: bad,
+        ok: bad.length === 0, summary: `sing ${sRate.toFixed(2)}/min, guitar ${pRate.toFixed(2)}/min`,
       });
     }
     return out;
@@ -510,11 +513,11 @@ const students: StudentSpec[] = [
   { st: { name: 'B5 hunts -5, +2, -1 then right, 0.6 s apart, ringing', wrongFirst: [-5, 2, -1], wrongGap: 0.6, ring: true, noReview: true }, expect: honestExpect(), quick: true },
   { st: { name: 'B6 hunts +7, +12, -12 (1.4 s each), ringing', wrongFirst: [7, 12, -12], wrongGap: 1.4, ring: true, noReview: true }, expect: honestExpect() },
   { st: { name: 'B7 hunts +7, +12, -12 (1.4 s each), damped', wrongFirst: [7, 12, -12], wrongGap: 1.4, noReview: true }, expect: honestExpect() },
-  { st: { name: 'C1 hums a short dying "hm" at the target pitch while hunting (counts as found unless strict)', humWhileHunting: true, noReview: true }, expect: () => null, info: true },
+  { st: { name: 'C1 hums a short dying "hm" at the target pitch while hunting', humWhileHunting: true, noReview: true }, expect: (r) => (r.playByVoice > 0 ? `${r.playByVoice} guitar steps passed by humming` : null) },
   { st: { name: 'C1s same, strict instrument check on', humWhileHunting: true, noReview: true }, o: { settings: { strictCheck: true } }, expect: (r) => (r.playByVoice > 0 ? `${r.playByVoice} guitar steps passed by humming` : null) },
-  { st: { name: 'C3 voice-only, never plays (deliberate; passes by default)', noGuitar: true, vDur: 1.2, intonSd: 5 }, o: { maxNotes: 30 }, expect: () => null, info: true },
+  { st: { name: 'C3 voice-only, never plays', noGuitar: true, vDur: 1.2, intonSd: 5 }, o: { maxNotes: 30 }, expect: (r) => (r.playByVoice > 0 || r.reviewByVoice > 0 ? `voice passed ${r.playByVoice} guitar steps, ${r.reviewByVoice} reviews` : null) },
   { st: { name: 'C3s voice-only, strict instrument check on', noGuitar: true, vDur: 1.2, intonSd: 5 }, o: { maxNotes: 30, settings: { strictCheck: true } }, expect: (r) => (r.playByVoice > 0 || r.reviewByVoice > 0 ? `voice passed ${r.playByVoice} guitar steps, ${r.reviewByVoice} reviews` : null) },
-  { st: { name: 'C4 guitar-only, never sings (deliberate; passes by default)', noSing: true, noReview: true }, o: { maxNotes: 30 }, expect: () => null, info: true },
+  { st: { name: 'C4 guitar-only, never sings', noSing: true, noReview: true }, o: { maxNotes: 30 }, expect: (r) => (r.singByGuitar > 0 ? `${r.singByGuitar} singing steps passed by the guitar` : null) },
   { st: { name: 'C4s guitar-only, strict instrument check on', noSing: true, noReview: true }, o: { maxNotes: 30, settings: { strictCheck: true } }, expect: (r) => (r.singByGuitar > 0 ? `${r.singByGuitar} singing steps passed by the guitar` : null) },
   { st: { name: 'D review at 50% of the written tempo, damped', reviewTempo: 0.5 }, expect: honestExpect({ reviews: true }) },
   { st: { name: 'D review, even notes every 0.3 s, ringing', reviewIOI: 0.3, ring: true }, expect: honestExpect({ reviews: true }), quick: true },
@@ -573,9 +576,9 @@ simJob('honest 0.8 s', () => honest(0.8), honestCheck);
 simJob('honest 1.5 s straight tone', () => honest(1.5, 0, { vibCents: 0 }), honestCheck);
 simJob('honest humming', () => honest(1.5, 0, { vowel: 'hum' }), honestCheck);
 simJob('honest KS + review', () => honest(1.2, 0, {}, 'ks', true), honestCheck);
-simJob('voice-only', () => voiceOnly(0, 1.2), () => null, false, true);
+simJob('voice-only', () => voiceOnly(0, 1.2), (r) => (r.passedPlay.voice + r.passedReview.voice > 0 ? `voice passed ${r.passedPlay.voice} guitar steps / ${r.passedReview.voice} review notes` : null));
 simJob('voice-only', () => voiceOnly(0, 1.2), (r) => (r.passedPlay.voice + r.passedReview.voice > 0 ? `voice passed ${r.passedPlay.voice} guitar steps / ${r.passedReview.voice} review notes` : null), true);
-simJob('guitar-only', () => guitarOnly('additive'), () => null, false, true);
+simJob('guitar-only', () => guitarOnly('additive'), (r) => (r.passedSing.guitar > 0 ? `guitar passed ${r.passedSing.guitar} sing steps` : null));
 simJob('guitar-only', () => guitarOnly('additive'), (r) => (r.passedSing.guitar > 0 ? `guitar passed ${r.passedSing.guitar} sing steps` : null), true);
 simJob('guitar-only re-plucks', () => guitarOnlyRepeated('ks'), (r) => (r.passedSing.guitar > 0 ? `guitar passed ${r.passedSing.guitar} sing steps` : null), true);
 
@@ -593,7 +596,7 @@ const C3: C3Spec[] = [
   { cond: 'huntOct' }, { cond: 'huntOctFast' }, { cond: 'huntDamped' }, { cond: 'huntStep', quick: true }, { cond: 'huntStepSlow' }, { cond: 'huntStepLoudG' },
   { cond: 'idleTalk' }, { cond: 'idleTalkF', quick: true }, { cond: 'idleHum' }, { cond: 'idleHumF' }, { cond: 'idleHumStrict' },
   { cond: 'strict' }, { cond: 'strictVars' },
-  { cond: 'fan' }, { cond: 'fanQuiet' }, { cond: 'hum50' }, { cond: 'hum60loud' }, { cond: 'talker' }, { cond: 'talkerLoud', kind: 'I' }, { cond: 'tv' }, { cond: 'tvLoud', kind: 'I' },
+  { cond: 'fan' }, { cond: 'fanQuiet' }, { cond: 'hum50' }, { cond: 'hum60loud' }, { cond: 'talker' }, { cond: 'talkerLoud' }, { cond: 'tv' }, { cond: 'tvLoud' },
   { cond: 'bathroom' }, { cond: 'agc' }, { cond: 'agcFast' }, { cond: 'gate' }, { cond: 'gateSoft' }, { cond: 'hp200' },
   { cond: 'jitter' }, { cond: 'jitterMild', quick: true }, { cond: 'slow40' }, { cond: 'burst20' }, { cond: 'burst40' }, { cond: 'phoneAll', reviewFirst: 0.6 },
   { cond: 'review03', quick: true, reviewFirst: 0.6 }, { cond: 'review045', reviewFirst: 0.8 }, { cond: 'review06LoudG', reviewFirst: 0.8 }, { cond: 'review03Damp', reviewFirst: 0.6 }, { cond: 'review03LoudG', reviewFirst: 0.6 }, { cond: 'review1', reviewFirst: 0.9 },
@@ -625,6 +628,68 @@ for (const sp of C3) {
     return [{ name: `critic3 ${sp.cond}`, kind: info ? 'I' : 'S', n: 1, acc: 0, tta: [], oct: 0, fails: problems, ok: info || problems.length === 0, summary: problems.length ? `${summary} — ${problems.join('; ')}` : summary }];
   });
 }
+
+// ========================================================================== fourth review's rig (permanent)
+// Waveguide guitar + source-filter voice, its own session rig (mic check first, main.ts timing,
+// in-session detector state). Every condition is an honest student; some hum, talk or sing while
+// hunting. Expectations: never stuck, never advanced by anything but the right pluck / the sung
+// note, at most 5 % of notes needing another pluck or breath, phrase review ≥ 90 % first try, no
+// hint that says something untrue.
+const C4_QUICK = new Set(['base', 'singOn', 'humTargetF', 'laBari', 'thumb', 'det35hard', 'rev03', 'quietSingerFan']);
+for (const name of Object.keys(C4CASES)) {
+  job(`critic4 ${name}`, 10, C4_QUICK.has(name), (quick) => {
+    const c = C4CASES[name];
+    const log = console.log;
+    console.log = () => {};
+    let r: C4Res;
+    try {
+      r = c4student({ name, maxNotes: quick ? 14 : 101, ...c.st }, c.ro ?? {});
+    } finally {
+      console.log = log;
+    }
+    const lim = (share: number) => Math.max(1, Math.ceil(share * r.total));
+    const problems: string[] = [];
+    if (r.stuckSing + r.stuckPlay) problems.push(`stuck on ${r.stuckSing + r.stuckPlay} notes (sing ${r.stuckSing}, play ${r.stuckPlay})`);
+    if (r.accidental.length) problems.push(`${r.accidental.length} accidental advances (${r.accidental.slice(0, 2).map((a) => `#${a.index + 1} ${a.phase}: ${a.why}`).join('; ')})`);
+    if (r.needPluck > lim(0.05)) problems.push(`${r.needPluck} notes needed another pluck`);
+    if (r.needBreath > lim(0.05)) problems.push(`${r.needBreath} notes needed another breath`);
+    if (r.rev && r.revFirst < Math.floor(0.9 * r.rev)) problems.push(`review first try ${r.revFirst}/${r.rev}`);
+    if (r.revStuck) problems.push(`review stuck ${r.revStuck}`);
+    const fh = Object.entries(r.falseHints);
+    if (fh.length) problems.push(`untrue hints: ${fh.map(([k, v]) => `${k} (${v} frames)`).join(', ')}`);
+    const med = (xs: number[]) => (xs.length ? [...xs].sort((x, y) => x - y)[xs.length >> 1].toFixed(0) : '-');
+    const summary = `clean ${r.clean}/${r.total}, stuck ${r.stuckSing}/${r.stuckPlay}, accidental ${r.accidental.length}, extra plucks on ${r.needPluck}, extra breaths on ${r.needBreath}, play median ${med(r.playTta)} ms, review first try ${r.revFirst}/${r.rev}`;
+    return [{ name: `critic4 ${name}`, kind: 'S', n: 1, acc: 0, tta: [], oct: 0, fails: problems, ok: problems.length === 0, summary: problems.length ? `${summary} — ${problems.join('; ')}` : summary }];
+  });
+}
+
+// Isolation tables of the fourth review (fresh matcher per stimulus). Each script prints a table;
+// a row counts as failed when the script marks it FAIL or a pass rate is below its target.
+function c4table(file: string, cost: number, quick: boolean, judge: (line: string) => string | null): void {
+  job(`critic4 table ${file}`, cost, quick, () => {
+    const lines: string[] = [];
+    const log = console.log;
+    console.log = (...a: unknown[]) => { lines.push(a.map(String).join(' ')); };
+    return import(`./critic4/${file}.ts`).then(
+      () => {
+        console.log = log;
+        const bad = lines.map((l) => judge(l)).filter((x): x is string => !!x);
+        return [{ name: `critic4 table ${file}`, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: bad, ok: bad.length === 0, summary: bad.length ? `${lines.length} rows, ${bad.length} failing: ${bad.slice(0, 4).join(' | ')}` : `${lines.length} rows, all as expected` }];
+      },
+      (e) => {
+        console.log = log;
+        throw e;
+      },
+    );
+  });
+}
+c4table('hum_iso', 6, true, (l) => (/passes the guitar step [1-9]\d*\/\d+ \(default\)/.test(l) ? l.replace(/\s+/g, ' ').slice(0, 110) : null));
+c4table('latefret', 6, false, (l) => { const m = /first pluck accepted (\d+)\/(\d+)/.exec(l); return m && m[1] !== m[2] ? l.replace(/\s+/g, ' ').slice(0, 90) : null; });
+c4table('short', 6, false, (l) => { const m = /default (\d+)\/12/.exec(l); return m && m[1] !== '12' ? l.replace(/\s+/g, ' ').slice(0, 90) : null; });
+c4table('sing_iso', 8, false, (l) => (l.startsWith('FAIL') ? l.replace(/\s+/g, ' ').slice(0, 110) : null));
+c4table('techniques', 14, false, (l) => (l.startsWith('FAIL') ? l.replace(/\s+/g, ' ').slice(0, 110) : null));
+c4table('leak', 2, false, (l) => { const m = /on pitch (\d+)\/12, 3 st off (\d+)\/12/.exec(l); return m && m[1] !== m[2] ? l : null; });
+c4table('probe_zero', 2, false, (l) => (/clean -1\d\d|clean -2\d\d/.test(l) ? l.slice(0, 120) : null));
 
 // ========================================================================== in-session pitch bias
 // A detector that has heard a realistic session must read a new pluck as a fresh one does.

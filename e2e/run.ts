@@ -151,6 +151,10 @@ async function correctRun(device: { name: string; slug: string }, wav: string): 
   await page.waitForTimeout(300);
   await shot(page, device.slug, '2-tuner');
 
+  // Every 20 ms hop must be analysed (the attack tracker needs every sample): an AudioWorklet in
+  // Chromium, with the timer fallbacks only for browsers without one.
+  const mode = await page.evaluate(() => (window as unknown as { __songPitcherCapture: string }).__songPitcherCapture);
+  check(mode === 'worklet', `${tag} microphone read by the AudioWorklet (got ${mode})`);
   await page.click('[data-testid="begin"]');
   await page.waitForSelector('[data-testid="session"]');
   check(await waitSession(page, `phase === 'listen' && index === 0`, 3000), `${tag} session starts in listen on note 1 (${elapsed()})`);
@@ -343,11 +347,14 @@ async function main(): Promise<void> {
       // step must still hold. With the strict check on it must stay in the singing step.)
       await Promise.all(devs.map((d) => negativeRun(d, wrong, 'wrong notes', 'sing|play')));
       await Promise.all(devs.map((d) => negativeRun(d, wrong, 'wrong notes, strict check', 'sing', { strictCheck: true })));
-      // Deliberately singing in the guitar step / plucking in the singing step is only caught with the
-      // "strict instrument check" setting (off by default, so honest students are never held up).
+      // Singing in the guitar step / plucking in the singing step is caught with the default
+      // settings (the attack shape tells a pluck from a voice; a string still ringing after a pluck
+      // does not pass the singing step).
       // Sings every note in the guitar's octave and never plays: must get stuck in the guitar step.
-      await Promise.all(devs.map((d) => negativeRun(d, voiceOnly, 'voice only, no guitar, strict check', 'play', { strictCheck: true })));
+      await Promise.all(devs.map((d) => negativeRun(d, voiceOnly, 'voice only, no guitar', 'play')));
       // Plucks every note and never sings: must get stuck in the singing step.
+      await Promise.all(devs.map((d) => negativeRun(d, guitarOnly, 'guitar only, no singing', 'sing')));
+      await Promise.all(devs.map((d) => negativeRun(d, voiceOnly, 'voice only, no guitar, strict check', 'play', { strictCheck: true })));
       await Promise.all(devs.map((d) => negativeRun(d, guitarOnly, 'guitar only, no singing, strict check', 'sing', { strictCheck: true })));
     }
     await toneRun();

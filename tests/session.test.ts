@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { PitchFrame } from '../src/core/matcher.ts';
+import type { FrameAttack, PitchFrame } from '../src/core/matcher.ts';
 import { midiToFreq } from '../src/core/music.ts';
 import { Session, summarize } from '../src/core/session.ts';
 import { DEFAULT_SETTINGS, normalizeSettings, updateSetting, type Settings } from '../src/core/settings.ts';
@@ -13,17 +13,27 @@ import { STAR_SPANGLED_BANNER as SSB } from '../src/core/songs.ts';
  */
 class Clock {
   t = 0;
+  /** attack events the stream analyser would report (a pluck is sharp, a voice builds up) */
+  events: FrameAttack[] = [];
+  private sounding: 'voice' | 'pluck' | null = null;
   private frame(s: Session, f: Omit<PitchFrame, 't'>): boolean {
     this.t += 0.02;
-    return s.pitch({ t: this.t, ...f });
+    return s.pitch({ t: this.t, ...f, attacks: this.events.filter((e) => e.t <= this.t && this.t - e.t <= 10) });
+  }
+  private attack(kind: 'voice' | 'pluck'): void {
+    if (kind === 'pluck') this.events.push({ t: this.t + 0.005, riseMs: 2, riseDb: 30, band: 'full' }, { t: this.t + 0.005, riseMs: 1, riseDb: 25, band: 'hf' });
+    else if (this.sounding !== 'voice') this.events.push({ t: this.t + 0.005, riseMs: 45, riseDb: 30, band: 'full' });
+    this.sounding = kind;
   }
   quiet(s: Session, ms: number): boolean {
     let adv = false;
     for (let k = 0; k < Math.round(ms / 20); k++) adv = this.frame(s, { freq: 0, clarity: 0, rms: 0.0001 }) || adv;
+    this.sounding = null;
     return adv;
   }
   sing(s: Session, midi: number, ms: number, opts: { cents?: number; rms?: number } = {}): boolean {
     let adv = false;
+    this.attack('voice');
     for (let k = 0; k < Math.round(ms / 20); k++) {
       adv = this.frame(s, { freq: midiToFreq(midi + (opts.cents ?? 0) / 100), clarity: 0.97, rms: opts.rms ?? 0.1 }) || adv;
     }
@@ -31,6 +41,7 @@ class Clock {
   }
   pluck(s: Session, midi: number, ms: number, opts: { cents?: number; peak?: number } = {}): boolean {
     let adv = false;
+    this.attack('pluck');
     for (let k = 0; k < Math.round(ms / 20); k++) {
       const rms = (opts.peak ?? 0.2) * Math.pow(10, (-15 * k * 0.02) / 20);
       adv = this.frame(s, { freq: midiToFreq(midi + (opts.cents ?? 0) / 100), clarity: 0.97, rms }) || adv;
@@ -92,8 +103,9 @@ describe('session state machine', () => {
       c.t += 0.02;
       expect(s.pitch({ t: c.t, freq: midiToFreq(55), clarity: 0.95, rms: 0.1 * Math.pow(0.85, k) })).toBe(false);
     }
-    // (says why: still singing, or — once the voice has died away — only a note still sounding)
-    expect(['noAttack', 'ringing']).toContain(s.view().match?.hint);
+    // (no untrue hint: it is the voice, not a string still ringing — "still singing" while it
+    // sounds, nothing once it has died away)
+    expect([null, undefined, 'singing']).toContain(s.view().match?.hint);
     c.quiet(s, 300);
     expect(c.pluck(s, 55, 400)).toBe(true);
   });

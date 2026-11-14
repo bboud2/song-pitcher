@@ -23,6 +23,10 @@ export interface PitchResult {
   novShare?: number;
   /** Level (dB) of the 2–6 kHz band: the pick/finger noise of an attack shows up here. */
   hfDb?: number;
+  /** harmonics 4–10 vs 1–2 of the detected pitch (dB): strings lose their upper partials first */
+  tiltDb?: number;
+  /** new power on odd vs even harmonics of the detected pitch (dB), when something new appeared */
+  novOddDb?: number;
 }
 
 /**
@@ -136,6 +140,8 @@ export class PitchDetector {
   private lastT: number | null = null;
   private fft: FFT;
   private lastPower: Float64Array | null = null;
+  /** the rectified "what's new" power spectrum of the current frame (for novOdd) */
+  private novSpec: Float64Array | null = null;
   /** recent power spectra with their times, for the "what's new since 160 ms ago" pitch */
   private history: { t: number; p: Float64Array }[] = [];
   private acf: Float64Array;
@@ -188,11 +194,13 @@ export class PitchDetector {
       energy += v * v;
     }
     const rms = Math.sqrt(energy / N);
-    if (energy < 1e-12) {
-      // digital silence (no mic noise at all): nothing to learn, and nothing is quieter
-      this.quietPower = 0;
-      this.seen++;
-      return { freq: 0, clarity: 0, rms, cleanRms: 0 };
+    // Digital silence or a dropout (exact zeros: a mic that is not delivering yet, a gated or
+    // interrupted stream): nothing to learn from, and it must not count as "the quietest the room
+    // gets" either — that would switch noise learning off for the rest of the session.
+    let zeros = 0;
+    for (let i = 0; i < N; i++) if (frame[off + i] === 0) zeros++;
+    if (energy < 1e-12 || zeros > N / 8) {
+      return { freq: 0, clarity: 0, rms, cleanRms: energy < 1e-12 ? 0 : rms };
     }
 
     // Autocorrelation via FFT: r = IFFT(|X|^2)
@@ -279,7 +287,48 @@ export class PitchDetector {
     const lo = Math.max(1, Math.floor(half * 0.97));
     const hi = Math.min(maxLag, Math.ceil(half * 1.03));
     for (let k = lo; k <= hi; k++) if (nsdf[k] > upClarity) upClarity = nsdf[k];
-    return { freq: this.sampleRate / period, clarity: Math.min(1, peakVal), rms, upClarity, cleanRms, nsdf: Float32Array.from(nsdf), hfDb, ...nov };
+    const freq = this.sampleRate / period;
+    return { freq, clarity: Math.min(1, peakVal), rms, upClarity, cleanRms, nsdf: Float32Array.from(nsdf), hfDb, tiltDb: this.tilt(freq), novOddDb: this.novOdd(freq), ...nov };
+  }
+
+  /**
+   * Of the power that is NEW since 160 ms ago, how much sits on the odd harmonics (1, 3, 5) of
+   * `f0` versus the even ones (2, 4, 6), in dB. A new note an octave above a sounding one (a
+   * pluck while singing the octave below) adds only even harmonics: strongly negative.
+   */
+  private novOdd(f0: number): number | undefined {
+    const P = this.novSpec;
+    this.novSpec = null;
+    if (!P) return undefined;
+    const nb = P.length;
+    const h = (k: number) => {
+      const c = (k * f0 * nb) / this.sampleRate;
+      let best = 0;
+      for (let b = Math.floor(c * 0.98); b <= Math.ceil(c * 1.02) && b < nb >> 1; b++) best = Math.max(best, P[b]);
+      return best;
+    };
+    const odd = h(1) + h(3) + h(5);
+    const even = h(2) + h(4) + h(6);
+    if (odd + even <= 0) return undefined;
+    return 10 * Math.log10((odd + 1e-20) / (even + 1e-20));
+  }
+
+  /** Spectral tilt across the harmonics of `f0` in the last (noise-cleaned) power spectrum. */
+  private tilt(f0: number): number {
+    const P = this.lastPower;
+    if (!P) return 0;
+    const nb = P.length;
+    const h = (k: number) => {
+      const c = (k * f0 * nb) / this.sampleRate;
+      let best = 0;
+      for (let b = Math.floor(c * 0.97); b <= Math.ceil(c * 1.03) && b < nb >> 1; b++) best = Math.max(best, P[b]);
+      return best;
+    };
+    let lo = 0;
+    let hi = 0;
+    for (let k = 1; k <= 2; k++) lo += h(k);
+    for (let k = 4; k <= 10; k++) if (k * f0 < 5000) hi += h(k);
+    return 10 * Math.log10((hi + 1e-20) / (lo + 1e-20));
   }
 
   /** MPM peak picking on an NSDF-like array: returns the fractional period and its height. */
@@ -356,6 +405,7 @@ export class PitchDetector {
    * pitch. Returns novelty fields for the frame.
    */
   private noveltyPitch(now: number): { novFreq: number; novClarity: number; novShare: number } {
+    this.novSpec = null;
     const P = this.lastPower;
     if (!P) return { novFreq: 0, novClarity: 0, novShare: 0 };
     // the most recent stored spectrum at least 160 ms old (by audio time, not frame count)
@@ -380,6 +430,7 @@ export class PitchDetector {
       im[i] = 0;
     }
     if (!(nov > 0) || !(tot > 0)) return { novFreq: 0, novClarity: 0, novShare: 0 };
+    this.novSpec = Float64Array.from(re);
     this.fft.transform(re, im, true);
     const N = this.size;
     const r0 = re[0];

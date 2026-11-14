@@ -295,3 +295,14 @@ body.flash .stage { animation: flash 0.6s ease-out; }
 .home .sticky-actions.two > :first-child { flex: 1.4; }
 .home .sticky-actions.two > :nth-child(2) { flex: 1; min-height: 68px; font-size: 1.05rem; }
 .home { padding-bottom: 8px; }
+
+/* Mic check on short phones (iPhone SE / 8, 568–667 px tall): a compact tuner card so the advice
+   and the help text stay above the Begin button without scrolling. */
+@media (max-height: 700px) and (orientation: portrait) {
+  .tuner-card { gap: 6px; padding: 12px 12px; }
+  .tuner-note { font-size: min(22vw, 11vh, 96px); }
+  .string { padding: 6px 0; }
+  .tuner .meter-ends { display: none; }
+  .tuner-help .muted { font-size: 0.95rem; }
+  .tuner .sticky-actions .btn.big { min-height: 56px; }
+}

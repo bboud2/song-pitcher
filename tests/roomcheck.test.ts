@@ -44,6 +44,20 @@ describe('room check', () => {
     expect(r.verdict().hum).toBe(50);
   });
 
+  it('the room level is measured only between notes: plucking again and again does not raise it', () => {
+    const r = new RoomCheck();
+    let t = 0;
+    for (let k = 0; k < 100; k++) r.frame((t += 0.02), -62, false);
+    for (let n = 0; n < 6; n++) {
+      for (let k = 0; k < 40; k++) r.frame((t += 0.02), -24 - k * 0.3, true);
+      for (let k = 0; k < 20; k++) r.frame((t += 0.02), -40 - k, false); // the ring dying away
+    }
+    for (let k = 0; k < 375; k++) r.frame((t += 0.02), -62, false); // 7.5 s later
+    const v = r.verdict();
+    expect(v.floorDb).toBeLessThan(-60);
+    expect(v.marginDb).toBeGreaterThan(35);
+  });
+
   it('the margin figure holds steady after the note (no sinking while you read it)', () => {
     const r = new RoomCheck();
     let t = 0;

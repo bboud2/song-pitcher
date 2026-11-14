@@ -236,7 +236,7 @@ function tunerScreen(): HTMLElement {
       hzEl.textContent = `${hz.toFixed(1)} Hz`;
       meter.set(nn.cents, 5);
       for (const st of strings.children) (st as HTMLElement).dataset.on = String(Number((st as HTMLElement).dataset.midi) === nn.midi);
-    }, () => 'voice', ['guitar']);
+    }, () => 'guitar', ['voice']);
   }
 
   return h('main', { class: 'screen tuner', attrs: { 'data-testid': 'tuner' } },
@@ -288,6 +288,8 @@ let lastKey = '';
 const eventLog: { t: number; index: number; phase: string; target: number; detected: number | null; cents: number | null }[] = [];
 (window as unknown as { __songPitcherLog: typeof eventLog }).__songPitcherLog = eventLog;
 (window as unknown as { __songPitcherRenderTone: typeof renderToneOffline }).__songPitcherRenderTone = renderToneOffline;
+/** How the microphone is being read (worklet / script / poll), for the end-to-end test. */
+Object.defineProperty(window, '__songPitcherCapture', { get: () => audio.captureMode });
 let updateSession: ((v: SessionView) => void) | null = null;
 
 function onFrame(f: PitchFrame): void {
@@ -427,23 +429,25 @@ function phaseHint(phase: string): string {
 const HINT_TEXT: Record<string, Record<string, string>> = {
   sing: {
     moving: 'Settle on one steady note…',
-    carryOver: 'That’s the guitar still ringing — now sing it',
+    carryOver: 'That’s the guitar ringing — now sing it',
     tooShort: 'Hold the note a little longer (about half a second)',
+    unclear: 'I can’t hear the pitch clearly — sing a bit louder',
     decaying: 'Strict check: that sounds like the guitar — sing it',
   },
   play: {
-    noAttack: 'Stop singing, then pluck the string',
+    voiceLike: 'That sounded like singing — pluck the string',
+    singing: 'I can hear you singing — stop, then pluck the string',
     ringing: 'That’s a note still ringing — pluck again',
     outOfTune: 'Close — this string may be out of tune (check the tuner)',
     moving: 'Stop on the note (no sliding)',
     octaveHigh: 'Right note, one octave too high',
     octaveLow: 'Right note, one octave too low',
-    sustained: 'That sounded like humming — pluck the string',
+    sustained: 'Strict check: let the string ring freely after the pluck',
   },
 };
 HINT_TEXT.review = HINT_TEXT.play;
 // Hints that only appear when the pitch is (nearly) right: hidden when the meter is off.
-const PITCH_REVEALING_HINTS = new Set(['octaveHigh', 'octaveLow', 'noAttack', 'ringing', 'outOfTune', 'carryOver']);
+const PITCH_REVEALING_HINTS = new Set(['octaveHigh', 'octaveLow', 'ringing', 'outOfTune', 'carryOver']);
 
 function targetLabel(midi: number, s: Settings, tonic: number, keyPc: number): { name: string | null; degree: string | null } {
   const off = midi - tonic;
@@ -707,7 +711,7 @@ function settingsPanel(): HTMLElement {
       toggle('phraseReview', 'Phrase review', s.skipGuitar ? 'needs the guitar step — off while “Skip guitar step” is on' : 'play each phrase back in order', s.skipGuitar),
       toggle('allowSkip', 'Allow “Skip note” button'),
       h('h2', { class: 'section-title', text: 'Checking' }),
-      toggle('strictCheck', 'Strict instrument check', 'a plucked string never passes the singing step; a guitar note must clearly ring down. Can reject fading singers and very sustained guitars.'),
+      toggle('strictCheck', 'Strict instrument check', 'extra checks: a sung note must hold its level, a guitar note must clearly ring down. Can reject fading singers and very sustained guitars.'),
       h('h2', { class: 'section-title', text: 'Sound' }),
       toggle('playKeyAtStart', 'Play the key at the start', 'do–mi–sol chord before the first note (also on the “Key” button)'),
       h('div', { class: 'actions' },

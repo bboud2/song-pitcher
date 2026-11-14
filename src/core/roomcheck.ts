@@ -65,15 +65,19 @@ export class RoomCheck {
   private humFrames = 0;
   private hearing = false;
   private good = false;
+  private lastNoteT = -Infinity;
 
   /** One analysed frame: time, raw level (dBFS) and whether a steady note is being heard. */
   frame(t: number, db: number, hearingNote: boolean): void {
-    this.levels.push({ t, db });
-    while (this.levels.length && this.levels[0].t < t - 4) this.levels.shift();
-    // the loudest note of the last 6 s (a steady figure, not one that sinks while you watch)
+    // The room is measured only while no note sounds — not during a note, and not in the 2 s
+    // after one (its ring) — over the last 10 s.
+    if (hearingNote) this.lastNoteT = t;
+    if (!hearingNote && t - this.lastNoteT > 2) this.levels.push({ t, db });
+    while (this.levels.length && this.levels[0].t < t - 10) this.levels.shift();
+    // the loudest note of the last 20 s (a steady figure, not one that sinks while you watch)
     if (hearingNote) this.notes.push({ t, db });
-    while (this.notes.length && this.notes[0].t < t - 6) this.notes.shift();
-    this.hearing = hearingNote;
+    while (this.notes.length && this.notes[0].t < t - 20) this.notes.shift();
+    this.hearing = hearingNote || t - this.lastNoteT < 2;
   }
 
   /**

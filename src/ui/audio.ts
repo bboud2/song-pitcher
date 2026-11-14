@@ -1,12 +1,15 @@
-// Browser audio: microphone capture + analysis loop, reference-tone synthesis, wake lock.
-// Playback and listening never overlap: while a reference plays (plus a decay tail) the
-// analysis loop drops frames, and the session state machine ignores mic input in 'listen'.
-import {
-  BUTTERWORTH4_Q, FRAME_SIZE, GUITAR_HPF_HZ, HOP_MS, VOICE_LPF_HZ, makeDetector, type AnalysisPath,
-} from '../core/engine.ts';
+// Browser audio: microphone capture + analysis, reference-tone synthesis, wake lock.
+//
+// Every sample of the microphone goes through the same StreamAnalyzer the offline tests use:
+// an AudioWorklet hands the raw samples to the page, which analyses one frame per 20 ms of
+// AUDIO (not per timer tick), so a slow or throttled timer only delays the analysis, it never
+// skips audio. Fallbacks, in order: ScriptProcessorNode, then reading the newest samples from an
+// AnalyserNode on a timer (gap-free while the timer fires at least every ~170 ms).
+// Playback and listening never overlap: while a reference plays (plus a decay tail) frames are
+// dropped and what was heard is forgotten, and the session ignores mic input in 'listen'.
+import { FRAME_SIZE, HOP_MS, StreamAnalyzer, type AnalysisPath } from '../core/engine.ts';
 import type { PitchFrame } from '../core/matcher.ts';
 import { midiToFreq } from '../core/music.ts';
-import type { PitchDetector } from '../core/pitch.ts';
 
 /** Silence after a reference tone before the mic is trusted again (room decay + analysis window). */
 const TAIL_SEC = 0.3;
@@ -18,12 +21,15 @@ type WakeLockNav = Navigator & { wakeLock?: { request(type: 'screen'): Promise<W
 export class AudioEngine {
   ctx: AudioContext | null = null;
   private stream: MediaStream | null = null;
-  /** Two analysis paths, the same as the offline engine: voice (low-passed) and guitar (high-passed). */
-  private analysers: Partial<Record<AnalysisPath, AnalyserNode>> = {};
-  private detectors: Partial<Record<AnalysisPath, PitchDetector>> = {};
-  private lastT: Partial<Record<AnalysisPath, number>> = {};
-  private buf: Float32Array<ArrayBuffer> = new Float32Array(FRAME_SIZE);
-  private warmBuf: Float32Array<ArrayBuffer> = new Float32Array(FRAME_SIZE);
+  /** Both analysis paths (voice, guitar) and the attack tracker, fed with every sample. */
+  private sa: StreamAnalyzer | null = null;
+  /** how the samples arrive: 'worklet' | 'script' | 'poll' (diagnostics, e2e) */
+  captureMode: 'worklet' | 'script' | 'poll' | 'none' = 'none';
+  private acc = new Float32Array(0);
+  private fed = 0;
+  private wasMuted = false;
+  private pollBuf: Float32Array<ArrayBuffer> | null = null;
+  private pollLast = -1;
   private rawAnalyser: AnalyserNode | null = null;
   private specBuf: Float32Array<ArrayBuffer> | null = null;
 
@@ -45,7 +51,7 @@ export class AudioEngine {
   private master: GainNode | null = null;
 
   get ready(): boolean {
-    return !!this.ctx && !!this.analysers.voice;
+    return !!this.ctx && !!this.sa;
   }
 
   get isPlaying(): boolean {
@@ -93,27 +99,8 @@ export class AudioEngine {
       });
       const ctx = this.ctx;
       const src = ctx.createMediaStreamSource(this.stream);
-      // Web Audio's lowpass/highpass Q is in dB.
-      const chain = (type: BiquadFilterType, hz: number): AudioNode => {
-        let node: AudioNode = src;
-        for (const q of BUTTERWORTH4_Q) {
-          const b = ctx.createBiquadFilter();
-          b.type = type;
-          b.frequency.value = hz;
-          b.Q.value = 20 * Math.log10(q);
-          node.connect(b);
-          node = b;
-        }
-        return node;
-      };
-      for (const [path, node] of [['voice', chain('lowpass', VOICE_LPF_HZ)], ['guitar', chain('highpass', GUITAR_HPF_HZ)]] as const) {
-        const a = ctx.createAnalyser();
-        a.fftSize = FRAME_SIZE;
-        a.smoothingTimeConstant = 0;
-        node.connect(a); // never connected to the speakers
-        this.analysers[path] = a;
-        this.detectors[path] = makeDetector(ctx.sampleRate, path);
-      }
+      this.sa = new StreamAnalyzer(ctx.sampleRate);
+      await this.startCapture(src);
       // unfiltered, high-resolution spectrum for the mic/room check (hum lines)
       this.rawAnalyser = ctx.createAnalyser();
       this.rawAnalyser.fftSize = 8192;
@@ -123,12 +110,79 @@ export class AudioEngine {
     await resume;
   }
 
-  /** Start delivering analysed frames every HOP_MS, from the path `pathFn` names at each tick. */
+  /** Hook the microphone up to the analysis: AudioWorklet, else ScriptProcessor, else polling. */
+  private async startCapture(src: MediaStreamAudioSourceNode): Promise<void> {
+    const ctx = this.ctx!;
+    const sink = ctx.createGain();
+    sink.gain.value = 0; // processing nodes must reach the destination to run; nothing is heard
+    sink.connect(ctx.destination);
+    try {
+      await ctx.audioWorklet.addModule(new URL('capture-worklet.js', document.baseURI).href);
+      const node = new AudioWorkletNode(ctx, 'capture', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
+      node.port.onmessage = (e: MessageEvent<{ samples: Float32Array; frame: number }>) => this.onAudio(e.data.samples, e.data.frame / ctx.sampleRate);
+      src.connect(node).connect(sink);
+      this.captureMode = 'worklet';
+      return;
+    } catch {
+      /* fall through */
+    }
+    try {
+      const sp = ctx.createScriptProcessor(1024, 1, 1);
+      sp.onaudioprocess = (e) => this.onAudio(new Float32Array(e.inputBuffer.getChannelData(0)), ctx.currentTime);
+      src.connect(sp).connect(sink);
+      this.captureMode = 'script';
+      return;
+    } catch {
+      /* fall through */
+    }
+    this.captureMode = 'poll';
+  }
+
+  /** New samples whose last one is at audio time `tEnd`: analyse every whole hop. */
+  private onAudio(samples: Float32Array, tEnd: number): void {
+    const sa = this.sa;
+    if (!sa) return;
+    const hop = Math.round((HOP_MS / 1000) * sa.sampleRate);
+    const all = new Float32Array(this.acc.length + samples.length);
+    all.set(this.acc);
+    all.set(samples, this.acc.length);
+    let off = 0;
+    while (all.length - off >= hop) {
+      sa.push(all.subarray(off, off + hop));
+      off += hop;
+      this.fed += hop;
+      const t = tEnd - (all.length - off) / sa.sampleRate;
+      if (this.fed >= FRAME_SIZE) this.deliver(t);
+    }
+    this.acc = all.slice(off);
+  }
+
+  private deliver(t: number): void {
+    const sa = this.sa!;
+    if (this.playing || t < this.mutedUntil) {
+      this.wasMuted = true; // never analyse our own reference tone
+      return;
+    }
+    if (this.wasMuted) {
+      sa.attacks.clear(); // ...nor remember its attacks
+      this.wasMuted = false;
+    }
+    if (!this.onFrame) return;
+    const path = this.pathFn();
+    const f = sa.frame(path, t);
+    // (e.g. the mic check also runs the guitar detector, so it has learned the room's noise
+    // before the first guitar step)
+    for (const w of this.warm) if (w !== path) sa.frame(w, t);
+    this.onFrame(f);
+  }
+
+  /** Start delivering analysed frames (one per 20 ms of audio), from the path `pathFn` names. */
   listen(cb: (f: PitchFrame) => void, pathFn: () => AnalysisPath = () => 'voice', warm: AnalysisPath[] = []): void {
     this.warm = warm;
     this.onFrame = cb;
     this.pathFn = pathFn;
     if (this.timer !== null) return;
+    // (the timer only keeps the context running and, in the last-resort mode, reads the samples)
     this.timer = window.setInterval(() => this.tick(), HOP_MS);
   }
 
@@ -142,32 +196,18 @@ export class AudioEngine {
 
   private tick(): void {
     const ctx = this.ctx;
-    const path = this.pathFn();
-    const an = this.analysers[path];
-    const det = this.detectors[path];
-    if (!ctx || !an || !det || !this.onFrame) return;
+    if (!ctx) return;
     if (ctx.state !== 'running') void ctx.resume().catch(() => {});
-    const t = ctx.currentTime;
-    if (this.playing || t < this.mutedUntil) return; // never analyse our own reference tone
-    // (no new audio since this path's last frame: the timer ran early or twice)
-    if (this.lastT[path] === t) return;
-    this.lastT[path] = t;
-    an.getFloatTimeDomainData(this.buf);
-    const r = det.detect(this.buf, t);
-    // (e.g. the mic check also runs the guitar detector, so it has learned the room's noise
-    // before the first guitar step)
-    for (const w of this.warm) {
-      const wa = this.analysers[w];
-      const wd = this.detectors[w];
-      if (w === path || !wa || !wd || this.lastT[w] === t) continue;
-      this.lastT[w] = t;
-      wa.getFloatTimeDomainData(this.warmBuf);
-      wd.detect(this.warmBuf, t);
-    }
-    this.onFrame({
-      t, freq: r.freq, clarity: r.clarity, rms: r.rms, upClarity: r.upClarity ?? 0, cleanRms: r.cleanRms, nsdf: r.nsdf,
-      sr: ctx.sampleRate, novFreq: r.novFreq, novClarity: r.novClarity, novShare: r.novShare, hfDb: r.hfDb,
-    });
+    if (this.captureMode !== 'poll' || !this.rawAnalyser) return;
+    // Last resort: the newest samples from the analyser (8192 = ~170 ms of history).
+    const a = this.rawAnalyser;
+    this.pollBuf ??= new Float32Array(a.fftSize);
+    const now = ctx.currentTime;
+    const fresh = this.pollLast < 0 ? FRAME_SIZE : Math.min(a.fftSize, Math.round((now - this.pollLast) * ctx.sampleRate));
+    if (fresh <= 0) return;
+    this.pollLast = now;
+    a.getFloatTimeDomainData(this.pollBuf);
+    this.onAudio(this.pollBuf.slice(a.fftSize - fresh), now);
   }
 
   /** Current audio-clock time (seconds). */
@@ -238,8 +278,8 @@ export class AudioEngine {
     this.stopPlayback();
     this.stream?.getTracks().forEach((t) => t.stop());
     this.stream = null;
-    this.analysers = {};
-    this.detectors = {};
+    this.sa = null;
+    this.captureMode = 'none';
   }
 }
 

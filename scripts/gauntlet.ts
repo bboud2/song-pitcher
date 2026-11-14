@@ -86,7 +86,7 @@ async function runShard(spec: string): Promise<void> {
   for (const j of mine) {
     const t0 = Date.now();
     const order = allJobs().indexOf(j);
-    const res = j.run(quick).map((r, k) => ({ ...r, order: order * 10 + k }));
+    const res = (await j.run(quick)).map((r, k) => ({ ...r, order: order * 10 + k }));
     process.stdout.write(`__RESULT__${JSON.stringify({ job: j.name, ms: Date.now() - t0, res })}\n`);
   }
 }

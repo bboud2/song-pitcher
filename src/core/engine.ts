@@ -1,7 +1,11 @@
 // Shared pitch-engine configuration used by both the browser app and the offline gauntlet,
 // so what is measured offline is what runs on the phone. No DOM.
-import { NoteMatcher, PLUCKED_DEFAULTS, SUNG_DEFAULTS, type MatchConfig, type PitchFrame } from './matcher.ts';
+import { NoteMatcher, PLUCKED_DEFAULTS, SUNG_DEFAULTS, type FrameAttack, type MatchConfig, type PitchFrame } from './matcher.ts';
 import { PitchDetector } from './pitch.ts';
+import { Biquad } from './engine-filters.ts';
+import { AttackTracker } from './attack.ts';
+
+export { Biquad };
 
 /** Analysis window. 2048 samples ≈ 43 ms at 48 kHz: ~3.5 periods of guitar low E (82.4 Hz). */
 export const FRAME_SIZE = 2048;
@@ -34,7 +38,7 @@ export function singConfig(targetMidi: number, toleranceCents: number, exactOcta
 
 export function guitarConfig(targetMidi: number, strict = false, fast = false): MatchConfig {
   // Phrase review uses a shorter steady window so sixteenth notes at the written tempo (≈180 ms) fit.
-  return { ...PLUCKED_DEFAULTS, targetMidi, toleranceCents: GUITAR_TOLERANCE_CENTS, mode: 'exact', strict, humGuard: !fast, ...(fast ? { pitchWindowMs: 90, repeatOnsets: true } : {}) };
+  return { ...PLUCKED_DEFAULTS, targetMidi, toleranceCents: GUITAR_TOLERANCE_CENTS, mode: 'exact', strict, needPluck: !fast, ...(fast ? { pitchWindowMs: 90, repeatOnsets: true } : {}) };
 }
 
 export function makeDetector(sampleRate: number, path: AnalysisPath = 'voice'): PitchDetector {
@@ -51,32 +55,6 @@ export function makeDetector(sampleRate: number, path: AnalysisPath = 'voice'): 
   });
 }
 
-/** RBJ high-/low-pass biquad (same formulas as Web Audio's BiquadFilterNode). */
-export class Biquad {
-  private b0: number; private b1: number; private b2: number; private a1: number; private a2: number;
-  private x1 = 0; private x2 = 0; private y1 = 0; private y2 = 0;
-  constructor(sampleRate: number, fc: number, q: number, type: 'highpass' | 'lowpass' = 'highpass') {
-    const w = (2 * Math.PI * fc) / sampleRate;
-    const alpha = Math.sin(w) / (2 * q);
-    const cw = Math.cos(w);
-    const a0 = 1 + alpha;
-    const k = type === 'highpass' ? 1 + cw : 1 - cw;
-    this.b0 = k / 2 / a0;
-    this.b1 = (type === 'highpass' ? -k : k) / a0;
-    this.b2 = k / 2 / a0;
-    this.a1 = (-2 * cw) / a0;
-    this.a2 = (1 - alpha) / a0;
-  }
-  process(x: Float32Array, out: Float32Array = new Float32Array(x.length)): Float32Array {
-    for (let i = 0; i < x.length; i++) {
-      const y = this.b0 * x[i] + this.b1 * this.x1 + this.b2 * this.x2 - this.a1 * this.y1 - this.a2 * this.y2;
-      this.x2 = this.x1; this.x1 = x[i]; this.y2 = this.y1; this.y1 = y;
-      out[i] = y;
-    }
-    return out;
-  }
-}
-
 /** Streaming front end: keeps the latest FRAME_SIZE samples of the raw and the high-passed signal. */
 export class StreamAnalyzer {
   readonly sampleRate: number;
@@ -85,8 +63,11 @@ export class StreamAnalyzer {
   private filters: Biquad[];
   private lpFilters: Biquad[];
   private det: Record<AnalysisPath, PitchDetector>;
+  /** attack shapes of the guitar-path signal, from every sample pushed */
+  readonly attacks: AttackTracker;
 
   constructor(sampleRate: number) {
+    this.attacks = new AttackTracker(sampleRate);
     this.sampleRate = sampleRate;
     this.filters = BUTTERWORTH4_Q.map((q) => new Biquad(sampleRate, GUITAR_HPF_HZ, q, 'highpass'));
     this.lpFilters = BUTTERWORTH4_Q.map((q) => new Biquad(sampleRate, VOICE_LPF_HZ, q, 'lowpass'));
@@ -100,11 +81,23 @@ export class StreamAnalyzer {
     for (const b of this.lpFilters) g = b.process(g);
     shiftIn(this.lp, g);
     shiftIn(this.hp, f);
+    this.attacks.push(f);
   }
 
   frame(path: AnalysisPath, t: number): PitchFrame {
     const r = this.det[path].detect(path === 'guitar' ? this.hp : this.lp, t);
-    return { t, freq: r.freq, clarity: r.clarity, rms: r.rms, upClarity: r.upClarity ?? 0, cleanRms: r.cleanRms, nsdf: r.nsdf, sr: this.sampleRate, novFreq: r.novFreq, novClarity: r.novClarity, novShare: r.novShare, hfDb: r.hfDb };
+    return { t, freq: r.freq, clarity: r.clarity, rms: r.rms, upClarity: r.upClarity ?? 0, cleanRms: r.cleanRms, nsdf: r.nsdf, sr: this.sampleRate, novFreq: r.novFreq, novClarity: r.novClarity, novShare: r.novShare, hfDb: r.hfDb, tiltDb: r.tiltDb, novOddDb: r.novOddDb, attacks: this.recentAttacks(t) };
+  }
+
+  /** attack events of the last 10 s, timed against `t` (the time of the newest sample pushed) */
+  recentAttacks(t: number): FrameAttack[] {
+    const a = this.attacks;
+    const out: FrameAttack[] = [];
+    for (const e of a.events) {
+      const et = t - (a.samples - e.sample) / this.sampleRate;
+      if (t - et <= 10) out.push({ t: et, riseMs: e.riseMs, riseDb: e.riseDb, band: e.band });
+    }
+    return out;
   }
 }
 

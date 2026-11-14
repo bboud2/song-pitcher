@@ -20,6 +20,8 @@ export interface RigOpts {
   agc?: { slew: number; max: number; target?: number };
   gate?: { thDb: number; attDb: number };
   timer?: 'regular' | 'jitter' | 'jitterMild' | 'burst20' | 'burst40' | 'slow40';
+  /** 'hop' (default): one analysis per 20 ms of audio, as the app does now; 'tick': per timer tick (old app) */
+  delivery?: 'hop' | 'tick';
   seed?: number;
 }
 interface Ev { buf: Float32Array; start: number; stop: number | null; fade: number; tag: string; midi: number; string: number; gain: number }
@@ -135,6 +137,9 @@ export class Rig {
   private nextDt(): number {
     const hop = Math.round((HOP_MS / 1000) * this.sr);
     const m = this.o.timer ?? 'regular';
+    // The app now analyses every 20 ms of AUDIO whatever its timer does (see src/ui/audio.ts);
+    // 'tick' replays the old timer-driven analysis.
+    if ((this.o.delivery ?? 'hop') === 'hop' && m !== 'burst20' && m !== 'burst40') return hop;
     if (m === 'jitter') {
       const u = this.r();
       const ms = u < 0.8 ? 20 + (this.r() * 2 - 1) * 7 : u < 0.96 ? 30 + 18 * this.r() : 80 + 170 * this.r();
