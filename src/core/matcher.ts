@@ -346,6 +346,10 @@ interface Candidate {
   inherited?: boolean;
   /** opened while the sung answer was still sounding: the voice's loudest level just before */
   underVoice?: number;
+  /** level of the last frame before the onset window */
+  preLast?: number;
+  /** identified on the target (this reading) while its source was still being decided */
+  ready?: number;
   /** default guitar step: did not lose level just after its peak (second look pending) */
   held?: boolean;
   /** this pluck is the octave above the note that was sounding (that note's MIDI) */
@@ -461,7 +465,10 @@ export class NoteMatcher {
     // also repeats strongly at half the period read, which a real note an octave lower never
     // does. Heard with nylon and thumb plucks in reverberant rooms.)
     // (a real note an octave lower reads with full clarity; the misread is less clear)
-    if (c.kind === 'plucked' && midi !== null && (f.upClarity ?? 0) >= OCTAVE_UP_CLARITY && f.clarity < 0.96 && Math.abs(midi + 12 - c.targetMidi) < 0.6) midi += 12;
+    // (not while the sung answer is still sounding at exactly that pitch: a thin voice repeats
+    // strongly at half its period too, and it is not the string)
+    if (c.kind === 'plucked' && midi !== null && (f.upClarity ?? 0) >= OCTAVE_UP_CLARITY && f.clarity < 0.96 && Math.abs(midi + 12 - c.targetMidi) < 0.6 &&
+      !(this.sungOn && c.voiceMidi !== undefined && Math.abs(midi - c.voiceMidi) < 0.5)) midi += 12;
     const nov = f.novFreq && (f.novClarity ?? 0) >= 0.75 && f.novFreq >= 55 && f.novFreq <= 1700 ? freqToMidi(f.novFreq) : null;
     this.hist.push({ t: f.t, db, rawDb: rmsToDb(f.rms), clarity: f.clarity, midi, nov, up: f.upClarity ?? 0, hf: f.hfDb ?? -200, tilt: midi !== null ? (f.tiltDb ?? null) : null, novOdd: midi !== null && (f.novShare ?? 0) >= 0.2 ? (f.novOddDb ?? null) : null, nsdf: f.nsdf, sr: f.sr });
     while (this.hist.length && this.hist[0].t < f.t - 2.5) this.hist.shift();
@@ -800,6 +807,7 @@ export class NoteMatcher {
         onsetT, peakT: t, peakDb: db, lead, source: fromEvent ?? 'pending',
         preSounding: preMax >= c.minDb + 10 && preMax >= db - 25,
         underVoice: this.sungOn && c.voiceMidi !== undefined ? preMax : undefined,
+        preLast: pre.length ? pre[pre.length - 1].db : -Infinity,
         preMidi: preVoiced.length >= 3 ? median(preVoiced) : null,
         pre: pre.slice(-6),
         identity: null, lastWindowMidi: null, done: false, counted: false, decay: 'pending',
@@ -949,7 +957,10 @@ export class NoteMatcher {
               // voice is what reads (a pluck under it is taken once the voice stops)
               hint = 'singing';
               cand.steadySince = undefined;
-            } else if (cand.underVoice !== undefined && c.voiceMidi !== undefined && Math.abs(((((wm - c.voiceMidi) % 12) + 18) % 12) - 6) < 0.6 && cand.peakDb < cand.underVoice + 3) {
+            } else if (cand.underVoice !== undefined && c.voiceMidi !== undefined && Math.abs(((((wm - c.voiceMidi) % 12) + 18) % 12) - 6) < 0.6 && cand.peakDb < cand.underVoice + 3 &&
+              // (unless the voice had already faded well down — 6 dB under its level — and the new
+              // sound jumped 6 dB above what was left: a pluck as the answer dies away)
+              !(cand.underVoice - (cand.preLast ?? -Infinity) >= 6 && cand.peakDb >= (cand.preLast ?? -Infinity) + 6)) {
               // Opened while the sung answer was still sounding, at its pitch (or an octave of
               // it), and never louder than the voice itself was just before: that "onset" was the
               // voice swelling (vibrato in a room swings it by several dB), and what is left once
@@ -970,7 +981,9 @@ export class NoteMatcher {
               if (!dwell) {
                 // keep waiting
               } else if (c.needPluck && cand.source !== 'pluck') {
-                // (still deciding what made the attack)
+                // (still deciding what made the attack: remember that the note was right, in case
+                // it is decided only after another string or the room has taken over the reading)
+                if (cand.source !== 'voice') cand.ready ??= wm;
               } else if (!c.strict || cand.decay === 'confirmed') {
                 accepted = !c.neverAccept;
                 accMidi = wm;
@@ -1009,6 +1022,14 @@ export class NoteMatcher {
       }
     }
 
+    // The note was identified on the target while its source was still being decided; it has
+    // now been decided a pluck: that is the accept, whatever reads by now.
+    if (!accepted && cand && cand.ready !== undefined && cand.source === 'pluck' && c.needPluck && !c.strict && !c.neverAccept && t - cand.onsetT <= 1.5) {
+      accepted = true;
+      accMidi = cand.ready;
+      reason = 'window';
+      hint = null;
+    }
     const disp = this.displayMidi();
     const centsNow = disp !== null ? this.deviation(disp) : null;
     const inTolNow = centsNow !== null && Math.abs(centsNow) <= c.toleranceCents;
@@ -1253,7 +1274,7 @@ export class NoteMatcher {
     const w4 = meanDb(0.52, 0.62);
     if (Number.isNaN(w4)) return;
     const d3 = w3 - w4;
-    if (d3 >= 0.6 && w2 - w4 >= 1.5 && voicedIn(0.52, 0.62) >= 1 && !recovers(0.16, 0.62, 3) && !ends(0.1, 0.62)) return decide('pluck');
+    if (d3 >= 0.6 && w2 - w4 >= 1.5 && voicedIn(0.52, 0.62) >= 1 && !ends(0.1, 0.62)) return decide('pluck');
     // A held level is no evidence after all when a compressor or a phone's gain control holds it:
     // the sound is still a string if its upper partials die away against the fundamental (a
     // voice keeps its colour; compression changes the level, not the balance of the partials).
