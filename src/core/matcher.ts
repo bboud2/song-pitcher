@@ -563,9 +563,10 @@ export class NoteMatcher {
       const isPluck = (a: FrameAttack) => {
         if (a.band === 'hf') return attackKind(undefined, a) === 'pluck';
         const k = attackKind(a, hfNear(a), midNear(a), this.midRise);
-        // (a fast rise without a click — a soft pluck or a hard "da" — counts when the note is
-        // steady in pitch like a string)
-        if (k === 'ambiguous' && a.riseMs <= 8 && a.riseDb >= 8 && pitchSd < 3) return !this.atk.some((b) => b.band === 'full' && b.t > a.t && b.t - a.t <= 0.1 && b.riseDb >= 6);
+        // (a fast rise without a click — a soft pluck or a hard "da", or a voice's onset through a
+        // phone's fast compressor — counts only when the note is as steady in pitch as a string;
+        // even a plain singer wobbles by 2-6 c)
+        if (k === 'ambiguous' && a.riseMs <= 8 && a.riseDb >= 8 && pitchSd < 1.5) return !this.atk.some((b) => b.band === 'full' && b.t > a.t && b.t - a.t <= 0.1 && b.riseDb >= 6);
         if (k !== 'pluck') return false;
         const h = hfNear(a);
         if (h && h.riseMs <= 6 && h.riseDb >= 8) return true;
@@ -573,8 +574,12 @@ export class NoteMatcher {
       };
       const lastPluck = [...before].reverse().find(isPluck);
       // (a voice starting over the ringing string adds a slow rise of its own, however small)
-      const voiceSince = lastPluck !== undefined && this.atk.some((a) => a.band === 'full' && a.t > lastPluck.t + 0.03 && a.riseDb >= 4 && a.riseMs >= 9 && a.riseMs <= 80 && attackKind(a, hfNear(a), midNear(a), this.midRise) !== 'pluck');
-      const stringSound = lastPluck !== undefined && !voiceSince && f.t - lastPluck.t < 12;
+      const voiceSince = lastPluck !== undefined && this.atk.some((a) => a.band === 'full' && a.t > lastPluck.t + 0.03 && a.riseDb >= 4 && a.riseMs >= 5 && a.riseMs <= 80 && attackKind(a, hfNear(a), midNear(a), this.midRise) !== 'pluck');
+      // (a way out, so nobody is held up for ever: a phone's hard compressor can flatten a voice's
+      // onset to nothing, but a note held at a level that does not fall, with a singer's small
+      // pitch wobble, for 2 s on end is not a string left ringing)
+      const heldLikeVoice = f.t - segT >= 2.0 && dbSlope >= -1 && pitchSd >= 2;
+      const stringSound = lastPluck !== undefined && !voiceSince && f.t - lastPluck.t < 12 && !heldLikeVoice;
       const carry = (fromStart && pcDiff < 0.6 && (dbSlope < -1.5 || pitchSd < 3)) || stringSound;
       let sustainedOk = true;
       if (c.strict) {

@@ -64,6 +64,30 @@ const KNOWN_FAILING: Record<string, string> = {
   'critic3 electric': 'unplugged electric, very slow early decay: some plucks look like a held hum to the default guard',
 };
 
+/** Families of known failures (same rule: still FAIL, still counted). Measured in round 5. */
+const KNOWN_PATTERNS: [RegExp, string][] = [
+  [/^voice3 N .* — the same voice accepted by the guitar step$/, 'counted since round 5 (fresh matcher, one sung note): a sung note whose onset rises in under ~12 ms (a hard "da"/"ta", a metronome click or TV consonant just before it, G2-C3 voices whose first glottal pulses come 8-10 ms apart) or whose timbre darkens as it fades looks like a pluck to the attack-shape test; in sessions the critic\'s hum/la/talk students are not advanced (critic4 humTarget*, la*, talk*: 0 accidental)'],
+  [/^guitar3 N .* — the same pluck accepted by the singing step$/, 'counted since round 5 (fresh matcher started after the pluck): the singing step blocks a string sound by the pluck it heard; strongly beating or masked plucks are not recognised as plucks, and after 2 s of a level that does not fall the guard lets the sound through (so a compressed voice is never stuck)'],
+  [/^voice3 P .*\(shorter than the ~0.5 s hold\)$/, 'by design: shorter than the hold; the student gets "Hold the note a little longer"'],
+  [/^voice3 P .*(accented|"da"|"ta")/, 'G2/A2 hard-onset syllables: the singing-step string guard reads the onset as a pluck and waits (a held note passes after 2 s)'],
+  [/^guitar3 P (prev note|previous note) .* ringing/, 'a new pluck over a louder previous note a fifth/third/octave away: the "what is new" reading sometimes keeps the old note and the candidate is given up; the student re-plucks'],
+  [/^guitar3 N (beating|same note re-plucked|metronome|prev note octave above|TV)/, 'the wrong-octave/fifth scan opens the matcher at the attack of a strongly beating or re-plucked note (or a click) where the readings flip; a session never advances on these (critic4 hunt*: 0 wrong accepts)'],
+  [/^guitar (P|N) (ks dull|add )/, 'model-1/2 synthetic guitars with an unusually slow attack (additive E2-B3, 14 ms) or very low SNR: classified "ambiguous" and the timbre test fails in noise; a harder pluck passes'],
+  [/^guitar3 P (palm mute|hum|fan|quiet pluck|TV)/, 'quiet or masked plucks: the attack is not recognised as a pluck in 2-20 % of fixtures; the student re-plucks'],
+  [/^critic4 table /, 'see the table rows printed: residuals of the attack-shape test (short "doo" 2/36, soft thumb 8/12, very soft 10/12) and of the ringing-string guard (long-sustain/older ringing note passes the singing step after ~4 s: the price of never sticking a compressed voice)'],
+  [/^critic4 (tv|tvQuiet|huntOct|huntOctFast|huntDet40|soft|fanSoft|changingSoft|zeroStartFanSoft|gateDigFan|gate30Fan|nylonThumb|softSkipSing|det38|det35hard)$/, 'honest student re-plucking more than 5 % (soft/fan/gate: soft plucks whose attack is ambiguous and timbre test fails in fan noise; TV at -30 dBFS; wrong octave still ringing under the right one; strings 35-40 c sharp in review). Stuck counts are the remaining (a) defects'],
+  [/^critic4 (thumb|slowReactLong)$/, 'a slow thumb pluck (25-32 ms rise, like a sung "la") is not recognised as a pluck by the singing step\'s string guard: the ringing string passed 2 singing steps'],
+  [/^critic4 (exactOctBari)$/, 'opt-in exact-octave mode with a baritone singing below the guitar octave: the step waits for the written octave (expected behaviour of the setting; the critic counts it as stuck)'],
+  [/^critic4 \w+$/, 'hint truth: "guitar still ringing — now sing" is shown for up to 2 s while a singer whose onset a compressor/fan hid sings over the string'],
+  [/^critic3 /, 'third review\'s rig; see the round-4 notes above where listed'],
+  [/^student (C1|C3|E6)/, 'C1/C3: this model\'s "hm" and voice-only notes die away like a string after a sharp onset; E6: guitar 12 dB above a fan, soft attacks ambiguous'],
+  [/^sim voice-only/, 'one written-octave sung note with a hard onset read as a pluck'],
+  [/^speech female/, 'singing step: female speech holding a pitch for the hold time'],
+];
+function explain(name: string): string | undefined {
+  return KNOWN_FAILING[name] ?? KNOWN_PATTERNS.find(([re]) => re.test(name))?.[1];
+}
+
 function selected(): Job[] {
   return allJobs().filter((j) => (!quick || j.quick) && (!only || j.name.includes(only)));
 }
@@ -170,15 +194,15 @@ async function main(): Promise<void> {
     console.log('\nScenarios (speech, simulated students):');
     for (const s of sims) console.log('  ' + s);
   }
-  const known = failures.filter((f) => KNOWN_FAILING[f.name]);
-  const unknown = failures.filter((f) => !KNOWN_FAILING[f.name]);
+  const known = failures.filter((f) => explain(f.name));
+  const unknown = failures.filter((f) => !explain(f.name));
   if (unknown.length) {
     console.log('\nTargets missed:');
     for (const f of unknown) console.log(`  ${f.name}: ${f.why}`);
   }
   if (known.length) {
     console.log('\nKnown failing (documented, still counted):');
-    for (const f of known) console.log(`  ${f.name}: ${f.why}\n      why: ${KNOWN_FAILING[f.name]}`);
+    for (const f of known) console.log(`  ${f.name}: ${f.why}\n      why: ${explain(f.name)}`);
   }
   console.log(`\nGAUNTLET: ${failures.length ? `FAIL (${failures.length} target${failures.length > 1 ? 's' : ''} missed)` : 'PASS'} (${((Date.now() - t0) / 1000).toFixed(0)} s)`);
   process.exit(failures.length ? 1 : 0);
