@@ -95,7 +95,7 @@ export class StreamAnalyzer {
     const out: FrameAttack[] = [];
     for (const e of a.events) {
       const et = t - (a.samples - e.sample) / this.sampleRate;
-      if (t - et <= 10) out.push({ t: et, riseMs: e.riseMs, riseDb: e.riseDb, band: e.band });
+      if (t - et <= 10) out.push({ t: et, riseMs: e.riseMs, riseDb: e.riseDb, band: e.band, edgeDb: e.edgeDb });
     }
     return out;
   }

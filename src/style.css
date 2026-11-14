@@ -306,3 +306,10 @@ body.flash .stage { animation: flash 0.6s ease-out; }
   .tuner-help .muted { font-size: 0.95rem; }
   .tuner .sticky-actions .btn.big { min-height: 56px; }
 }
+
+/* Narrow phones (320 px): the tolerance choice goes under its label instead of past the card. */
+@media (max-width: 360px) {
+  .toggle-row:has(.segmented) { flex-wrap: wrap; }
+  .toggle-row .segmented { width: 100%; }
+  .toggle-row .segmented .seg { flex: 1; min-width: 0; }
+}

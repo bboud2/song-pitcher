@@ -51,12 +51,21 @@ describe('plucked matcher', () => {
     expect(r.hint).toBe('outOfTune');
   });
 
-  it('a hummed note at the target (steady level) does not pass; the following pluck does', () => {
-    // (a hum builds up over ~50 ms: the analyser reports a slow attack)
-    const hum: F[] = Array.from({ length: 35 }, (_, k) => ({ freq: midiToFreq(55), clarity: 0.97, rms: k < 2 ? 0.02 * (k + 1) : 0.05, attack: k === 0 ? ('voice' as const) : undefined }));
+  it('a hum that holds its level after its onset does not pass; the following pluck does', () => {
+    // (a string loses level from the peak of its attack on; a voice holds it)
+    const hum: F[] = Array.from({ length: 50 }, (_, k) => ({ freq: midiToFreq(55), clarity: 0.97, rms: k < 2 ? 0.02 * (k + 1) : 0.05, attack: k === 0 ? ('voice' as const) : undefined }));
     const m = new NoteMatcher(guitarConfig(55));
-    expect(run(m, [...quiet(10), ...hum]).at).toBeNull();
+    const r = run(m, [...quiet(10), ...hum]);
+    expect(r.at).toBeNull();
+    expect(r.hint).toBe('voiceLike');
     expect(run(m, [...quiet(15), ...pluck(40, () => 55)]).at).not.toBeNull();
+  });
+
+  it('a pluck with a slow (room-like) attack is accepted by default, not with the strict check', () => {
+    // (in a room the reverberation makes a pluck's level rise over ~40 ms, like a hum)
+    const slow: F[] = Array.from({ length: 40 }, (_, k) => ({ freq: midiToFreq(55), clarity: 0.97, rms: k < 2 ? 0.08 * (k + 1) : 0.2 * Math.pow(10, (-15 * (k - 2) * 0.02) / 20), attack: k === 0 ? ('voice' as const) : undefined }));
+    expect(run(new NoteMatcher(guitarConfig(55)), [...quiet(10), ...slow]).at).not.toBeNull();
+    expect(run(new NoteMatcher(guitarConfig(55, true)), [...quiet(10), ...slow]).at).toBeNull();
   });
 
   it('irregular frame timing (40 ms ticks, stalls) still accepts a pluck', () => {

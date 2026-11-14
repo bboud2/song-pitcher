@@ -17,15 +17,24 @@
 //                the pitch of the previous (possibly still ringing) note, must not be dying away.
 //  * 'plucked' — a NEW attack (level jump, or a clean jump to a new pitch for hammer-ons/
 //                legato) opens a candidate; the note's identity is read from the first steady
-//                window after that attack and is locked: a later octave flip of the detector (a
-//                dying note, hum) cannot turn it into a different note, and the note is only
-//                accepted while both that identity and the current reading are on the target
-//                fret. A sound that has no
-//                attack of its own — the tail of the sung answer, a note still ringing — never
-//                opens a candidate.
+//                window after that attack. A later octave/fifth flip of the detector (a dying
+//                note, hum) does not change it — the candidate is given up instead; only a jump
+//                of a few semitones early on (a late-landing finger, a hammer-on or pull-off)
+//                re-identifies the note. It is accepted only when the reading NOW is on the
+//                target fret (still settling down from a hard pick on the sharp side counts; still
+//                falling on the flat side does not) AND the identity was not below the target
+//                fret (so the fret below on a sharp string, whose reading creeps up as it decays,
+//                never counts). A sound with no attack of its own — the tail of the sung answer,
+//                a note still ringing — never opens a candidate. Guitar step, default: an attack
+//                is taken as a pluck unless there is positive evidence of a voice (it holds its
+//                level after its peak for 0.2 s and is still not dying away at 0.6 s, or it is
+//                the sung answer that has not stopped since the step opened); the attack's rise
+//                time is NOT used — in a room the reverberation makes a pluck rise as slowly as
+//                a hum.
 //
 // `strict` ("strict instrument check" setting, off by default) adds envelope-shape tests: sung
-// notes must not decay like a string, plucked notes must decay freely after the attack.
+// notes must not decay like a string, plucked notes must decay freely after the attack and must
+// start like a pluck (fast rise) — which can reject honest plucks in echoey rooms.
 import { centsFromMidi, centsFromPitchClass, freqToMidi, midiToFreq } from './music.ts';
 import { periodicityAt, rmsToDb } from './pitch.ts';
 
@@ -63,6 +72,8 @@ export interface FrameAttack {
   riseMs: number;
   riseDb: number;
   band: 'full' | 'hf' | 'mid';
+  /** see AttackEvent.edgeDb */
+  edgeDb?: number;
 }
 
 export type MatchMode = 'pitchClass' | 'exact';
@@ -201,6 +212,8 @@ export function attackKind(full: FrameAttack | undefined, hf: FrameAttack | unde
   if (full && hf && full.riseMs <= 3 && full.riseDb >= 2.5 && hf.riseDb >= 5) return 'pluck';
   return null;
 }
+/** Default guitar step: a string is at least this much quieter 0.12-0.22 s after its peak than just after it (dB). */
+export const HOLD_MIN_DECAY_DB = 0.3;
 /** Up to this rise time the source is decided by how the timbre develops. */
 export const AMBIGUOUS_RISE_MS = 34;
 /** ...a string's upper partials lose at least this much against its fundamental in 0.25 s. */
@@ -331,6 +344,8 @@ interface Candidate {
   source: 'pending' | 'ambiguous' | 'pluck' | 'voice';
   /** taken over from the attack before (an onset with no attack of its own) */
   inherited?: boolean;
+  /** default guitar step: did not lose level just after its peak (second look pending) */
+  held?: boolean;
   /** this pluck is the octave above the note that was sounding (that note's MIDI) */
   octaveUp?: number;
   /** time after the onset before pitch is read (skips the pick noise of an attack) */
@@ -369,6 +384,11 @@ export class NoteMatcher {
   private prevNovShare2 = 1;
   /** when the share of new power last rose past 0.4 (its rising edge), and whether it was used */
   private novEdgeT = -Infinity;
+
+  /** guitar step: the sung answer may still be sounding (until the level has gone quiet) */
+  private sungOn = true;
+  private startLevels: number[] = [];
+  private quietFrames = 0;
 
   constructor(cfg: MatchConfig) {
     this.cfg = cfg;
@@ -625,6 +645,20 @@ export class NoteMatcher {
 
     this.mergeAttacks(f);
 
+    // ---- the sung answer still sounding (guitar step right after the singing step): positive
+    // evidence of the voice, as long as it has not stopped since the step opened
+    if (this.sungOn && c.voiceMidi !== undefined) {
+      if (this.startLevels.length < 3) this.startLevels.push(db);
+      const startLevel = median(this.startLevels);
+      if (db <= startLevel - 20 || db <= -60 || midi === null) this.quietFrames++;
+      else this.quietFrames = 0;
+      if (this.quietFrames >= 3) this.sungOn = false;
+      // (or the voice stopped over a string still ringing: the level falls by 6 dB within 60 ms,
+      // faster than any string dies)
+      const recent = this.hist.filter((r) => r.t >= t - 0.16 - 1e-6 && r.t <= t - 0.06 + 1e-6);
+      if (recent.length && db <= Math.max(...recent.map((r) => r.db)) - 6) this.sungOn = false;
+    } else this.sungOn = false;
+
     // ---- new attack: a level jump, or a clean jump to a new steady pitch (hammer-on, legato)
     let onset = false;
     // Attacks only count when most of the frame's energy is signal, not room noise (after noise
@@ -846,16 +880,28 @@ export class NoteMatcher {
           } else {
             // (a jump of a few semitones early on is the finger landing late, a hammer-on, a
             // pull-off or a slide: the note is whatever it now settles on)
-            if (jump > 0.6) cand.steadySince = undefined;
+            // (re-identified then: the identity is what the string settles on after such a jump)
+            if (jump > 0.6) {
+              cand.steadySince = undefined;
+              cand.identity = wm;
+            }
             cand.lastWindowMidi = wm;
             cand.identity ??= wm;
+            // The note identified at the attack must not have been below the target fret: the
+            // fret below on a sharp string, whose decaying reading creeps up toward the target
+            // later, never counts. (On the sharp side no such check: a hard pick starts sharp and
+            // settles, and a fret above stays above — the reading now must be on target anyway.)
+            const idDev = this.deviation(cand.identity);
+            const idOk = idDev > -50;
             const dev = this.deviation(wm);
             // pitch moving away from the target within the window (a neighbouring fret settling
             // after a hard pick) is not yet a decision
             const half = Math.floor(midis.length / 2);
             const early = this.deviation(mean(midis.slice(0, half)));
             const late = this.deviation(mean(midis.slice(midis.length - half)));
-            const leaving = half >= 1 && Math.abs(late) > Math.abs(early) + 4 && Math.abs(late) > c.toleranceCents - 10;
+            // (also any note on the flat side still falling: a hard pick on the fret below a sharp
+            // string reads near the target at first and settles well below it — wait for it)
+            const leaving = half >= 1 && ((Math.abs(late) > Math.abs(early) + 4 && Math.abs(late) > c.toleranceCents - 10) || (late < 0 && late < early - 2 && t - cand.onsetT < 0.8));
             // A hard pick stretches the string: for the first few tenths of a second the note is
             // up to ~15 c sharp of where it settles, and falling. A note that is just outside the
             // tolerance on the sharp side but clearly settling down into it counts.
@@ -864,7 +910,12 @@ export class NoteMatcher {
               // whatever its pitch: it started like a voice (said whether or not it is the right note)
               hint = 'voiceLike';
               cand.steadySince = undefined;
-            } else if ((Math.abs(dev) <= c.toleranceCents || settling) && !leaving) {
+            } else if (this.sungOn && c.voiceMidi !== undefined && Math.abs(wm - c.voiceMidi) < 0.6) {
+              // the sung answer has not stopped since the step opened and this is its pitch: the
+              // voice is what reads (a pluck under it is taken once the voice stops)
+              hint = 'singing';
+              cand.steadySince = undefined;
+            } else if ((Math.abs(dev) <= c.toleranceCents || settling) && !leaving && idOk) {
               // the note must have sounded on the target for a moment, and still be on it now: a
               // hammer-on or slide that leaves the target right after the attack does not count
               cand.steadySince ??= t;
@@ -894,7 +945,7 @@ export class NoteMatcher {
               }
             }
           }
-        } else if (cand.steadySince !== undefined && !c.strict && (!c.needPluck || cand.source === 'pluck') && t - cand.steadySince >= c.persistMs / 1000 - 1e-6 && this.dwelled(cand, t) &&
+        } else if (cand.steadySince !== undefined && !c.strict && (!c.needPluck || cand.source === 'pluck') && cand.identity !== null && this.deviation(cand.identity) > -50 && t - cand.steadySince >= c.persistMs / 1000 - 1e-6 && this.dwelled(cand, t) &&
           [nov, bl].some((k) => k.members.length >= 3 && Math.abs(this.deviation(median(k.members))) <= c.toleranceCents)) {
           // The note read steady on the target in the previous window and still reads it in at least
           // three frames now (a fast-dying note slipping into noise): that is enough.
@@ -956,6 +1007,7 @@ export class NoteMatcher {
 
   /** Was the last real attack heard a string's (clearly, or resolved so by its decay)? */
   private lastAttackWasPluck(t: number): boolean {
+    if (!this.cfg.strict) return this.lastSource?.kind === 'pluck' && t - this.lastSource.t < 10;
     const hfNear = (a: FrameAttack) => this.atk.find((b) => b.band === 'hf' && Math.abs(b.t - a.t) < 0.03);
     const last = [...this.atk].reverse().find((a) => a.band === 'full' && a.riseDb >= 6 && a.t <= t);
     if (!last) return false;
@@ -965,6 +1017,14 @@ export class NoteMatcher {
 
   /** Is the last attack heard (still sounding) a voice's? */
   private voiceSounding(t: number): boolean {
+    if (!this.cfg.strict) {
+      // (only on positive evidence: the last attack swelled like a voice and is still going)
+      const ls = this.lastSource;
+      if (!ls || ls.kind !== 'voice') return false;
+      const since = this.hist.filter((r) => r.t >= ls.t);
+      if (!since.length) return false;
+      return this.hist[this.hist.length - 1].db >= Math.max(...since.map((r) => r.db)) - 12;
+    }
     const hfNear = (a: FrameAttack) => this.atk.find((b) => b.band === 'hf' && Math.abs(b.t - a.t) < 0.03);
     const last = [...this.atk].reverse().find((a) => a.band === 'full' && a.riseDb >= 6 && a.t <= t);
     if (!last || attackKind(last, hfNear(last), this.near(last, 'mid'), this.midRise) !== 'voice') return false;
@@ -1002,6 +1062,10 @@ export class NoteMatcher {
    * "what's new" spectrum) belongs to whatever started the sound it grew out of.
    */
   private classify(cand: Candidate, t: number): void {
+    if (!this.cfg.strict) {
+      this.classifyByEvidence(cand, t);
+      return;
+    }
     // (decided once every attack event around the onset has been measured: they are reported
     // 120 ms after they start)
     if (cand.source === 'pending' && t >= cand.onsetT + 0.15) {
@@ -1060,6 +1124,60 @@ export class NoteMatcher {
       cand.source = (drop >= need && ringing && bright) || steadyString ? 'pluck' : 'voice';
       this.lastSource = { kind: cand.source, t: cand.onsetT };
     }
+  }
+
+  /**
+   * Default guitar step: a new attack on the target counts unless there is positive evidence
+   * that it is a voice. The shape of the attack is no such evidence: in a room the reverberation
+   * and the guitar body keep adding level for 30-70 ms after the pick, so a pluck at 1 m rises as
+   * slowly as a hum. What a string cannot do is HOLD its level: from the peak of its attack it
+   * loses level at once (reverberation included — the room only adds a tail), so the 0.1 s just
+   * after the peak is louder than the 0.1 s after that. A sound that is no quieter 0.12-0.22 s
+   * after its peak, and is still not dying away steadily half a second later, is held like a
+   * voice (a hum, a sung or spoken vowel): that is the evidence. A string that swelled at first
+   * (a sympathetic resonance building up) passes the second look.
+   */
+  private classifyByEvidence(cand: Candidate, t: number): void {
+    if (cand.source === 'voice' || cand.source === 'pluck') return;
+    cand.source = 'ambiguous';
+    // (a clear loss already by 0.14 s after the peak decides at once: no need to wait)
+    if (!cand.held && t >= cand.peakT + 0.14 - 1e-6 && t < cand.peakT + 0.22 - 1e-6) {
+      const a0 = this.hist.filter((r) => r.t >= cand.peakT + 0.02 - 1e-6 && r.t <= cand.peakT + 0.08 + 1e-6).map((r) => r.db);
+      const a1 = this.hist.filter((r) => r.t >= t - 0.04 - 1e-6).map((r) => r.db);
+      if (a0.length && a1.length && mean(a0) - mean(a1) >= 1.0 && this.hist[this.hist.length - 1].midi !== null) {
+        cand.source = 'pluck';
+        this.lastSource = { kind: 'pluck', t: cand.onsetT };
+        return;
+      }
+    }
+    if (t < cand.peakT + 0.22 - 1e-6) return;
+    const meanDb = (a: number, b: number) => {
+      const xs = this.hist.filter((r) => r.t >= a - 1e-6 && r.t <= b + 1e-6).map((r) => r.db);
+      if (xs.length) return mean(xs);
+      const next = this.hist.find((r) => r.t > b && r.t <= b + 0.3);
+      return next ? next.db : NaN;
+    };
+    const voicedIn = (a: number, b: number) => this.hist.filter((r) => r.t >= a - 1e-6 && r.t <= b + 1e-6 && r.midi !== null).length;
+    const m0 = meanDb(cand.peakT + 0.02, cand.peakT + 0.1);
+    const m1 = meanDb(cand.peakT + 0.12, cand.peakT + 0.22);
+    // (after a stalled audio callback a window can be empty: decide on the next frame)
+    if (Number.isNaN(m1)) return;
+    if (!cand.held) {
+      if (m0 - m1 >= HOLD_MIN_DECAY_DB && voicedIn(cand.peakT + 0.12, t) >= 1) {
+        cand.source = 'pluck';
+        this.lastSource = { kind: 'pluck', t: cand.onsetT };
+        return;
+      }
+      cand.held = true;
+    }
+    if (t < cand.peakT + 0.62 - 1e-6) return;
+    const m2 = meanDb(cand.peakT + 0.3, cand.peakT + 0.4);
+    const m3 = meanDb(cand.peakT + 0.52, cand.peakT + 0.62);
+    // (dying steadily: about the same loss in each 0.2 s step, not a sudden end)
+    const d1 = m1 - m2;
+    const d2 = m2 - m3;
+    cand.source = d1 >= 0.6 && d2 >= 0.6 && d2 <= 2.5 * d1 && voicedIn(cand.peakT + 0.52, cand.peakT + 0.62) >= 1 ? 'pluck' : 'voice';
+    this.lastSource = { kind: cand.source, t: cand.onsetT };
   }
 
   private strictDecay(cand: Candidate, t: number): void {

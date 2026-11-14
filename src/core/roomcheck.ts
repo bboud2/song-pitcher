@@ -111,7 +111,7 @@ export class RoomCheck {
     }
     if (marginDb === null) {
       if (level === 'ok') level = 'info';
-      messages.push('Test: pluck an open string (or sing a note) so I can measure your level against the room.');
+      messages.push('Pluck an open string or sing a note.');
     } else if (marginDb < (this.good ? 12 : 15)) {
       // (a little hysteresis so the verdict doesn't flicker around the threshold)
       this.good = false;

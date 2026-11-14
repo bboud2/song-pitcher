@@ -21,6 +21,12 @@ import { student as c3student, type Res as C3Res } from './critic3/student.ts';
 import { BIAS_NOTES, biasTable, sessionSnapshots } from './bias.ts';
 import { CASES as C4CASES } from './critic4/cases.ts';
 import { student as c4student, type Res as C4Res } from './critic4/rig4.ts';
+import { STY as C5STY } from './critic5/cases5.ts';
+import { honest as c5honest, type Res as C5Res } from './critic5/rig5.ts';
+import { pluckRoom, ROOMS5, STYLES5 } from './critic5/pluckroom5.ts';
+import { BQ, makeRoom, reverb as reverb5, type Room as Room5 } from './critic5/synth5.ts';
+import { wg as wg4, voice as voice4 } from './critic4/synth4.ts';
+import { gtr as gtr3 } from './critic3/synth.ts';
 
 export type Kind = 'P' | 'N' | 'I' | 'S';
 export interface GroupResult {
@@ -690,6 +696,104 @@ c4table('sing_iso', 8, false, (l) => (l.startsWith('FAIL') ? l.replace(/\s+/g, '
 c4table('techniques', 14, false, (l) => (l.startsWith('FAIL') ? l.replace(/\s+/g, ' ').slice(0, 110) : null));
 c4table('leak', 2, false, (l) => { const m = /on pitch (\d+)\/12, 3 st off (\d+)\/12/.exec(l); return m && m[1] !== m[2] ? l : null; });
 c4table('probe_zero', 2, false, (l) => (/clean -1\d\d|clean -2\d\d/.test(l) ? l.slice(0, 120) : null));
+
+// ========================================================================== rooms (fifth review)
+// Every fixture before round 6 was anechoic. A pluck in a room keeps gaining level for 30-70 ms
+// after the pick (reverberation, body resonance): these jobs make sure no rule rejects it.
+//
+// (1) The fifth review's honest sessions in rooms (finite-difference string with body, tube-model
+// voice, stochastic rooms, phone chains). Expectations: no note stuck, no accidental advance,
+// at most 5 % of notes needing another pluck (or breath), phrase review ≥ 90 % first try.
+const C5_QUICK = new Set(['B_finger_room0', 'D_pick_liveroom']);
+for (const name of Object.keys(C5STY)) {
+  job(`critic5 ${name}`, 14, C5_QUICK.has(name), (quick) => {
+    const r: C5Res = c5honest({ ...C5STY[name], maxNotes: quick ? 14 : C5STY[name].maxNotes ?? 101 });
+    const lim = (share: number, n: number) => Math.max(1, Math.ceil(share * n));
+    const problems: string[] = [];
+    const stuck = r.playStuck + r.singStuck + r.revStuck;
+    if (stuck) problems.push(`stuck on ${stuck} (play ${r.playStuck}, sing ${r.singStuck}, review ${r.revStuck}: ${r.stuckAt.slice(0, 4).join(' ')})`);
+    if (r.bad.length) problems.push(`${r.bad.length} accidental advances (${r.bad.slice(0, 2).map((a) => `#${a.index + 1} ${a.phase}: ${a.why}`).join('; ')})`);
+    const needPluck = r.playSteps - r.firstPluck - r.playStuck;
+    if (needPluck > lim(0.05, r.playSteps)) problems.push(`${needPluck}/${r.playSteps} notes needed another pluck`);
+    if (r.singSteps - r.singFirst - r.singStuck > lim(0.05, r.singSteps)) problems.push(`${r.singSteps - r.singFirst - r.singStuck} notes needed another breath`);
+    if (r.revNotes && r.revFirst < Math.floor(0.9 * r.revNotes)) problems.push(`review first try ${r.revFirst}/${r.revNotes}`);
+    const lat = [...r.lat].sort((x, y) => x - y)[r.lat.length >> 1] ?? NaN;
+    const summary = `play ${r.firstPluck}/${r.playSteps} first, +${r.replucks} re-plucks, sing ${r.singFirst}/${r.singSteps}, review ${r.revFirst}/${r.revNotes}, stuck ${stuck}, accidental ${r.bad.length}, play latency median ${lat.toFixed(0)} ms`;
+    return [{ name: `critic5 ${name}`, kind: 'S', n: 1, acc: 0, tta: [], oct: 0, fails: problems, ok: problems.length === 0, summary: problems.length ? `${summary} — ${problems.join('; ')}` : summary }];
+  });
+}
+// (2) First-pluck acceptance by room x pluck style (correct, in-tune plucks, 14 pitches x 2).
+// Target: ≥ 93 % first pluck (26/28), every note within 4 plucks.
+ROOMS5.forEach(([rn], ri) => {
+  job(`critic5 pluck room: ${rn}`, 8, ri === 3 || ri === 5, () => {
+    const rows = STYLES5.map((_, si) => pluckRoom(ri, si));
+    const bad = rows.filter((r) => r.first < Math.ceil(0.93 * r.n) || r.any < r.n).map((r) => `${r.style} ${r.first}/${r.n} first, ${r.any}/${r.n} within 4 (missed ${r.missed.join(',')})`);
+    const summary = rows.map((r) => `${r.style} ${r.first}/${r.n}`).join(', ') + `; median latency ${rows.map((r) => r.lat.toFixed(0)).join('/')} ms`;
+    return [{ name: `critic5 pluck room: ${rn}`, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: bad, ok: bad.length === 0, summary: bad.length ? `${summary} — ${bad.join('; ')}` : summary }];
+  });
+});
+// (3) Our own and the earlier reviews' guitar and voice stimuli through three rooms and a phone
+// chain (fresh matcher, like the anechoic groups above).
+const OWN_ROOMS: [string, Room5 | null, boolean][] = [
+  ['dead room RT 0.25 s, 0.5 m', makeRoom(3, 0.25, 61), false],
+  ['living room RT 0.6 s, 1 m', makeRoom(0, 0.6, 62), false],
+  ['live room RT 0.7 s, 2 m', makeRoom(-6, 0.7, 63), false],
+  ['phone chain (hp 150, lp 3.4k) in the living room', makeRoom(0, 0.6, 64), true],
+];
+function inRoom(x: Float32Array, room: Room5 | null, phone: boolean, seed: number): { buf: Float32Array; onset: number } {
+  let y = reverb5(x, room);
+  if (phone) {
+    const f = [new BQ('hp', 150, 0.707), new BQ('lp', 3400, 0.54), new BQ('lp', 3400, 1.3)];
+    y = Float32Array.from(y, (v) => f.reduce((a, q) => q.s(a), v));
+  }
+  let pk = 0;
+  for (const v of y) pk = Math.max(pk, Math.abs(v));
+  const out = S3.white(S3.silence(0.7 + y.length / SR + 0.2, SR), -62, seed);
+  const g = S3.db2a(-16) / (pk || 1);
+  for (let i = 0; i < y.length; i++) out[Math.floor(0.7 * SR) + i] += g * y[i];
+  return { buf: out, onset: 0.7 };
+}
+const OWN_GUITARS: [string, (m: number, s: number) => Float32Array][] = [
+  ['own KS3 pick', (m, s) => S3.ks(m, 2.0, { sr: SR, seed: s })],
+  ['own additive', (m, s) => guitar(m, 2.0, { sr: SR, seed: s })],
+  ['critic3 modal guitar', (m, s) => gtr3(m, 2.0, { sr: SR, seed: s })],
+  ['critic4 waveguide steel', (m, s) => wg4(m, 2.0, { sr: SR, seed: s })],
+  ['critic4 waveguide thumb', (m, s) => wg4(m, 2.0, { sr: SR, seed: s, hard: 0, attackMs: 25, pick: 0.3 })],
+  ['critic4 nylon', (m, s) => wg4(m, 2.0, { sr: SR, seed: s, kind: 'nylon', hard: 0.2 })],
+];
+const OWN_VOICES: [string, (m: number, s: number) => Float32Array][] = [
+  ['own voice "a" (vibrato)', (m, s) => S3.vo(m, 1.6, { sr: SR, seed: s, vowel: 'a', vibCents: 20 } as never)],
+  ['critic4 hum "mm"', (m, s) => voice4(m, 1.6, { sr: SR, seed: s, vowel: 'm', levelDb: -24 })],
+  ['critic4 sung "la"', (m, s) => voice4(m, 1.6, { sr: SR, seed: s, vowel: 'a', attackMs: 25 })],
+];
+for (const [rn, room, phone] of OWN_ROOMS) {
+  job(`rooms: own guitars, ${rn}`, 3, rn.startsWith('living'), (quick) => {
+    const out: GroupResult[] = [];
+    for (const [gn, mk] of OWN_GUITARS) {
+      const g = new Group(`rooms P ${gn}, ${rn}`, 'P');
+      for (const m of pickNotes(GM, quick, 3)) {
+        const fx = inRoom(mk(m, m + 5), room, phone, m);
+        g.add(noteName(m), runCfg(framesOf(fx.buf, 'guitar'), guitarConfig(m), 0.3), fx.onset);
+      }
+      out.push(g.r);
+    }
+    return out;
+  });
+  job(`rooms: own voices, ${rn}`, 3, rn.startsWith('living'), (quick) => {
+    const out: GroupResult[] = [];
+    for (const [vn, mk] of OWN_VOICES) {
+      const sing = new Group(`rooms P ${vn} passes the singing step, ${rn}`, 'P');
+      const play = new Group(`rooms N ${vn} — accepted by the guitar step, ${rn}`, 'N');
+      for (const m of pickNotes(VM, quick, 3)) {
+        const fx = inRoom(mk(m, m + 9), room, phone, m);
+        sing.add(noteName(m), runCfg(framesOf(fx.buf, 'voice'), singConfig(m, 50, false), 0.3), fx.onset);
+        play.add(noteName(m), runCfg(framesOf(fx.buf, 'guitar'), guitarConfig(m), 0.3), fx.onset);
+      }
+      out.push(sing.r, play.r);
+    }
+    return out;
+  });
+}
 
 // ========================================================================== in-session pitch bias
 // A detector that has heard a realistic session must read a new pluck as a fresh one does.

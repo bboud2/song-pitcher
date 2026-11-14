@@ -26,6 +26,10 @@ export interface AttackEvent {
   /** level added by the attack (dB above what was sounding before) */
   riseDb: number;
   band: 'full' | 'hf' | 'mid';
+  /** level 6 ms after the rise starts, against the peak of the added power (dB, ≤ 0): how much
+   * of the sound arrives at once. A pluck's direct sound arrives in one go, whatever the room
+   * adds afterwards; a voice builds up over several glottal cycles. */
+  edgeDb: number;
 }
 
 const BLOCK_MS = 1;
@@ -102,7 +106,8 @@ class BandTracker {
       const riseDb = 10 * Math.log10((p.pre + peak) / p.pre);
       // (a flicker of the noise does not hold off the next trigger; a real attack does, for 100 ms)
       if (riseDb >= 3) this.lastStart = p.k;
-      if (riseDb >= 1.5) this.emit({ sample: a * this.blockLen, riseMs: (b - a) * BLOCK_MS, riseDb, band: this.band });
+      const edgeDb = 10 * Math.log10(Math.max(P(Math.min(a + 6, k)) - p.pre, 1e-3 * peak) / peak);
+      if (riseDb >= 1.5) this.emit({ sample: a * this.blockLen, riseMs: (b - a) * BLOCK_MS, riseDb, band: this.band, edgeDb });
     }
   }
 }

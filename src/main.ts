@@ -207,8 +207,10 @@ function tunerScreen(): HTMLElement {
       let m = stable.push(f);
       // Mains hum (50/60 Hz and its low harmonics) is not a note: never show it or count it as heard.
       if (m !== null && isMainsHum(440 * Math.pow(2, (m - 69) / 12))) m = null;
-      if (m !== null) heardFrames++;
-      room.frame(f.t, db, m !== null);
+      // (a strum of several strings has no single pitch, but its attack is plainly heard)
+      const strum = m === null && (f.attacks ?? []).some((a) => a.band === 'full' && a.riseDb >= 12 && f.t - a.t < 1.5) && db >= peakDb - 20;
+      if (m !== null || strum) heardFrames++;
+      room.frame(f.t, db, m !== null || strum);
       if (++n % 10 === 0) {
         const sp = audio.spectrumDb();
         if (sp) room.spectrum(sp.db, sp.sampleRate, sp.fftSize);
@@ -256,7 +258,7 @@ function tunerScreen(): HTMLElement {
         ? h('p', { class: 'muted center' }, 'Waiting for microphone permission…')
         : h('div', { class: 'tuner-help' },
             advice,
-            h('p', { class: 'muted center' }, 'Pluck a string or sing a note: the note name should follow you. Put the phone about 1 m away on a stand.'),
+            h('p', { class: 'muted center' }, 'The note name should follow you. Put the phone on a stand about 50 cm from the guitar.'),
           ),
     h('div', { class: 'actions sticky-actions' }, begin, skipCheck),
   );
@@ -711,7 +713,7 @@ function settingsPanel(): HTMLElement {
       toggle('phraseReview', 'Phrase review', s.skipGuitar ? 'needs the guitar step — off while “Skip guitar step” is on' : 'play each phrase back in order', s.skipGuitar),
       toggle('allowSkip', 'Allow “Skip note” button'),
       h('h2', { class: 'section-title', text: 'Checking' }),
-      toggle('strictCheck', 'Strict instrument check', 'extra checks: a sung note must hold its level, a guitar note must clearly ring down. Can reject fading singers and very sustained guitars.'),
+      toggle('strictCheck', 'Strict instrument check', 'extra checks: a sung note must hold its level, a guitar note must start sharply and clearly ring down. Can reject fading singers, very sustained guitars and plucks in echoey rooms.'),
       h('h2', { class: 'section-title', text: 'Sound' }),
       toggle('playKeyAtStart', 'Play the key at the start', 'do–mi–sol chord before the first note (also on the “Key” button)'),
       h('div', { class: 'actions' },
