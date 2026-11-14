@@ -282,7 +282,7 @@ async function insecureRun(): Promise<void> {
 /** Extra layouts: tiny phone, landscape, tall phone; degree-only and hidden hints. */
 async function layoutRun(wav: string): Promise<void> {
   const browser = await launch(wav);
-  for (const [name, vp] of [['se-320x568', { width: 320, height: 568 }], ['landscape-844x390', { width: 844, height: 390 }], ['tall-430x932', { width: 430, height: 932 }]] as const) {
+  for (const [name, vp] of [['se-320x568', { width: 320, height: 568 }], ['se2-375x667', { width: 375, height: 667 }], ['landscape-844x390', { width: 844, height: 390 }], ['tall-430x932', { width: 430, height: 932 }]] as const) {
     const ctx = await browser.newContext({ viewport: vp, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
     await ctx.grantPermissions(['microphone'], { origin: URL });
     const page = await ctx.newPage();
@@ -293,10 +293,32 @@ async function layoutRun(wav: string): Promise<void> {
     const startVisible = await page.$eval('[data-testid="start"]', (b: Element) => { const r = b.getBoundingClientRect(); return r.bottom <= window.innerHeight + 1 && r.top >= 0; });
     check(startVisible, `[layout ${name}] Start button visible without scrolling (key G with octave row)`);
     await page.screenshot({ path: join(SHOTS, `layout-${name}-home.png`) });
+    // The mic check: its advice and help text must sit above the Begin button, before and after
+    // a note is heard (no text hidden behind the sticky buttons).
+    const clear = () => page.evaluate(() => {
+      const actions = document.querySelector('.tuner .sticky-actions')!.getBoundingClientRect();
+      const texts = [...document.querySelectorAll('.tuner-help > *')].map((e) => e.getBoundingClientRect()).filter((r) => r.height > 0);
+      return texts.every((r) => r.bottom <= actions.top + 12);
+    });
     await page.click('[data-testid="start"]');
+    await page.waitForSelector('[data-testid="tuner"]');
+    await page.waitForTimeout(400);
+    if (!name.startsWith('landscape')) check(await clear(), `[layout ${name}] mic check text above the Begin button before a note is heard`);
+    await page.screenshot({ path: join(SHOTS, `layout-${name}-tuner-before.png`) });
     await page.waitForSelector('[data-testid="begin"]:not([disabled])', { timeout: 12000 });
+    await page.waitForTimeout(600);
+    if (!name.startsWith('landscape')) check(await clear(), `[layout ${name}] mic check text above the Begin button after a note`);
+    await page.screenshot({ path: join(SHOTS, `layout-${name}-tuner.png`) });
     await page.click('[data-testid="begin"]');
     await waitSession(page, `phase === 'sing'`, 10000);
+    if (name.startsWith('se')) {
+      await page.click('[data-testid="open-settings"]');
+      const inside = await page.evaluate(() => [...document.querySelectorAll('.seg')].every((b) => { const r = b.getBoundingClientRect(); const row = b.closest('.toggle-row')!.getBoundingClientRect(); return r.right <= row.right + 0.5 && r.left >= row.left - 0.5; }));
+      check(inside, `[layout ${name}] settings: tolerance buttons inside their card`);
+      await page.screenshot({ path: join(SHOTS, `layout-${name}-settings.png`) });
+      await page.click('[data-testid="close-settings"]');
+      await waitSession(page, `phase === 'sing' || phase === 'listen'`, 10000);
+    }
     const fits = await page.evaluate(() => {
       const c = document.querySelector('.controls')!.getBoundingClientRect();
       return c.bottom <= window.innerHeight + 1 && document.documentElement.scrollWidth <= window.innerWidth + 1;
