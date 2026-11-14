@@ -9,6 +9,7 @@ import { SONGS, placeTonic, songById, songRange, transpose, validTonics, type So
 import { AudioEngine, WakeLock, renderToneOffline } from './ui/audio.ts';
 import { button, h, icon } from './ui/dom.ts';
 import { createMeter } from './ui/meter.ts';
+import { Recorder, RECORD_MAX_SEC, saveRecording } from './ui/recorder.ts';
 import { load, save, type Stored } from './ui/storage.ts';
 
 type Screen = 'home' | 'tuner' | 'session' | 'summary';
@@ -200,6 +201,9 @@ function tunerScreen(): HTMLElement {
     let heardFrames = 0;
     let n = 0;
     const room = new RoomCheck();
+    // per open string: recent readings (cents from that string's pitch) while it sounds
+    const openCents = new Map<number, number[]>();
+    let tuneWarn: string | null = null;
     audio.listen((f) => {
       const db = 20 * Math.log10(Math.max(f.rms, 1e-6));
       peakDb = Math.max(db, peakDb - 1.5);
@@ -216,9 +220,12 @@ function tunerScreen(): HTMLElement {
         if (sp) room.spectrum(sp.db, sp.sampleRate, sp.fftSize);
         const v = room.verdict();
         // (the most important point only: a stack of advice would run under the Begin button)
-        const msg = v.messages[0] ?? '';
+        // (a string well out of tune comes first: on a string 40-50 c sharp the fret below sounds
+        // close to the right note, and nothing in the session could tell)
+        const msg = tuneWarn ?? v.messages[0] ?? '';
         if (advice.textContent !== msg) advice.textContent = msg;
-        advice.dataset.level = v.level;
+        advice.dataset.level = tuneWarn ? 'warn' : v.level;
+        advice.dataset.tune = tuneWarn ? 'off' : '';
         advice.dataset.margin = v.marginDb === null ? '' : String(Math.round(v.marginDb));
         advice.dataset.hum = v.hum === null ? '' : String(v.hum);
       }
@@ -237,6 +244,17 @@ function tunerScreen(): HTMLElement {
       noteEl.classList.remove('placeholder');
       hzEl.textContent = `${hz.toFixed(1)} Hz`;
       meter.set(nn.cents, 5);
+      if (OPEN_STRINGS.includes(nn.midi)) {
+        const xs = openCents.get(nn.midi) ?? [];
+        xs.push(nn.cents);
+        if (xs.length > 25) xs.shift();
+        openCents.set(nn.midi, xs);
+        if (xs.length >= 12) {
+          const c = [...xs].sort((a, b) => a - b)[xs.length >> 1];
+          if (Math.abs(c) > 25) tuneWarn = `The ${noteName(nn.midi)} string sounds about ${Math.round(Math.abs(c))}¢ ${c > 0 ? 'sharp' : 'flat'}: tune it before you begin, or the wrong fret may sound right.`;
+          else if (tuneWarn?.startsWith(`The ${noteName(nn.midi)} string`)) tuneWarn = null;
+        }
+      }
       for (const st of strings.children) (st as HTMLElement).dataset.on = String(Number((st as HTMLElement).dataset.midi) === nn.midi);
     }, () => 'guitar', ['voice']);
   }
@@ -260,11 +278,120 @@ function tunerScreen(): HTMLElement {
             advice,
             h('p', { class: 'muted center' }, 'The note name should follow you. Put the phone on a stand about 50 cm from the guitar.'),
           ),
+    audio.ready && !micError ? soundCheckBlock() : null,
     h('div', { class: 'actions sticky-actions' }, begin, skipCheck),
   );
 }
 
 // ---------------------------------------------------------------- Session
+
+// ---------------------------------------------------------------- Practice recorder
+
+/** Guided sound-check recording: a short script of the sounds the app has to tell apart. */
+const SOUND_CHECK: { sec: number; text: string }[] = [
+  { sec: 10, text: 'Stay quiet: let the phone hear the room.' },
+  { sec: 25, text: 'Pluck each open string once, low to high, letting each ring.' },
+  { sec: 12, text: 'Sing one comfortable note and hold it.' },
+  { sec: 10, text: 'Hum that note quietly, as you would while looking for it on the guitar.' },
+  { sec: 13, text: 'Sing a note and, while still singing, pluck the same note on the guitar.' },
+];
+
+function soundCheckBlock(): HTMLElement {
+  const box = h('section', { class: 'soundcheck', attrs: { 'data-testid': 'soundcheck' } });
+  const total = SOUND_CHECK.reduce((a, x) => a + x.sec, 0);
+  const idle = () => {
+    const save = rec?.kind === 'soundcheck' && !recActive ? saveButton('Save sound check') : null;
+    box.replaceChildren(button(`Sound check recording (${total} s)`, () => run(), 'btn ghost', { 'data-testid': 'soundcheck-start' }), ...(save ? [save] : []));
+  };
+  const run = () => {
+    const r = startRecorder('soundcheck', { script: SOUND_CHECK });
+    if (!r) return;
+    const step = h('p', { class: 'soundcheck-step', attrs: { 'data-testid': 'soundcheck-step' } });
+    const count = h('p', { class: 'soundcheck-count muted' });
+    const stop = button('Stop', () => finish(), 'btn ghost');
+    box.replaceChildren(step, count, stop);
+    const t0 = performance.now();
+    let k = -1;
+    const timer = window.setInterval(() => {
+      const el = (performance.now() - t0) / 1000;
+      let acc = 0;
+      let i = 0;
+      while (i < SOUND_CHECK.length && el >= acc + SOUND_CHECK[i].sec) acc += SOUND_CHECK[i++].sec;
+      if (i >= SOUND_CHECK.length || !box.isConnected) return finish();
+      if (i !== k) {
+        k = i;
+        step.textContent = `${i + 1}/${SOUND_CHECK.length}: ${SOUND_CHECK[i].text}`;
+        r.log(audio.now(), 'prompt', { step: i, text: SOUND_CHECK[i].text });
+      }
+      count.textContent = `${Math.ceil(acc + SOUND_CHECK[i].sec - el)} s · recording ${Math.round(r.seconds)} s`;
+    }, 200);
+    const finish = () => {
+      clearInterval(timer);
+      r.log(audio.now(), 'end', {});
+      stopRecorder();
+      if (box.isConnected) idle();
+    };
+  };
+  idle();
+  return box;
+}
+
+/** The recording being made (session or sound check), or the last one, kept until saved. */
+let rec: Recorder | null = null;
+let recActive = false;
+let recNotice = '';
+
+function recMeta(): Record<string, unknown> {
+  return {
+    userAgent: navigator.userAgent,
+    captureMode: audio.captureMode,
+    trackSettings: audio.trackSettings(),
+    settings: { ...store.settings },
+    songId: currentSong().id,
+    tonicMidi: currentTonic(),
+  };
+}
+
+function startRecorder(kind: 'session' | 'soundcheck', extra: Record<string, unknown> = {}): Recorder | null {
+  if (!audio.ctx) return null;
+  const r = new Recorder(kind, audio.ctx.sampleRate, { ...recMeta(), ...extra });
+  rec = r;
+  recActive = true;
+  recNotice = '';
+  audio.tap = (x, t) => r.push(x, t);
+  audio.onMute = (from, to) => r.log(to, 'mute', { from, to });
+  r.onFull = () => {
+    recNotice = `Recording stopped at ${RECORD_MAX_SEC / 60} minutes (the session goes on).`;
+    stopRecorder();
+    if (screen === 'session' && session) refresh(session.view(), true);
+  };
+  return r;
+}
+
+function stopRecorder(): void {
+  recActive = false;
+  audio.tap = null;
+  audio.onMute = null;
+}
+
+/** Log a session event on the recording (audio-clock time). */
+function recLog(type: string, data: Record<string, unknown> = {}, t = audio.now()): void {
+  if (rec && recActive && rec.kind === 'session') rec.log(t, type, data);
+}
+
+function saveButton(label = 'Save recording'): HTMLElement | null {
+  if (!rec || rec.samples === 0) return null;
+  const r = rec;
+  const b = button(`${label} (${Math.round(r.seconds)} s)`, async () => {
+    b.disabled = true;
+    try {
+      await saveRecording(r);
+    } finally {
+      b.disabled = false;
+    }
+  }, 'btn secondary', { 'data-testid': 'save-recording' });
+  return b;
+}
 
 function beginSession(): void {
   audio.stopListening();
@@ -273,8 +400,13 @@ function beginSession(): void {
   session = new Session(song, tonic, store.settings);
   const r = store.resume;
   if (pendingResume !== null && r && r.songId === song.id && r.tonicMidi === tonic) session.restore({ stats: r.stats, reviews: r.reviews });
-  session.start(pendingResume ?? 0);
+  const startIndex = pendingResume ?? 0;
+  session.start(startIndex);
   pendingResume = null;
+  if (store.settings.recordSession) {
+    startRecorder('session', { startIndex });
+    recLog('start', { startIndex });
+  }
   void wake.acquire();
   const sess = session;
   audio.listen(onFrame, () => sess.listeningPath());
@@ -293,12 +425,25 @@ const eventLog: { t: number; index: number; phase: string; target: number; detec
 /** How the microphone is being read (worklet / script / poll), for the end-to-end test. */
 Object.defineProperty(window, '__songPitcherCapture', { get: () => audio.captureMode });
 let updateSession: ((v: SessionView) => void) | null = null;
+let lastRecHint: string | null = null;
 
 function onFrame(f: PitchFrame): void {
   // Paused while the settings panel is open (nothing is accepted behind it).
   if (!session || screen !== 'session' || settingsOpen || keyPlaying) return;
   const before = session.view();
   const advanced = session.pitch(f);
+  if (rec && recActive) {
+    const m = session.view().match;
+    const hint = m?.hint ?? null;
+    if (hint !== lastRecHint) {
+      recLog('hint', { phase: before.phase, index: before.index, hint }, f.t);
+      lastRecHint = hint;
+    }
+    if (advanced) {
+      const a = session.lastAccepted;
+      recLog('accept', { phase: before.phase, index: before.index, pos: before.review?.pos ?? -1, target: before.targetMidi, detected: a?.detectedMidi ?? null, cents: a?.cents ?? null, reason: a?.reason ?? null }, f.t);
+    }
+  }
   if (advanced) {
     const m = session.lastAccepted;
     eventLog.push({ t: +f.t.toFixed(3), index: before.index, phase: before.phase, target: before.targetMidi, detected: m?.detectedMidi ?? null, cents: m?.cents ?? null });
@@ -320,6 +465,7 @@ function onFrame(f: PitchFrame): void {
 
 function refresh(v: SessionView, force = false): void {
   const key = `${v.phase}|${v.next}|${v.index}|${v.review?.pos ?? -1}|${v.listenKind}`;
+  if (key !== lastKey) recLog('step', { phase: v.phase, index: v.index, pos: v.review?.pos ?? -1, target: v.targetMidi, listenKind: v.listenKind });
   if (key !== lastKey || force) {
     lastKey = key;
     render();
@@ -351,7 +497,9 @@ function runListen(delayMs = 0): void {
     chips.forEach((c) => c.classList.remove('playing'));
     listenRunning = false;
     if (token !== listenToken || !session) return;
-    session.listenDone(audio.now());
+    const tDone = audio.now();
+    session.listenDone(tDone);
+    recLog('listenDone', { index: session.view().index }, tDone);
     refresh(session.view());
   }, delayMs);
 }
@@ -363,14 +511,17 @@ async function playKey(): Promise<void> {
   if (!session || keyPlaying) return;
   cancelListen();
   keyPlaying = true;
+  recLog('pause', { why: 'key' });
   if (session) refresh(session.view(), true);
   const t = session.tonicMidi;
   await audio.play([{ midi: t, sec: 0.32 }, { midi: t + 4, sec: 0.32 }, { midi: t + 7, sec: 0.32 }, { midi: t + 12, sec: 0.4 }, { midi: [t, t + 4, t + 7, t + 12], sec: 1.0 }]);
   keyPlaying = false;
+  recLog('resume', { why: 'key' });
   if (!session) return;
   // Mid-step the chord would overwrite the student's memory of the target: replay it.
   const v = session.view();
   if (v.phase === 'sing' || v.phase === 'play' || v.phase === 'review') {
+    recLog('replay');
     session.replay();
     refresh(session.view(), true);
     runListen(250);
@@ -393,6 +544,8 @@ function flash(): void {
 }
 
 function finishSession(reachedEnd: boolean): void {
+  recLog('end', { reachedEnd });
+  if (rec?.kind === 'session') stopRecorder();
   cancelListen();
   audio.stopListening();
   void wake.release();
@@ -528,6 +681,7 @@ function sessionScreen(): HTMLElement {
     h('div', { class: 'topbar-title' },
       h('div', { class: 'note-count', attrs: { 'data-testid': 'note-count' }, text: `Note ${v.index + 1} / ${v.total}` }),
       h('div', { class: 'small muted lyric', text: phrase ? `“${phrase.lyric}”` : song.title }),
+      recActive ? h('div', { class: 'rec-badge', attrs: { 'data-testid': 'rec-badge', 'aria-label': 'Recording this session' }, text: '● REC' }) : recNotice ? h('div', { class: 'small rec-notice', text: recNotice }) : null,
     ),
     button(icon('gear', 26), () => openSettings(), 'icon-btn', { 'aria-label': 'Settings', 'data-testid': 'open-settings' }),
   );
@@ -537,6 +691,7 @@ function sessionScreen(): HTMLElement {
   const replayLabel = effPhase === 'review' ? 'Phrase' : 'Replay';
   const replayBtn = button(h('span', {}, icon('speaker', 24), ` ${replayLabel}`), () => {
     if (!session) return;
+    recLog('replay');
     session.replay();
     refresh(session.view());
     runListen(0);
@@ -547,6 +702,7 @@ function sessionScreen(): HTMLElement {
     ? button(h('span', {}, icon('skip', 22), ' Skip'), () => {
         if (!session) return;
         cancelListen();
+        recLog('skip');
         session.skip();
         const nv = session.view();
         if (nv.phase === 'done') return finishSession(true);
@@ -650,6 +806,7 @@ function summaryScreen(): HTMLElement {
     h('div', { class: 'actions' },
       button(done ? 'Practice again' : `Continue from note ${v.index + 1}`, () => { pendingResume = done ? null : v.index; setScreen('tuner'); void enableMic(); }, 'btn primary big', { 'data-testid': 'again' }),
       button('Home', () => { session = null; setScreen('home'); }, 'btn secondary big', { 'data-testid': 'home-btn' }),
+      rec?.kind === 'session' ? saveButton() : null,
     ),
   );
 }
@@ -658,6 +815,7 @@ function summaryScreen(): HTMLElement {
 
 function openSettings(): void {
   settingsOpen = true;
+  if (session && screen === 'session') recLog('pause', { why: 'settings' });
   // Pause: stop any reference tone; frames are ignored while the panel is open.
   if (session && screen === 'session') cancelListen();
   render();
@@ -665,6 +823,7 @@ function openSettings(): void {
 
 function closeSettings(): void {
   settingsOpen = false;
+  if (session && screen === 'session') recLog('resume', { why: 'settings', settings: { ...store.settings } });
   lastKey = '';
   render();
   // Resume: replay the reference if we were in (or interrupted) a listen phase.
@@ -713,9 +872,12 @@ function settingsPanel(): HTMLElement {
       toggle('phraseReview', 'Phrase review', s.skipGuitar ? 'needs the guitar step — off while “Skip guitar step” is on' : 'play each phrase back in order', s.skipGuitar),
       toggle('allowSkip', 'Allow “Skip note” button'),
       h('h2', { class: 'section-title', text: 'Checking' }),
-      toggle('strictCheck', 'Strict instrument check', 'extra checks: a sung note must hold its level, a guitar note must start sharply and clearly ring down. Can reject fading singers, very sustained guitars and plucks in echoey rooms.'),
+      toggle('strictCheck', 'Strict instrument check', 'only for a quiet room with no echo (carpet, curtains, phone close). In an ordinary room it rejects real plucks and you will have to play notes again. Extra checks: a sung note must hold its level; a guitar note must start sharply and ring down'),
       h('h2', { class: 'section-title', text: 'Sound' }),
       toggle('playKeyAtStart', 'Play the key at the start', 'do–mi–sol chord before the first note (also on the “Key” button)'),
+      h('h2', { class: 'section-title', text: 'Testing' }),
+      toggle('recordSession', 'Record this session for testing', 'keeps the microphone audio and what the app decided on this device until you save it; nothing is sent anywhere'),
+      saveButton('Save last recording'),
       h('div', { class: 'actions' },
         button('Reset to easy defaults', () => {
           store.settings = { ...DEFAULT_SETTINGS };

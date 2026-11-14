@@ -22,6 +22,10 @@ import { BIAS_NOTES, biasTable, sessionSnapshots } from './bias.ts';
 import { CASES as C4CASES } from './critic4/cases.ts';
 import { student as c4student, type Res as C4Res } from './critic4/rig4.ts';
 import { STY as C5STY } from './critic5/cases5.ts';
+import { replayRecording } from './replay.ts';
+import { STY as C6STY } from './critic6/cases6.ts';
+import { honest as c6honest, line as c6line } from './critic6/rig6.ts';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { honest as c5honest, type Res as C5Res } from './critic5/rig5.ts';
 import { pluckRoom, ROOMS5, STYLES5 } from './critic5/pluckroom5.ts';
 import { BQ, makeRoom, reverb as reverb5, type Room as Room5 } from './critic5/synth5.ts';
@@ -793,6 +797,71 @@ for (const [rn, room, phone] of OWN_ROOMS) {
     }
     return out;
   });
+}
+
+// ========================================================================== sixth review (rooms, speaker leak, beginners)
+// Sessions: no note stuck, no accidental advance (the student's own sung answer, a ringing string,
+// a noise or a hunting hum advancing a step), ≤ 5 % re-plucks / extra breaths, review ≥ 90 %.
+// The B* sessions hum or sing while hunting on purpose: their accidental advances are listed.
+const C6_QUICK = new Set(['H2_live_finger', 'B3_hum_held', 'T1_thin_voice']);
+for (const name of Object.keys(C6STY)) {
+  job(`critic6 ${name}`, 14, C6_QUICK.has(name), (quick) => {
+    const st = { ...C6STY[name], maxNotes: quick ? 20 : C6STY[name].maxNotes };
+    const r = c6honest(st);
+    const lim = (n: number) => Math.max(1, Math.ceil(0.05 * n));
+    const problems: string[] = [];
+    const stuck = r.playStuck + r.singStuck + r.revStuck;
+    if (stuck) problems.push(`stuck on ${stuck} (play ${r.playStuck}, sing ${r.singStuck}, review ${r.revStuck})`);
+    if (r.bad.length) problems.push(`${r.bad.length} accidental advances (${r.bad.slice(0, 2).map((a) => `#${a.index + 1} ${a.phase}: ${a.why}`).join('; ')})`);
+    const need = r.playSteps - r.noPluck - r.firstPluck - r.playStuck;
+    if (need > lim(r.playSteps)) problems.push(`${need}/${r.playSteps - r.noPluck} notes needed another pluck`);
+    if (r.singSteps - r.singFirst - r.singStuck > lim(r.singSteps)) problems.push(`${r.singSteps - r.singFirst - r.singStuck} notes needed another breath`);
+    if (r.revNotes && r.revFirst < Math.floor(0.9 * r.revNotes)) problems.push(`review first try ${r.revFirst}/${r.revNotes}`);
+    const summary = c6line(r).replace(/\s+/g, ' ');
+    return [{ name: `critic6 ${name}`, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: problems, ok: problems.length === 0, summary: problems.length ? `${summary} — ${problems.join('; ')}` : summary }];
+  });
+}
+// Probes (one action per guitar step after an honest sung answer): every wrong-note, octave,
+// fret-below and voice-only probe must be refused; the honest probes accepted.
+for (const set of ['octave', 'interval', 'sharp', 'voice', 'nsgate']) {
+  job(`critic6 probes ${set}`, set === 'voice' ? 30 : 16, false, async () => {
+    const lines: string[] = [];
+    const log = console.log;
+    console.log = (...a: unknown[]) => { lines.push(a.map(String).join(' ')); };
+    try {
+      const { SETS } = await import('./critic6/probes6.ts');
+      SETS[set]();
+    } finally {
+      console.log = log;
+    }
+    const bad = lines.filter((l) => {
+      const m = /ACCEPTED (\d+)\/(\d+)/.exec(l);
+      if (!m) return false;
+      const honestRow = /\(honest\)/.test(l);
+      return honestRow ? m[1] !== m[2] : m[1] !== '0';
+    }).map((l) => l.replace(/\s+/g, ' ').slice(0, 120));
+    return [{ name: `critic6 probes ${set}`, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: bad, ok: bad.length === 0, summary: bad.length ? `${lines.length} rows, ${bad.length} not as expected: ${bad.slice(0, 4).join(' | ')}` : `${lines.length} rows, all as expected` }];
+  });
+}
+
+// ========================================================================== real recordings
+// Practice recordings made on phones (Settings → "Record this session for testing"), dropped into
+// recordings/ as NAME.wav + NAME.json: the engine must reproduce every accept the app logged.
+{
+  const dir = new URL('../recordings/', import.meta.url);
+  const wavs = existsSync(dir) ? readdirSync(dir).filter((f) => f.toLowerCase().endsWith('.wav')) : [];
+  if (!wavs.length) {
+    job('real recordings', 0.1, true, () => [{ name: 'real recordings', kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: [], ok: true, summary: 'no real recordings yet (drop NAME.wav + NAME.json into recordings/)' }]);
+  }
+  for (const w of wavs) {
+    job(`real recording ${w}`, 2, true, () => {
+      const json = new URL(w.replace(/\.wav$/i, '.json'), dir);
+      if (!existsSync(json)) return [{ name: `real recording ${w}`, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: ['no matching .json event log'], ok: false, summary: 'no matching .json event log' }];
+      const r = replayRecording(new Uint8Array(readFileSync(new URL(w, dir))), readFileSync(json, 'utf8'));
+      const fails = [...r.missing.map((a) => `app accepted note ${a.index + 1} ${a.phase}, replay did not`), ...r.extra.map((a) => `replay accepted note ${a.index + 1} ${a.phase}, the app did not`)];
+      return [{ name: `real recording ${w}`, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails, ok: fails.length === 0, summary: `${r.kind}: app accepted ${r.logged.length}, replay ${r.replayed.length}${fails.length ? ' — ' + fails.slice(0, 3).join('; ') : ''}` }];
+    });
+  }
 }
 
 // ========================================================================== in-session pitch bias

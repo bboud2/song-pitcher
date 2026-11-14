@@ -317,3 +317,15 @@ body.flash .stage { animation: flash 0.6s ease-out; }
   .toggle-row .segmented { width: 100%; }
   .toggle-row .segmented .seg { flex: 1; min-width: 0; }
 }
+
+/* Very short phones: while a warning is shown, the general help line gives way to it. */
+@media (max-height: 600px) and (orientation: portrait) {
+  .tuner-help .advice[data-level='warn'] + p { display: none; }
+}
+
+/* Practice recorder */
+.rec-badge { display: inline-block; margin-top: 2px; padding: 1px 8px; border-radius: 999px; background: #5a1d24; color: #ffb3bd; font-size: 0.8rem; font-weight: 800; letter-spacing: 0.04em; }
+.rec-notice { color: var(--play); }
+.soundcheck { display: flex; flex-direction: column; gap: 8px; }
+.soundcheck-step { font-size: 1.1rem; font-weight: 700; text-align: center; }
+.soundcheck-count { text-align: center; font-variant-numeric: tabular-nums; }

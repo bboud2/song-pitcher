@@ -7,10 +7,12 @@
 //
 // Uses the globally installed `playwright` package and its bundled Chromium.
 import { execSync, spawn, type ChildProcess } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
 import { buildWavs } from './wavs.ts';
+import { decodeWav } from '../src/core/wav.ts';
+import { replayRecording } from '../scripts/replay.ts';
 
 const require = createRequire(import.meta.url);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -235,6 +237,98 @@ async function negativeRun(device: { name: string; slug: string }, wav: string, 
   await browser.close();
 }
 
+/** The next `n` downloads the page starts. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function downloads(page: Page, n: number): Promise<any[]> {
+  return new Promise((resolveAll) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const got: any[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const on = (d: any) => {
+      got.push(d);
+      if (got.length === n) {
+        page.off('download', on);
+        resolveAll(got);
+      }
+    };
+    page.on('download', on);
+  });
+}
+
+/** Practice recorder: a short recorded session and a sound check, saved and replayed offline. */
+async function recorderRun(wav: string): Promise<void> {
+  const browser = await launch(wav);
+  const ctx = await browser.newContext({ ...pw.devices['Pixel 7'], acceptDownloads: true });
+  await ctx.grantPermissions(['microphone'], { origin: URL });
+  const page = await ctx.newPage();
+  const tag = '[recorder]';
+  await page.goto(URL);
+  await page.evaluate(() => {
+    localStorage.clear();
+    localStorage.setItem('songPitcher.v1', JSON.stringify({ settings: { recordSession: true } }));
+  });
+  await page.reload();
+  await page.click('[data-testid="start"]');
+  await page.waitForSelector('[data-testid="begin"]:not([disabled])', { timeout: 12000 });
+  // sound check recording (a few seconds, stopped early)
+  await page.click('[data-testid="soundcheck-start"]');
+  await page.waitForTimeout(3000);
+  check(((await page.textContent('[data-testid="soundcheck-step"]')) ?? '').includes('1/'), `${tag} sound check shows its first instruction`);
+  await page.click('[data-testid="soundcheck"] button');
+  const scSave = await page.waitForSelector('[data-testid="soundcheck"] [data-testid="save-recording"]', { timeout: 5000 }).catch(() => null);
+  check(!!scSave, `${tag} sound check offers "Save sound check" when stopped`);
+  if (scSave) {
+    const dl = downloads(page, 2);
+    await scSave.click();
+    const files = await dl;
+    const names = files.map((d: { suggestedFilename(): string }) => d.suggestedFilename());
+    check(names.some((n: string) => n.endsWith('.wav')) && names.some((n: string) => n.endsWith('.json')), `${tag} sound check saved as WAV + JSON (${names.join(', ')})`);
+  }
+  // a short recorded session: two notes
+  await page.click('[data-testid="begin"]');
+  await page.waitForSelector('[data-testid="session"]');
+  check((await page.$('[data-testid="rec-badge"]')) !== null, `${tag} recording indicator shown during the session`);
+  const twoNotes = await waitSession(page, 'index >= 2', 60000);
+  check(twoNotes, `${tag} two notes done while recording`);
+  await page.click('[data-testid="end"]');
+  await page.waitForSelector('[data-testid="summary"]');
+  const save = await page.$('[data-testid="save-recording"]');
+  check(!!save, `${tag} summary offers "Save recording"`);
+  if (save) {
+    const dl = downloads(page, 2);
+    await save.click();
+    const files = await dl;
+    const paths: Record<string, string> = {};
+    for (const d of files) {
+      const p = join(OUT, d.suggestedFilename());
+      await d.saveAs(p);
+      paths[p.endsWith('.wav') ? 'wav' : 'json'] = p;
+    }
+    check(!!paths.wav && !!paths.json, `${tag} session saved as WAV + JSON`);
+    if (paths.wav && paths.json) {
+      const bytes = new Uint8Array(readFileSync(paths.wav));
+      const w = decodeWav(bytes);
+      let rec: { meta: Record<string, unknown>; events: { type: string }[] } | null = null;
+      try {
+        rec = JSON.parse(readFileSync(paths.json, 'utf8'));
+      } catch {
+        rec = null;
+      }
+      check(!!rec, `${tag} event log is valid JSON`);
+      if (rec) {
+        const sec = Number(rec.meta.seconds);
+        check(Math.abs(w.samples.length / w.sampleRate - sec) < 0.01 && w.sampleRate === rec.meta.sampleRate, `${tag} WAV length matches the log (${(w.samples.length / w.sampleRate).toFixed(2)} s vs ${sec.toFixed(2)} s, ${w.sampleRate} Hz)`);
+        check(rec.meta.captureMode === 'worklet' && typeof rec.meta.trackSettings === 'object' && typeof rec.meta.userAgent === 'string', `${tag} log has capture mode, applied mic settings and user agent (${rec.meta.captureMode}, ${JSON.stringify(rec.meta.trackSettings).slice(0, 80)})`);
+        check(['start', 'step', 'listenDone', 'accept', 'end'].every((k) => rec!.events.some((e) => e.type === k)), `${tag} log has start, step, listenDone, accept and end events`);
+        const r = replayRecording(bytes, readFileSync(paths.json, 'utf8'));
+        check(r.logged.length >= 3 && r.missing.length === 0 && r.extra.length === 0, `${tag} offline replay reproduces the app's accepts (app ${r.logged.length}, replay ${r.replayed.length}, not reproduced ${r.missing.length}, extra ${r.extra.length})`);
+        if (r.missing.length || r.extra.length) for (const l of r.lines) console.log('   ', l);
+      }
+    }
+  }
+  await browser.close();
+}
+
 /** On plain http from a non-localhost address the page must explain that the mic needs https. */
 /** The reference tone (rendered offline with the app's own code) must be steady during its sustain. */
 async function toneRun(): Promise<void> {
@@ -379,6 +473,7 @@ async function main(): Promise<void> {
       await Promise.all(devs.map((d) => negativeRun(d, voiceOnly, 'voice only, no guitar, strict check', 'play', { strictCheck: true })));
       await Promise.all(devs.map((d) => negativeRun(d, guitarOnly, 'guitar only, no singing, strict check', 'sing', { strictCheck: true })));
     }
+    await recorderRun(correct);
     await toneRun();
     await insecureRun();
     await layoutRun(correct);

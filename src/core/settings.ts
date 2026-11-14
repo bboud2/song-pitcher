@@ -21,6 +21,8 @@ export interface Settings {
    * (fading singers, compressed or long-sustain guitars).
    */
   strictCheck: boolean;
+  /** Keep this session's raw microphone audio and the app's decisions on the device for testing. */
+  recordSession: boolean;
 }
 
 /** Defaults are the easy end: all hints on, widest tolerance. */
@@ -37,6 +39,7 @@ export const DEFAULT_SETTINGS: Settings = {
   allowSkip: true,
   playKeyAtStart: true,
   strictCheck: false,
+  recordSession: false,
 };
 
 /** Merge unknown/partial input (e.g. from localStorage) into valid settings. */

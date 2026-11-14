@@ -28,6 +28,7 @@ export class AudioEngine {
   private acc = new Float32Array(0);
   private fed = 0;
   private wasMuted = false;
+  private muteFrom = 0;
   private pollBuf: Float32Array<ArrayBuffer> | null = null;
   private pollLast = -1;
   private rawAnalyser: AnalyserNode | null = null;
@@ -138,10 +139,26 @@ export class AudioEngine {
     this.captureMode = 'poll';
   }
 
+  /** Raw microphone samples as the analysis receives them (practice recorder). */
+  tap: ((samples: Float32Array, tEnd: number) => void) | null = null;
+  /** The reference tone is playing (frames dropped) from/to these audio times (practice recorder). */
+  onMute: ((from: number, to: number) => void) | null = null;
+
+  /** What the browser actually applied to the microphone (echo cancellation, AGC, ...). */
+  trackSettings(): Record<string, unknown> {
+    const tr = this.stream?.getAudioTracks()[0];
+    try {
+      return tr ? { ...(tr.getSettings() as Record<string, unknown>), label: tr.label } : {};
+    } catch {
+      return {};
+    }
+  }
+
   /** New samples whose last one is at audio time `tEnd`: analyse every whole hop. */
   private onAudio(samples: Float32Array, tEnd: number): void {
     const sa = this.sa;
     if (!sa) return;
+    this.tap?.(samples, tEnd);
     const hop = Math.round((HOP_MS / 1000) * sa.sampleRate);
     const all = new Float32Array(this.acc.length + samples.length);
     all.set(this.acc);
@@ -160,12 +177,14 @@ export class AudioEngine {
   private deliver(t: number): void {
     const sa = this.sa!;
     if (this.playing || t < this.mutedUntil) {
+      if (!this.wasMuted) this.muteFrom = t;
       this.wasMuted = true; // never analyse our own reference tone
       return;
     }
     if (this.wasMuted) {
       sa.attacks.clear(); // ...nor remember its attacks
       this.wasMuted = false;
+      this.onMute?.(this.muteFrom, t);
     }
     if (!this.onFrame) return;
     const path = this.pathFn();

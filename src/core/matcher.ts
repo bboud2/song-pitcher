@@ -213,7 +213,7 @@ export function attackKind(full: FrameAttack | undefined, hf: FrameAttack | unde
   return null;
 }
 /** NSDF height at half the read period above which a reading is taken one octave up (plucked). */
-export const OCTAVE_UP_CLARITY = 0.6;
+export const OCTAVE_UP_CLARITY = 0.65;
 /** Up to this rise time the source is decided by how the timbre develops. */
 export const AMBIGUOUS_RISE_MS = 34;
 /** ...a string's upper partials lose at least this much against its fundamental in 0.25 s. */
@@ -344,6 +344,8 @@ interface Candidate {
   source: 'pending' | 'ambiguous' | 'pluck' | 'voice';
   /** taken over from the attack before (an onset with no attack of its own) */
   inherited?: boolean;
+  /** opened while the sung answer was still sounding: the voice's loudest level just before */
+  underVoice?: number;
   /** default guitar step: did not lose level just after its peak (second look pending) */
   held?: boolean;
   /** this pluck is the octave above the note that was sounding (that note's MIDI) */
@@ -368,6 +370,8 @@ export class NoteMatcher {
   private tooShortUntil = -Infinity;
   private unclearUntil = -Infinity;
   private lastSungMidi: number | null = null;
+  /** consecutive sung frames read within 0.3 st of each other */
+  private sungRun = 0;
   private lastVoicedT = -Infinity;
   private lastCountedWrong: number | null = null;
   // plucked
@@ -389,6 +393,8 @@ export class NoteMatcher {
   private sungOn = true;
   /** when the sung answer was found to have stopped */
   private sungEndT = -Infinity;
+  /** a fall of the sung answer's level, not yet confirmed as its end */
+  private sungDrop: { t: number; ref: number } | null = null;
   private startLevels: number[] = [];
   private quietFrames = 0;
 
@@ -442,14 +448,20 @@ export class NoteMatcher {
     // (a quiet voice in a noisy room: the detector can lock onto every third cycle for a frame,
     // a twelfth (or a twelfth and an octave) below the note sung a moment ago — that is still the
     // same note, no voice jumps that far within 0.1 s)
-    if (c.kind === 'sung' && midi !== null && this.lastSungMidi !== null && f.t - this.lastVoicedT <= 0.1) {
+    // (only toward a pitch already read steadily for 3 frames: a thin voice whose third harmonic
+    // is read for one frame at the onset must not drag every later, correct frame up with it)
+    if (c.kind === 'sung' && midi !== null && this.lastSungMidi !== null && this.sungRun >= 3 && f.t - this.lastVoicedT <= 0.1) {
       for (const d of [19, 31]) if (Math.abs(midi + d - this.lastSungMidi) < 0.3) midi += d;
     }
-    if (c.kind === 'sung' && midi !== null) this.lastSungMidi = midi;
+    if (c.kind === 'sung' && midi !== null) {
+      this.sungRun = this.lastSungMidi !== null && Math.abs(midi - this.lastSungMidi) < 0.3 ? this.sungRun + 1 : 1;
+      this.lastSungMidi = midi;
+    }
     // (a guitar note read an octave low: the detector took two periods for one — the waveform
     // also repeats strongly at half the period read, which a real note an octave lower never
     // does. Heard with nylon and thumb plucks in reverberant rooms.)
-    if (c.kind === 'plucked' && midi !== null && (f.upClarity ?? 0) >= OCTAVE_UP_CLARITY && Math.abs(midi + 12 - c.targetMidi) < 0.6) midi += 12;
+    // (a real note an octave lower reads with full clarity; the misread is less clear)
+    if (c.kind === 'plucked' && midi !== null && (f.upClarity ?? 0) >= OCTAVE_UP_CLARITY && f.clarity < 0.96 && Math.abs(midi + 12 - c.targetMidi) < 0.6) midi += 12;
     const nov = f.novFreq && (f.novClarity ?? 0) >= 0.75 && f.novFreq >= 55 && f.novFreq <= 1700 ? freqToMidi(f.novFreq) : null;
     this.hist.push({ t: f.t, db, rawDb: rmsToDb(f.rms), clarity: f.clarity, midi, nov, up: f.upClarity ?? 0, hf: f.hfDb ?? -200, tilt: midi !== null ? (f.tiltDb ?? null) : null, novOdd: midi !== null && (f.novShare ?? 0) >= 0.2 ? (f.novOddDb ?? null) : null, nsdf: f.nsdf, sr: f.sr });
     while (this.hist.length && this.hist[0].t < f.t - 2.5) this.hist.shift();
@@ -662,10 +674,14 @@ export class NoteMatcher {
       if (!this.sungOn) this.sungEndT = t;
       // (or the voice stopped over a string still ringing: the level falls by 6 dB within 60 ms,
       // faster than any string dies)
+      // (confirmed only if the level stays down for 0.15 s: in a room a sung vowel's vibrato
+      // swings the level by 5 dB and more, and a dip that comes back is the voice going on)
       const recent = this.hist.filter((r) => r.t >= t - 0.16 - 1e-6 && r.t <= t - 0.06 + 1e-6);
-      if (recent.length && db <= Math.max(...recent.map((r) => r.db)) - 6) {
+      if (this.sungDrop === null && recent.length && db <= Math.max(...recent.map((r) => r.db)) - 6) this.sungDrop = { t, ref: Math.max(...recent.map((r) => r.db)) };
+      else if (this.sungDrop !== null && db >= this.sungDrop.ref - 3) this.sungDrop = null;
+      else if (this.sungDrop !== null && t - this.sungDrop.t >= 0.15 - 1e-6) {
         this.sungOn = false;
-        this.sungEndT = t;
+        this.sungEndT = this.sungDrop.t;
       }
     } else this.sungOn = false;
 
@@ -783,6 +799,7 @@ export class NoteMatcher {
       this.cand = {
         onsetT, peakT: t, peakDb: db, lead, source: fromEvent ?? 'pending',
         preSounding: preMax >= c.minDb + 10 && preMax >= db - 25,
+        underVoice: this.sungOn && c.voiceMidi !== undefined ? preMax : undefined,
         preMidi: preVoiced.length >= 3 ? median(preVoiced) : null,
         pre: pre.slice(-6),
         identity: null, lastWindowMidi: null, done: false, counted: false, decay: 'pending',
@@ -848,7 +865,8 @@ export class NoteMatcher {
         // A pluck an octave above a note that was already sounding (singing the octave below while
         // plucking): the mixture reads as the lower note, but everything NEW sits on its even
         // harmonics only — the new note is the octave above.
-        if (cand.octaveUp === undefined && cand.preMidi !== null && t - cand.onsetT <= 0.4 && vw.some((r) => Math.abs((r.midi as number) - (cand.preMidi as number)) < 0.5)) {
+        // (only to reach the target: the note sounding before is the target's lower octave)
+        if (cand.octaveUp === undefined && cand.preMidi !== null && Math.abs(cand.preMidi + 12 - c.targetMidi) < 0.5 && t - cand.onsetT <= 0.4 && vw.some((r) => Math.abs((r.midi as number) - (cand.preMidi as number)) < 0.5)) {
           // (the frames that read the lower note, early after the attack while the new power is fresh)
           const odd = this.hist.filter((r) => r.t >= cand.onsetT - 1e-6 && r.t <= cand.onsetT + 0.25 && r.novOdd !== null && r.midi !== null && Math.abs(r.midi - (cand.preMidi as number)) < 0.5).map((r) => r.novOdd as number);
           if (odd.length >= 2 && median(odd) <= -8) {
@@ -931,6 +949,14 @@ export class NoteMatcher {
               // voice is what reads (a pluck under it is taken once the voice stops)
               hint = 'singing';
               cand.steadySince = undefined;
+            } else if (cand.underVoice !== undefined && c.voiceMidi !== undefined && Math.abs(((((wm - c.voiceMidi) % 12) + 18) % 12) - 6) < 0.6 && cand.peakDb < cand.underVoice + 3) {
+              // Opened while the sung answer was still sounding, at its pitch (or an octave of
+              // it), and never louder than the voice itself was just before: that "onset" was the
+              // voice swelling (vibrato in a room swings it by several dB), and what is left once
+              // it stops is its reverberant tail — not a pluck. A pluck under the voice that does
+              // not stand out has to be plucked again after the voice has stopped.
+              cand.steadySince = undefined;
+              if (!this.sungOn) cand.done = true;
             } else if (cand.onsetT < this.sungEndT && (t < this.sungEndT + 0.06 || db < cand.peakDb - 14)) {
               // opened while the student was still singing: only what is left once the voice has
               // stopped can be the string — and a pluck leaves a string sounding, not a fading
@@ -974,7 +1000,10 @@ export class NoteMatcher {
           accMidi = cand.lastWindowMidi;
           reason = 'window';
         } else {
-          hint = 'moving';
+          // ("stop on the note" only for a note that is near the target and gliding — not for a
+          // thump, a squeak or a spoken word, which never settle anywhere)
+          const near = this.hist.slice(-3).filter((r) => r.midi !== null && Math.abs((r.midi as number) - c.targetMidi) <= 1.5).length;
+          if (cand.identity !== null || near >= 3) hint = 'moving';
           cand.steadySince = undefined;
         }
       }
@@ -1172,16 +1201,36 @@ export class NoteMatcher {
       return next ? next.db : NaN;
     };
     const voicedIn = (a: number, b: number) => this.hist.filter((r) => r.t >= cand.peakT + a - 1e-6 && r.t <= cand.peakT + b + 1e-6 && r.midi !== null).length;
+    // (a string's level only goes down after its peak; a held tone in a room swings by a few dB
+    // as its pitch wanders across the room's resonances — so a dip that recovers, by more than
+    // `tol` dB above the lowest level reached so far, is no sign of a string)
+    const recovers = (a: number, b: number, tol: number) => {
+      const xs = this.hist.filter((r) => r.t >= cand.peakT + a - 1e-6 && r.t <= cand.peakT + b + 1e-6).map((r) => r.db);
+      let lo = Infinity;
+      for (let i = 1; i < xs.length; i++) {
+        const v = (xs[i] + xs[i - 1]) / 2;
+        if (v >= lo + tol) return true;
+        lo = Math.min(lo, v);
+      }
+      return false;
+    };
+    // (a sound that stops — its level falls 4 dB or more from one 20 ms frame to the next — is a
+    // voice ending, not a string dying: even a nylon string dies by under 3 dB per frame)
+    const ends = (a: number, b: number) => {
+      const xs = this.hist.filter((r) => r.t >= cand.peakT + a - 1e-6 && r.t <= cand.peakT + b + 1e-6).map((r) => r.db);
+      for (let i = 1; i < xs.length; i++) if (xs[i - 1] - xs[i] >= 4) return true;
+      return false;
+    };
     const decide = (k: 'pluck' | 'voice') => {
       cand.source = k;
       this.lastSource = { kind: k, t: cand.onsetT };
     };
-    // (1) A loss of 2.5 dB or more within 0.15 s of the peak: a string (a voice's accent relaxes
+    // (1) A loss of 3.5 dB or more within 0.15-0.4 s of the peak, steadily: a string (a voice's accent relaxes
     // by less), decided at once.
     if (t >= cand.peakT + 0.14 - 1e-6 && t < cand.peakT + 0.4 - 1e-6) {
       const a0 = meanDb(0.02, 0.08);
       const a1 = mean(this.hist.filter((r) => r.t >= t - 0.04 - 1e-6).map((r) => r.db));
-      if (a0 - a1 >= 2.5 && this.hist[this.hist.length - 1].midi !== null) return decide('pluck');
+      if (a0 - a1 >= 3.5 && this.hist[this.hist.length - 1].midi !== null && !recovers(0.02, t - cand.peakT, 1.5) && !ends(0.1, t - cand.peakT)) return decide('pluck');
     }
     if (t < cand.peakT + 0.4 - 1e-6) return;
     // (2) At 0.4 s: a string loses about the same number of dB in each 0.14 s step (it dies
@@ -1194,7 +1243,7 @@ export class NoteMatcher {
     const d1 = w1 - w2;
     const d2 = w2 - w3;
     if (!cand.held) {
-      if (d1 >= 0.5 && d2 >= 0.5 && d2 >= 0.6 * d1 && voicedIn(0.3, 0.4) >= 1) return decide('pluck');
+      if (d1 >= 0.8 && d2 >= 0.8 && d2 >= 0.6 * d1 && voicedIn(0.3, 0.4) >= 1 && !recovers(0.02, 0.4, 2) && !ends(0.1, 0.4)) return decide('pluck');
       cand.held = true;
     }
     if (t < cand.peakT + 0.62 - 1e-6) return;
@@ -1204,7 +1253,7 @@ export class NoteMatcher {
     const w4 = meanDb(0.52, 0.62);
     if (Number.isNaN(w4)) return;
     const d3 = w3 - w4;
-    if (d3 >= 0.6 && w2 - w4 >= 1.5 && voicedIn(0.52, 0.62) >= 1) return decide('pluck');
+    if (d3 >= 0.6 && w2 - w4 >= 1.5 && voicedIn(0.52, 0.62) >= 1 && !recovers(0.16, 0.62, 3) && !ends(0.1, 0.62)) return decide('pluck');
     // A held level is no evidence after all when a compressor or a phone's gain control holds it:
     // the sound is still a string if its upper partials die away against the fundamental (a
     // voice keeps its colour; compression changes the level, not the balance of the partials).
@@ -1213,8 +1262,12 @@ export class NoteMatcher {
       const xs = this.hist.filter((r) => r.t >= cand.peakT + a - 1e-6 && r.t <= cand.peakT + b + 1e-6 && r.tilt !== null).map((r) => r.tilt as number);
       return xs.length >= 2 ? mean(xs) : NaN;
     };
-    const tiltDrop = tilt(0.02, 0.12) - tilt(0.5, 0.62);
-    decide(tiltDrop >= 2 ? 'pluck' : 'voice');
+    // (by a clear margin and step by step: a held hum's colour wanders by ±2 dB in a room)
+    const ta = tilt(0.02, 0.12);
+    const tb = tilt(0.26, 0.36);
+    const tc = tilt(0.5, 0.62);
+    const tiltDrop = ta > tb && tb > tc ? ta - tc : 0;
+    decide(tiltDrop >= 3.5 ? 'pluck' : 'voice');
   }
 
   private strictDecay(cand: Candidate, t: number): void {
