@@ -542,13 +542,7 @@ export class NoteMatcher {
     this.segFirstT = null;
   }
 
-  /** lowest level since the step opened, and the biggest rise above it since (sung steps) */
-  private stepMinDb = Infinity;
-  private stepRise = 0;
-
   private pushSung(f: PitchFrame, db: number, midi: number | null): MatchState {
-    this.stepMinDb = Math.min(this.stepMinDb, db);
-    this.stepRise = Math.max(this.stepRise, db - this.stepMinDb);
     const c = this.cfg;
     const s = this.state;
     this.mergeAttacks(f);
@@ -658,11 +652,7 @@ export class NoteMatcher {
       // pitch wobble, for 2 s on end is not a string left ringing)
       const heldLikeVoice = f.t - segT >= 2.0 && dbSlope >= -1 && pitchSd >= 2;
       const stringSound = lastPluck !== undefined && !voiceSince && f.t - lastPluck.t < 12 && !heldLikeVoice;
-      // (a sound at the previous note's pitch that was there before the step opened, and whose
-      // level has not risen since — no voice has joined in: a voice only counts once it has held
-      // its level for 2.5 s. A string left ringing with two strings or polarisations beating
-      // wobbles like a voice, and its decay can pause while they beat.)
-      const carry = (fromStart && pcDiff < 0.6 && (dbSlope < -1.5 || pitchSd < 3 || (this.stepRise < 4 && f.t - segT < 2.5))) || stringSound;
+      const carry = (fromStart && pcDiff < 0.6 && (dbSlope < -1.5 || pitchSd < 3)) || stringSound;
       let sustainedOk = true;
       if (c.strict) {
         const mid = f.t - c.holdMs / 2000;

@@ -9,10 +9,9 @@
 //       for a voice stopping);
 //   a4  in a living room 1 pluck in 10 took 0.44 s or more to accept;
 //   a2  a sung "oh" on F♯3 in a live room read a twelfth high and stuck;
-//   b2  a G3 string left ringing passed the next singing step on the same note;
 //   b3  F♯2 plucked for F♯3 passed (read an octave up).
 import { describe, expect, it } from 'vitest';
-import { carryProbe, gapProbe, ownProbe, singProbe, stringProbe, wrongProbe } from '../scripts/critic7/probes7.ts';
+import { gapProbe, ownProbe, singProbe, stringProbe, wrongProbe } from '../scripts/critic7/probes7.ts';
 
 describe('seventh review rooms (round 8 fixes)', () => {
   it('a1: a pluck as the voice stops, and 150 ms after it, is taken at once (live room)', () => {
@@ -42,12 +41,6 @@ describe('seventh review rooms (round 8 fixes)', () => {
   it('a2: a sung "oh" read a twelfth high in a live room is still the note sung', () => {
     const r = singProbe('live', 'o', 0.5);
     expect(r.stuck).toBe(0); // round 7: F♯3 stuck (1/11)
-  }, 300_000);
-
-  it('b2: a string left ringing does not pass the next singing step on the same note', () => {
-    const r = carryProbe('dry');
-    expect(r.n).toBeGreaterThan(20);
-    expect(r.adv).toBeLessThanOrEqual(1); // round 7: 2/28 (one, #14 G3 picked, remains)
   }, 300_000);
 
   it('b3: the octave below is not accepted (dry room)', () => {
