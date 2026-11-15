@@ -573,6 +573,13 @@ export class NoteMatcher {
       while (prev - cents > 600) cents += 1200;
     }
     if (this.seg.length && Math.abs(cents - this.seg[this.seg.length - 1].c) > c.jumpCents) this.resetSeg();
+    // (followed that way from something else — a TV, speech — the note can end up counted an
+    // octave away from the target although its pitch class is right: start afresh from it)
+    if (c.mode === 'pitchClass' && Math.abs(cents) > 600) {
+      this.resetSeg();
+      while (cents > 600) cents -= 1200;
+      while (cents < -600) cents += 1200;
+    }
     if (!this.seg.length) {
       this.segFirstT = f.t;
       // Did this note start with an attack inside this step, or was it already sounding?
@@ -928,7 +935,10 @@ export class NoteMatcher {
         if (cand.octaveUp === undefined && cand.preMidi !== null && Math.abs(cand.preMidi + 12 - c.targetMidi) < 0.5 && t - cand.onsetT <= 0.4 && vw.some((r) => Math.abs((r.midi as number) - (cand.preMidi as number)) < 0.5)) {
           // (the frames that read the lower note, early after the attack while the new power is fresh)
           const odd = this.hist.filter((r) => r.t >= cand.onsetT - 1e-6 && r.t <= cand.onsetT + 0.25 && r.novOdd !== null && r.midi !== null && Math.abs(r.midi - (cand.preMidi as number)) < 0.5).map((r) => r.novOdd as number);
-          if (odd.length >= 2 && median(odd) <= -8) {
+          // (unless what is new reads as the lower note itself: the same low string plucked again)
+          const newN = this.hist.filter((r) => r.t >= cand.onsetT - 1e-6 && r.t <= cand.onsetT + 0.25 && r.nov !== null).map((r) => r.nov as number);
+          const sameLow = newN.length >= 3 && newN.filter((n) => Math.abs(n - (cand.preMidi as number)) < 0.6).length >= newN.length / 2;
+          if (odd.length >= 2 && median(odd) <= -8 && !sameLow) {
             cand.octaveUp = cand.preMidi;
             // (what it was read as so far was that lower note: it is this note's octave — not a jump)
             const lift = (m: number | null) => (m !== null && Math.abs(m - (cand.octaveUp as number)) < 0.5 ? m + 12 : m);
@@ -973,6 +983,19 @@ export class NoteMatcher {
           if (voiceOver) {
             cand.steadySince = undefined;
             if (this.voiceSounding(t) || (cand.preSounding && db >= cand.peakDb - 6)) hint = 'singing';
+          } else if (jump > 1.5 && flip && t - cand.onsetT <= 0.22 && !cand.preSounding && db >= cand.peakDb - 15 && Math.abs(this.deviation(wm)) <= c.toleranceCents && cand.lastWindowMidi !== null && cand.lastWindowMidi > wm) {
+            // (right after the attack a string whose fundamental is weak reads an octave or two
+            // high, then settles on its own note while still loud: that note is the identity —
+            // only very early, and not over another note ringing, where the reading of a real
+            // higher note can drop an octave into the lower one's period)
+            cand.steadySince = undefined;
+            cand.identity = wm;
+            cand.lastWindowMidi = wm;
+          } else if (jump > 1.5 && flip && t - cand.onsetT <= 0.35 && cand.lastWindowMidi !== null && wm > cand.lastWindowMidi && Math.abs(this.deviation(cand.lastWindowMidi)) <= c.toleranceCents) {
+            // (...and the other way: a note already read on the target that reads an octave or
+            // two higher for a moment — its upper partials while it is fresh — is still that note;
+            // this window does not count)
+            cand.steadySince = undefined;
           } else if (jump > 1.5 && (flip || jump > 5 || t - cand.onsetT > 0.5)) {
             // the reading jumped by an octave/fifth (a dying note's misread, hum) or far, late:
             // this attack is not trusted any more
@@ -1061,6 +1084,9 @@ export class NoteMatcher {
                 // (still deciding what made the attack: remember that the note was right, in case
                 // it is decided only after another string or the room has taken over the reading)
                 if (cand.source !== 'voice') cand.ready ??= wm;
+              } else if (db < cand.peakDb - 30) {
+                // (never on the last breath of a sound: 30 dB under its peak the reading is the
+                // room's noise as much as the note, and it can read an octave off)
               } else if (!c.strict || cand.decay === 'confirmed') {
                 accepted = !c.neverAccept;
                 accMidi = wm;

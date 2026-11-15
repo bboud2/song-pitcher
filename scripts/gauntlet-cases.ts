@@ -6,6 +6,7 @@
 // Three independent synthesis models are used: fixtures.ts (Karplus-Strong + formant voice),
 // fixtures2.ts (additive strings + formant voices) and fixtures3.ts (two-polarisation strings,
 // source-filter voices, rooms, phone processing), plus the review's ported conditions.
+import { spawnSync } from 'node:child_process';
 import { StreamAnalyzer, guitarConfig, singConfig, HOP_MS, FRAME_SIZE, type AnalysisPath } from '../src/core/engine.ts';
 import { NoteMatcher, type MatchConfig, type PitchFrame } from '../src/core/matcher.ts';
 import { noteName } from '../src/core/music.ts';
@@ -897,6 +898,64 @@ for (const name of ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']) {
     job(`critic7 probe ${key}`, 6, false, async () => {
       const r = await run();
       return [{ name: `critic7 probe ${key}`, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: r.ok ? [] : [`${r.name}: ${r.text}`], ok: r.ok, summary: `${r.name}: ${r.text}` }];
+    });
+  }
+}
+
+// ========================================================================== eighth review (streaming rooms, phone chains, guitars)
+// Run as child processes (its rig picks the build by path). Sessions: none stuck, no accidental
+// advance, at most 5 % re-plucks and extra breaths. Probes: nothing passes that should not, and
+// the tuner rows are all as expected.
+{
+  const dir = new URL('./critic8/', import.meta.url).pathname;
+  const runC8 = (args: string[], env: Record<string, string> = {}): string => {
+    const r = spawnSync(process.execPath, args, { cwd: dir, env: { ...process.env, ...env }, encoding: 'utf8', maxBuffer: 64 << 20 });
+    return `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  };
+  const sessions: [string, string, Record<string, string>][] = [
+    ...['s1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's8a', 's8b', 's8c', 's8d', 's9', 's10'].map((n) => [n, '1', {}] as [string, string, Record<string, string>]),
+    ['s3', '3', { SUS: '2.5' }], ['s6', '3', { SUS: '2.5' }], ['s9', '3', { SUS: '2.5' }],
+  ];
+  for (const [name, seed, env] of sessions) {
+    const label = `critic8 session ${name} s${seed}${env.SUS ? ` sustain ×${env.SUS}` : ''}`;
+    job(label, 10, name === 's3' && !env.SUS, () => {
+      const out = runC8(['sess8.ts', name, seed], env);
+      const j = /^JSON (.*)$/m.exec(out);
+      if (!j) return [{ name: label, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: ['no result'], ok: false, summary: out.slice(0, 300) }];
+      const d = JSON.parse(j[1]);
+      const lim = (n: number) => Math.max(1, Math.ceil(0.05 * n));
+      const problems: string[] = [];
+      if (d.pstuck + d.sstuck + d.rstuck) problems.push(`stuck on ${d.pstuck + d.sstuck + d.rstuck} (play ${d.pstuck}, sing ${d.sstuck}, review ${d.rstuck})`);
+      if (d.badSing + d.badPlay + d.badRev) problems.push(`${d.badSing + d.badPlay + d.badRev} accidental advances (sing ${d.badSing}, play ${d.badPlay}, review ${d.badRev})`);
+      if (d.ps - d.fp - d.pstuck > lim(d.ps)) problems.push(`${d.ps - d.fp - d.pstuck}/${d.ps} notes needed another pluck`);
+      if (d.ss - d.sf - d.sstuck > lim(d.ss)) problems.push(`${d.ss - d.sf - d.sstuck}/${d.ss} notes needed another breath`);
+      const summary = out.split('\n')[0].replace(/\s+/g, ' ');
+      return [{ name: label, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: problems, ok: problems.length === 0, summary: problems.length ? `${summary} — ${problems.join('; ')}` : summary }];
+    });
+  }
+  const probes: [string[], Record<string, string>][] = [
+    [['tv', '-30', 'm', 'bed'], {}], [['tv', '-24', 'm', 'bed'], {}], [['tv', '-30', 'f', 'bed'], {}], [['tv', '-24', 'f', 'kitchen'], {}],
+    [['quiet'], {}], [['knock'], {}], ...[0, 1, 2, 3, 4].map((k) => [['hold', String(k)], {}] as [string[], Record<string, string>]),
+    ...[['bed', 'dread', '12', '0'], ['bed', 'dread', '-12', '0'], ['kitchen', 'nylon', '-12', '0', 'budget'], ['kitchen', 'nylon', '12', '0', 'budget'], ['bath', 'parlor', '-12', '0'], ['bath', 'parlor', '12', '0'],
+      ['bed', 'electric', '12', '0', 'airpods'], ['bed', 'dread', '-1', '45'], ['bed', 'dread', '0', '50'], ['bed', 'dread', '0', '-60'], ['bed', 'dread', '-1', '0'], ['bed', 'dread', '1', '0']].map((a) => [['wrong', ...a], {}] as [string[], Record<string, string>]),
+    ...[['kitchen', 'nylon', '-12', '0', 'budget'], ['bath', 'parlor', '-12', '0'], ['bed', 'dread', '-12', '0']].map((a) => [['wrong', ...a], { SUS: '2.5' }] as [string[], Record<string, string>]),
+  ];
+  for (const [args, env] of probes) {
+    const label = `critic8 probe ${args.join(' ')}${env.SUS ? ` sustain ×${env.SUS}` : ''}`;
+    job(label, 6, false, () => {
+      const out = runC8(['probes8.ts', ...args], env);
+      const rows = out.split('\n').filter((l) => /\d+\/\d+/.test(l));
+      const bad = rows.filter((l) => !/ 0\/\d+/.test(l)).map((l) => l.replace(/^\S+ /, '').slice(0, 160));
+      return [{ name: label, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: bad, ok: rows.length > 0 && bad.length === 0, summary: rows.map((l) => l.replace(/^\S+ /, '').replace(/ \| det.*$/, '')).join(' || ') || out.slice(0, 200) }];
+    });
+  }
+  for (const which of ['intune', 'four', 'fret', 'sung', 'd150', 'one']) {
+    const label = `critic8 tuner ${which}`;
+    job(label, 8, false, () => {
+      const out = runC8(['tuner8.ts', which]);
+      const rows = out.split('\n').filter((l) => /: \d+\/\d+/.test(l));
+      const bad = rows.filter((l) => { const m = /: (\d+)\/(\d+)/.exec(l)!; return m[1] !== m[2]; }).map((l) => l.slice(0, 150));
+      return [{ name: label, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: bad, ok: rows.length > 0 && bad.length === 0, summary: rows.map((l) => l.replace(/\s+failing:.*$/, '')).join(' || ') }];
     });
   }
 }

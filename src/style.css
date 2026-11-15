@@ -344,7 +344,7 @@ body.flash .stage { animation: flash 0.6s ease-out; }
 .take-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
 .take-actions .btn { min-height: 44px; }
 .small-btn { padding: 8px 12px; font-size: 0.95rem; }
-.mark-btn { border: 0; cursor: pointer; min-height: 32px; padding: 4px 14px; font-size: 0.85rem; }
+.mark-btn { border: 0; cursor: pointer; min-height: 44px; min-width: 160px; padding: 6px 18px; font-size: 0.95rem; }
 .mark-btn:active { background: #7a2530; }
 .mark-panel { position: fixed; left: 12px; right: 12px; top: calc(max(12px, env(safe-area-inset-top)) + 64px); z-index: 20; display: flex; flex-direction: column; gap: 8px; padding: 12px; border-radius: 14px; background: var(--card); box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5); max-width: 536px; margin: 0 auto; }
 .mark-labels { display: flex; flex-wrap: wrap; gap: 6px; }

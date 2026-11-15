@@ -484,7 +484,8 @@ function unsavedBanner(): HTMLElement | null {
   if (!u.length) {
     // (after a save: say what was saved, until the next screen change)
     return saveMsg && saveMsg.at > Date.now() - 60_000
-      ? h('div', { class: `rec-banner${saveMsg.ok ? ' done' : ''}`, attrs: { 'data-testid': 'saved-banner', role: 'status' } }, h('span', { attrs: { 'data-testid': 'save-msg' }, text: saveMsg.text }))
+      ? h('div', { class: `rec-banner${saveMsg.ok ? ' done' : ''}`, attrs: { 'data-testid': 'saved-banner', role: 'status' } }, h('span', { attrs: { 'data-testid': 'save-msg' }, text: saveMsg.text }),
+          h('span', { class: 'rec-banner-actions' }, button('Recordings', () => openSettings('recordings'), 'btn ghost', { 'data-testid': 'open-recordings' })))
       : null;
   }
   const t = u[0];
@@ -493,7 +494,8 @@ function unsavedBanner(): HTMLElement | null {
   return h('div', { class: 'rec-banner', attrs: { 'data-testid': 'unsaved-banner', role: 'status' } },
     h('span', { text: u.length > 1 ? `${u.length} recordings not saved yet (newest ${fmtDur(t.samples / t.sampleRate)}).` : `Recording not saved yet (${t.kind === 'soundcheck' ? 'sound check, ' : ''}${fmtDur(t.samples / t.sampleRate)}).` }),
     msg ? h('span', { class: msg.ok ? 'small' : 'small warn-text', attrs: { 'data-testid': 'save-msg' }, text: msg.text }) : null,
-    h('span', { class: 'rec-banner-actions' }, saveTakeButton(t), button('Recordings', () => openSettings('recordings'), 'btn ghost', { 'data-testid': 'open-recordings' })),
+    // (one Save button saves one take: with several unsaved, the list is where to save them)
+    h('span', { class: 'rec-banner-actions' }, saveTakeButton(t, u.length > 1 ? 'Save newest' : 'Save'), button(u.length > 1 ? `All ${u.length} in Recordings` : 'Recordings', () => openSettings('recordings'), 'btn ghost', { 'data-testid': 'open-recordings' })),
   );
 }
 
@@ -563,7 +565,18 @@ function markControl(): HTMLElement {
   return b;
 }
 
+// Browser Back during a session ends it the way the ✕ button does (the take is kept and the
+// summary offers it), instead of leaving the app.
+window.addEventListener('popstate', () => {
+  if (screen === 'session' && session) finishSession(false);
+});
+
 function beginSession(): void {
+  try {
+    history.pushState({ songPitcher: 'session' }, '');
+  } catch {
+    /* (some embedded browsers refuse) */
+  }
   audio.stopListening();
   const song = currentSong();
   const tonic = currentTonic();
@@ -843,9 +856,12 @@ function sessionScreen(): HTMLElement {
       return;
     }
     if (showMeter) {
+      // (in the singing step, the guitar note still ringing from before is not the student:
+      // the meter waits for the voice instead of saying "too high" before anything was sung)
+      const ringingOn = effPhase === 'sing' && m?.hint === 'carryOver';
       let label: string | undefined;
-      if (m?.detectedMidi != null && settings.showNoteName) label = `You: ${noteName(Math.round(m.detectedMidi), keyPc)}`;
-      meter.set(m?.cents ?? null, tol, { label, idle: effPhase === 'sing' ? 'Sing now…' : 'Play now…', fretted: effPhase !== 'sing' });
+      if (!ringingOn && m?.detectedMidi != null && settings.showNoteName) label = `You: ${noteName(Math.round(m.detectedMidi), keyPc)}`;
+      meter.set(ringingOn ? null : (m?.cents ?? null), tol, { label, idle: effPhase === 'sing' ? 'Sing now…' : 'Play now…', fretted: effPhase !== 'sing' });
     }
     let hintText = m?.hint ? HINT_TEXT[effPhase]?.[m.hint] : undefined;
     if (hintText && m?.hint && !showMeter && PITCH_REVEALING_HINTS.has(m.hint)) hintText = undefined;
@@ -857,7 +873,8 @@ function sessionScreen(): HTMLElement {
     button(icon('close', 26), () => endSessionEarly(), 'icon-btn', { 'aria-label': 'End session', 'data-testid': 'end' }),
     h('div', { class: 'topbar-title' },
       h('div', { class: 'note-count', attrs: { 'data-testid': 'note-count' }, text: `Note ${v.index + 1} / ${v.total}` }),
-      h('div', { class: 'small muted lyric', text: phrase ? `“${phrase.lyric}”` : song.title }),
+      // (while recording, the Mark pill takes the lyric's line: the screen keeps its height)
+      recActive && rec?.kind === 'session' ? null : h('div', { class: 'small muted lyric', text: phrase ? `“${phrase.lyric}”` : song.title }),
       recActive && rec?.kind === 'session' ? h('div', { attrs: { 'data-testid': 'rec-badge' } }, markControl()) : null,
     ),
     button(icon('gear', 26), () => openSettings(), 'icon-btn', { 'aria-label': 'Settings', 'data-testid': 'open-settings' }),

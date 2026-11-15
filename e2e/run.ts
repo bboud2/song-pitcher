@@ -476,8 +476,17 @@ async function hitRun(wav: string): Promise<void> {
     r = await hitTest(page, ['[data-testid="replay"]', '[data-testid="key"]', '[data-testid="mark"]', '[data-testid="end"]', '[data-testid="open-settings"]']);
     check(Object.values(r).every((v) => v === 'ok'), `${tag} session: Replay, Key, Mark, End, Settings uncovered (${JSON.stringify(r)})`);
     if (w === 320) await page.screenshot({ path: join(SHOTS, 'layout-se-320x568-recording-session.png') });
-    await page.click('[data-testid="end"]');
-    await page.waitForSelector('[data-testid="summary"]');
+    const geo = await page.evaluate(() => {
+      scrollTo(0, 0);
+      const c = document.querySelector('.controls')!.getBoundingClientRect();
+      const m = document.querySelector('[data-testid="mark"]')!.getBoundingClientRect();
+      return { controlsBottom: Math.round(c.bottom), h: innerHeight, markH: Math.round(m.height), markW: Math.round(m.width) };
+    });
+    check(geo.controlsBottom <= geo.h && geo.markH >= 44, `${tag} recording: Replay/Key/Skip on screen without scrolling, Mark a 44 px target (${JSON.stringify(geo)})`);
+    // browser Back mid-session ends the session in the app (summary), it does not leave it
+    await page.goBack();
+    const backOk = await page.waitForSelector('[data-testid="summary"]', { timeout: 5000 }).then(() => true, () => false);
+    check(backOk, `${tag} browser Back during a session shows the summary`);
     await page.waitForSelector('[data-testid="unsaved-banner"]', { timeout: 5000 }).catch(() => null);
     r = await hitTest(page, ['[data-testid="unsaved-banner"] [data-testid="save-recording"]', '[data-testid="again"]']);
     check(Object.values(r).every((v) => v === 'ok'), `${tag} summary: Save and Practice again uncovered (${JSON.stringify(r)})`);

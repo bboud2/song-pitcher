@@ -53,9 +53,9 @@ describe('tuner: out-of-tune strings', () => {
     expect(w.message()).toBeNull();
   });
 
-  it('a string 120 c flat is named as far out of tune (round 7: no warning at all past 50 c)', () => {
-    const { w } = run([{ at: 0.5, x: pluck(45, -120, 1) }, { at: 4, x: pluck(45, -120, 3) }], 7.5);
-    expect(w.message()).toMatch(/may be the A2 string, far out of tune \(about 1[12]\d¢ flat\)/);
+  it('a string 160 c flat is named as far out of tune (round 7: no warning at all past 50 c)', () => {
+    const { w } = run([{ at: 0.5, x: pluck(45, -160, 1) }, { at: 4, x: pluck(45, -160, 3) }], 7.5);
+    expect(w.message()).toMatch(/may be the A2 string, far out of tune \(about 1[56]\d¢ flat\)/);
   });
 
   it('a stiff string, hard pick, 15 c sharp: no warning (round 7 warned past 25 c on the attack)', () => {

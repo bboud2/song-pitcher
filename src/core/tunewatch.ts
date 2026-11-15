@@ -51,7 +51,7 @@ export class TuneWatch {
    * the recent attack events.
    */
   push(t: number, midi: number | null, db: number, attacks: TuneAttack[] = []): void {
-    const fresh = attacks.filter((a) => a.band === 'full' && a.riseDb >= 10 && a.t > this.lastAttack + 0.2 && t - a.t < 0.5);
+    const fresh = attacks.filter((a) => ((a.band === 'full' && a.riseDb >= 8) || (a.band === 'hf' && a.riseDb >= 12)) && a.t > this.lastAttack + 0.2 && t - a.t < 0.5);
     if (fresh.length) {
       this.finish();
       this.lastAttack = Math.max(...fresh.map((a) => a.t));
@@ -69,6 +69,16 @@ export class TuneWatch {
     for (const o of OPEN_STRINGS) {
       const c = (midi - o) * 100;
       if (Math.abs(c) <= MAX_CENTS && (!best || Math.abs(c) < Math.abs(best.cents))) best = { open: o, cents: c };
+    }
+    // (a string whose fundamental is weak in this room or phone reads an octave high: fold it
+    // back when the reading is near no open string itself)
+    if (!best) {
+      for (const o of OPEN_STRINGS) {
+        for (const k of [12, -12]) {
+          const c = (midi - k - o) * 100;
+          if (Math.abs(c) <= MAX_CENTS && (!best || Math.abs(c) < Math.abs(best.cents))) best = { open: o, cents: c };
+        }
+      }
     }
     if (best) p.readings.push({ ...best, db });
   }
@@ -89,10 +99,11 @@ export class TuneWatch {
     const head = median(rs.slice(0, k).map((r) => r.db));
     const tail = median(rs.slice(-k).map((r) => r.db));
     if (head - tail < 2) return;
-    // a fretted note sits on a semitone; a string far out of tune almost never does
+    // a fretted note sits on a semitone (give or take a sharp fret's 30 c); a string that far out
+    // is not told apart from it, so it is not reported (it reads as the neighbouring note)
     const cents = median(cs);
     const offSemitone = Math.abs(cents - 100 * Math.round(cents / 100));
-    if (Math.abs(cents) >= FAR_CENTS && offSemitone < 12) return;
+    if (Math.abs(cents) >= FAR_CENTS && offSemitone < 30) return;
     const res = { open, cents, t: p.t0 };
     this.measured.push(res);
     const list = [...(this.byString.get(open) ?? []), res].slice(-2);
