@@ -133,6 +133,36 @@ export function analyzeBuffer(
 }
 
 /** Which analysis path a session phase listens through. */
+/**
+ * Warm a fresh analyser on 16-bit samples that start at capture index `c0` (a whole number of hops
+ * after the start of capture): push them hop by hop and analyse both paths at every hop once a
+ * full frame is in. The app does this when a session starts and the replay does the same, so both
+ * start from the same state. Frame time = t0 + capture index / sample rate. It can be done in
+ * pieces (each a whole number of hops; pass the samples pushed so far): the result is the same.
+ */
+export function warmAnalyzer(sa: StreamAnalyzer, q: Int16Array, c0: number, t0: number, hop: number, pushedBefore = 0): number {
+  const sr = sa.sampleRate;
+  const buf = new Float32Array(hop);
+  let pushed = pushedBefore;
+  for (let off = 0; off + hop <= q.length; off += hop) {
+    for (let i = 0; i < hop; i++) {
+      const v = q[off + i];
+      buf[i] = v < 0 ? v / 0x8000 : v / 0x7fff;
+    }
+    sa.push(buf);
+    pushed += hop;
+    if (pushed >= FRAME_SIZE) {
+      const t = t0 + (c0 + off + hop) / sr;
+      sa.frame('voice', t);
+      sa.frame('guitar', t);
+    }
+  }
+  return pushed;
+}
+
+/** A 16-bit sample as the analysis sees it. */
+export const fromInt16 = (v: number): number => (v < 0 ? v / 0x8000 : v / 0x7fff);
+
 export function pathForPhase(phase: string): AnalysisPath {
   return phase === 'sing' ? 'voice' : 'guitar';
 }

@@ -1,0 +1,161 @@
+// Mic-check tuner: which open string is out of tune, judged only on plucked strings.
+//
+// A warning that a string is out of tune must not come from a sung note, a fretted note that
+// happens to sit near an open string, or the first sharp instant of a hard pluck (a stiff string
+// reads 10-18 c sharp at the attack). So: each pluck (a broadband attack followed by a decaying
+// note) is measured on its settled part only; a string is reported only when two separate plucks
+// agree that it is at least 30 c off; and the report goes away as soon as an in-tune pluck of that
+// string is heard. A string 65-250 c off (nearer another note than its own) is named as "may be
+// the X string, far out of tune".
+import { OPEN_STRINGS, noteName } from './music.ts';
+
+export interface TuneAttack { t: number; riseDb: number; band: string }
+
+interface Pluck {
+  t0: number;
+  /** (open string, cents from it, level dB) per settled frame */
+  readings: { open: number; cents: number; db: number }[];
+}
+
+export interface PluckResult { open: number; cents: number; t: number }
+
+const SETTLE_SEC = 0.25;
+const PLUCK_SEC = 2.5;
+const WARN_CENTS = 30;
+const IN_TUNE_CENTS = 20;
+const AGREE_CENTS = 20;
+const FAR_CENTS = 65;
+const MAX_CENTS = 250;
+
+const median = (xs: number[]) => {
+  const s = [...xs].sort((a, b) => a - b);
+  return s[s.length >> 1];
+};
+
+export class TuneWatch {
+  private pluck: Pluck | null = null;
+  private lastAttack = -Infinity;
+  /** per open string: its last two measured plucks */
+  private byString = new Map<number, PluckResult[]>();
+  private warn: { open: number; cents: number } | null = null;
+  /** every pluck measured (for tests) */
+  readonly measured: PluckResult[] = [];
+
+  /** A plucked string sounded within the last few seconds (its attack was seen). */
+  plucking(t: number): boolean {
+    return t - this.lastAttack < 4;
+  }
+
+  /**
+   * One analysed frame: `midi` is the (fractional) stable pitch or null, `db` the level, `attacks`
+   * the recent attack events.
+   */
+  push(t: number, midi: number | null, db: number, attacks: TuneAttack[] = []): void {
+    const fresh = attacks.filter((a) => a.band === 'full' && a.riseDb >= 10 && a.t > this.lastAttack + 0.2 && t - a.t < 0.5);
+    if (fresh.length) {
+      this.finish();
+      this.lastAttack = Math.max(...fresh.map((a) => a.t));
+      this.pluck = { t0: this.lastAttack, readings: [] };
+    }
+    const p = this.pluck;
+    if (!p) return;
+    const age = t - p.t0;
+    if (age > PLUCK_SEC) {
+      this.finish();
+      return;
+    }
+    if (age < SETTLE_SEC || midi === null) return;
+    let best: { open: number; cents: number } | null = null;
+    for (const o of OPEN_STRINGS) {
+      const c = (midi - o) * 100;
+      if (Math.abs(c) <= MAX_CENTS && (!best || Math.abs(c) < Math.abs(best.cents))) best = { open: o, cents: c };
+    }
+    if (best) p.readings.push({ ...best, db });
+  }
+
+  /** Measure the pluck in progress (if it holds a settled, decaying note) and update the warning. */
+  private finish(): void {
+    const p = this.pluck;
+    this.pluck = null;
+    if (!p || p.readings.length < 6) return;
+    // one string throughout, a steady pitch, and a level that falls (a string, not a held voice)
+    const open = median(p.readings.map((r) => r.open));
+    const rs = p.readings.filter((r) => r.open === open);
+    if (rs.length < 0.8 * p.readings.length) return;
+    const cs = rs.map((r) => r.cents).sort((a, b) => a - b);
+    const iqr = cs[Math.floor(cs.length * 0.75)] - cs[Math.floor(cs.length * 0.25)];
+    if (iqr > 15) return;
+    const k = Math.max(2, Math.floor(rs.length / 3));
+    const head = median(rs.slice(0, k).map((r) => r.db));
+    const tail = median(rs.slice(-k).map((r) => r.db));
+    if (head - tail < 2) return;
+    // a fretted note sits on a semitone; a string far out of tune almost never does
+    const cents = median(cs);
+    const offSemitone = Math.abs(cents - 100 * Math.round(cents / 100));
+    if (Math.abs(cents) >= FAR_CENTS && offSemitone < 12) return;
+    const res = { open, cents, t: p.t0 };
+    this.measured.push(res);
+    const list = [...(this.byString.get(open) ?? []), res].slice(-2);
+    this.byString.set(open, list);
+    if (Math.abs(cents) < IN_TUNE_CENTS) {
+      // an in-tune pluck of that string: forget what was said about it
+      this.byString.set(open, [res]);
+      if (this.warn?.open === open) this.warn = null;
+      return;
+    }
+    if (list.length === 2) {
+      const [a, b] = list;
+      if (Math.abs(a.cents) >= WARN_CENTS && Math.abs(b.cents) >= WARN_CENTS && Math.sign(a.cents) === Math.sign(b.cents) && Math.abs(a.cents - b.cents) <= AGREE_CENTS) {
+        this.warn = { open, cents: (a.cents + b.cents) / 2 };
+      }
+    }
+  }
+
+  /** The warning to show, or null. */
+  message(): string | null {
+    const w = this.warn;
+    if (!w) return null;
+    const name = noteName(w.open);
+    const dir = w.cents > 0 ? 'sharp' : 'flat';
+    const amount = Math.round(Math.abs(w.cents));
+    if (Math.abs(w.cents) >= FAR_CENTS) return `This may be the ${name} string, far out of tune (about ${amount}¢ ${dir}): tune it before you begin.`;
+    return `The ${name} string sounds about ${amount}¢ ${dir}: tune it before you begin, or the wrong fret may sound right.`;
+  }
+
+  /** the open string currently warned about */
+  warned(): number | null {
+    return this.warn?.open ?? null;
+  }
+}
+
+/**
+ * Note display without single-frame octave slips: a reading an octave (or octave and a fifth)
+ * away from the note on show is shown only once the next frame confirms it.
+ */
+export class OctaveSlipFilter {
+  private shown: number | null = null;
+  private pending: number | null = null;
+
+  push(m: number | null): number | null {
+    if (m === null) {
+      this.pending = null;
+      return null;
+    }
+    if (this.shown !== null) {
+      const d = m - this.shown;
+      const slip = [12, 19, 24, -12, -19, -24].some((k) => Math.abs(d - k) < 0.6);
+      if (slip) {
+        if (this.pending !== null && Math.abs(m - this.pending) < 0.6) {
+          this.pending = null;
+          this.shown = m;
+          return m;
+        }
+        this.pending = m;
+        return this.shown;
+      }
+    }
+    this.pending = null;
+    this.shown = m;
+    return m;
+  }
+}

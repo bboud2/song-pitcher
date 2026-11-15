@@ -10,7 +10,8 @@
     "gauntlet": "node scripts/gauntlet.ts",
     "test": "vitest run",
     "e2e": "node e2e/run.ts",
-    "gauntlet:quick": "node scripts/gauntlet.ts --quick"
+    "gauntlet:quick": "node scripts/gauntlet.ts --quick",
+    "e2e:long": "vite build && node e2e/long-recording.ts"
   },
   "repository": {
     "type": "git",

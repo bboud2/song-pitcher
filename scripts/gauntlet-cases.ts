@@ -844,6 +844,63 @@ for (const set of ['octave', 'interval', 'sharp', 'voice', 'nsgate']) {
   });
 }
 
+// ========================================================================== seventh review (modal rooms, sessions and probes)
+// Its nine honest 101-note sessions (A-I: rooms from dry to live and bare, pick/finger/nylon,
+// plucks as the answer stops or while still singing, strings left ringing) and its probes. A
+// session must have no note stuck, no accidental advance, ≤ 5 % re-plucks and extra breaths.
+const C7_QUICK = new Set(['C', 'I']);
+for (const name of ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']) {
+  job(`critic7 session ${name}`, 16, C7_QUICK.has(name), async (quick) => {
+    const { honest, line } = await import('./critic7/sess7.ts');
+    const log = console.log;
+    console.log = () => {};
+    let r: Awaited<ReturnType<typeof honest>>;
+    try {
+      r = await honest('here', name, 1, quick ? 20 : 0);
+    } finally {
+      console.log = log;
+    }
+    const lim = (n: number) => Math.max(1, Math.ceil(0.05 * n));
+    const problems: string[] = [];
+    const stuck = r.playStuck + r.singStuck + r.revStuck;
+    if (stuck) problems.push(`stuck on ${stuck} (play ${r.playStuck}, sing ${r.singStuck}, review ${r.revStuck})`);
+    if (r.bad.length) problems.push(`${r.bad.length} accidental advances (${r.bad.slice(0, 2).map((a) => `#${a.index + 1} ${a.phase}: ${a.why}`).join('; ')})`);
+    const plays = r.playSteps - r.noPluck;
+    if (plays - r.firstPluck - r.playStuck > lim(plays)) problems.push(`${plays - r.firstPluck - r.playStuck}/${plays} notes needed another pluck`);
+    if (r.singSteps - r.singFirst - r.singStuck > lim(r.singSteps)) problems.push(`${r.singSteps - r.singFirst - r.singStuck} notes needed another breath`);
+    const summary = line(r).replace(/\s+/g, ' ');
+    return [{ name: `critic7 session ${name}`, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: problems, ok: problems.length === 0, summary: problems.length ? `${summary} — ${problems.join('; ')}` : summary }];
+  });
+}
+// Probes: a pluck as the answer stops (and 150 ms later) taken first; the answer's own tail, a
+// string left ringing, the octave below and the fret below a sharp string refused; staccato and
+// pick plucks taken, within 0.4 s (90th percentile) in a living room; every sung "oh" taken.
+{
+  type Row = { name: string; ok: boolean; text: string };
+  const rows: [string, () => Promise<Row>][] = [
+    ['gap 0 live', async () => { const { gapProbe } = await import('./critic7/probes7.ts'); const r = gapProbe('live', 0, 0); return { name: 'pluck as the answer stops (live)', ok: r.first >= r.n - 1, text: `${r.first}/${r.n} first` }; }],
+    ['gap -6 0 live', async () => { const { gapProbe } = await import('./critic7/probes7.ts'); const r = gapProbe('live', -6, 0); return { name: 'pluck 6 dB under the answer as it stops (live)', ok: r.first >= r.n - 1, text: `${r.first}/${r.n} first` }; }],
+    ['gap 150 live', async () => { const { gapProbe } = await import('./critic7/probes7.ts'); const r = gapProbe('live', 0, 150); return { name: 'pluck 150 ms after the answer (live)', ok: r.first >= r.n - 1, text: `${r.first}/${r.n} first` }; }],
+    ['gap -150 live', async () => { const { gapProbe } = await import('./critic7/probes7.ts'); const r = gapProbe('live', 0, -150); return { name: 'pluck while still singing (live)', ok: r.first >= r.n - 1, text: `${r.first}/${r.n} first` }; }],
+    ['own live', async () => { const { ownProbe, OWN } = await import('./critic7/probes7.ts'); let adv = 0, n = 0; for (const k of Object.keys(OWN)) { const r = ownProbe('live', k); adv += r.adv; n += r.n; } return { name: 'the answer held on into the guitar step (live)', ok: adv === 0, text: `${adv}/${n} advanced` }; }],
+    ['own bare', async () => { const { ownProbe, OWN } = await import('./critic7/probes7.ts'); let adv = 0, n = 0; for (const k of Object.keys(OWN)) { const r = ownProbe('bare', k); adv += r.adv; n += r.n; } return { name: 'the answer held on into the guitar step (bare)', ok: adv === 0, text: `${adv}/${n} advanced` }; }],
+    ['carry dry', async () => { const { carryProbe } = await import('./critic7/probes7.ts'); const r = carryProbe('dry'); return { name: 'string left ringing into the next singing step', ok: r.adv === 0, text: `${r.adv}/${r.n} advanced` }; }],
+    ['oct- dry', async () => { const { wrongProbe } = await import('./critic7/probes7.ts'); const r = wrongProbe('dry', 'oct-'); return { name: 'octave below (dry)', ok: r.acc === 0, text: `${r.acc}/${r.n} accepted` }; }],
+    ['fret below +45c live', async () => { const { wrongProbe } = await import('./critic7/probes7.ts'); const r = wrongProbe('live', 'fretBelow+45c'); return { name: 'fret below on a string 45 c sharp (live)', ok: r.acc === 0, text: `${r.acc}/${r.n} accepted` }; }],
+    ['stacc180 dry', async () => { const { stringProbe } = await import('./critic7/probes7.ts'); const r = stringProbe('dry', 'stacc180'); return { name: 'staccato 0.18 s (dry)', ok: r.first >= r.n - 1, text: `${r.first}/${r.n} first` }; }],
+    ['latency living', async () => { const { stringProbe } = await import('./critic7/probes7.ts'); const r = stringProbe('living', 'base'); return { name: 'pick plucks, living room', ok: r.first === r.n && r.p90 < 400, text: `${r.first}/${r.n} first, median ${Math.round(r.med)} ms, p90 ${Math.round(r.p90)} ms` }; }],
+    ['latency live', async () => { const { stringProbe } = await import('./critic7/probes7.ts'); const r = stringProbe('live', 'base'); return { name: 'pick plucks, live room', ok: r.first === r.n && r.p90 < 400, text: `${r.first}/${r.n} first, median ${Math.round(r.med)} ms, p90 ${Math.round(r.p90)} ms` }; }],
+    ['latency live finger', async () => { const { stringProbe } = await import('./critic7/probes7.ts'); const r = stringProbe('live', 'finger'); return { name: 'finger plucks, live room', ok: r.first === r.n && r.p90 < 400, text: `${r.first}/${r.n} first, median ${Math.round(r.med)} ms, p90 ${Math.round(r.p90)} ms` }; }],
+    ['sing oh live', async () => { const { singProbe } = await import('./critic7/probes7.ts'); const r = singProbe('live', 'o', 0.8); return { name: 'sung "oh" (live)', ok: r.stuck === 0 && r.first === r.n, text: `${r.first}/${r.n} first, ${r.stuck} stuck` }; }],
+  ];
+  for (const [key, run] of rows) {
+    job(`critic7 probe ${key}`, 6, false, async () => {
+      const r = await run();
+      return [{ name: `critic7 probe ${key}`, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: r.ok ? [] : [`${r.name}: ${r.text}`], ok: r.ok, summary: `${r.name}: ${r.text}` }];
+    });
+  }
+}
+
 // ========================================================================== real recordings
 // Practice recordings made on phones (Settings → "Record this session for testing"), dropped into
 // recordings/ as NAME.wav + NAME.json: the engine must reproduce every accept the app logged.
@@ -851,15 +908,21 @@ for (const set of ['octave', 'interval', 'sharp', 'voice', 'nsgate']) {
   const dir = new URL('../recordings/', import.meta.url);
   const wavs = existsSync(dir) ? readdirSync(dir).filter((f) => f.toLowerCase().endsWith('.wav')) : [];
   if (!wavs.length) {
-    job('real recordings', 0.1, true, () => [{ name: 'real recordings', kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: [], ok: true, summary: 'no real recordings yet (drop NAME.wav + NAME.json into recordings/)' }]);
+    job('real recordings', 0.1, true, () => [{ name: 'real recordings', kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: [], ok: true, summary: 'no real recordings yet (drop the app\'s NAME.wav into recordings/)' }]);
   }
   for (const w of wavs) {
     job(`real recording ${w}`, 2, true, () => {
+      // (the log is inside the WAV; older recordings come with NAME.json beside it)
       const json = new URL(w.replace(/\.wav$/i, '.json'), dir);
-      if (!existsSync(json)) return [{ name: `real recording ${w}`, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: ['no matching .json event log'], ok: false, summary: 'no matching .json event log' }];
-      const r = replayRecording(new Uint8Array(readFileSync(new URL(w, dir))), readFileSync(json, 'utf8'));
+      let r: ReturnType<typeof replayRecording>;
+      try {
+        r = replayRecording(new Uint8Array(readFileSync(new URL(w, dir))), existsSync(json) ? readFileSync(json, 'utf8') : null);
+      } catch (e) {
+        const msg = `replay refused: ${(e as Error).message}`;
+        return [{ name: `real recording ${w}`, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: [msg], ok: false, summary: msg }];
+      }
       const fails = [...r.missing.map((a) => `app accepted note ${a.index + 1} ${a.phase}, replay did not`), ...r.extra.map((a) => `replay accepted note ${a.index + 1} ${a.phase}, the app did not`)];
-      return [{ name: `real recording ${w}`, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails, ok: fails.length === 0, summary: `${r.kind}: app accepted ${r.logged.length}, replay ${r.replayed.length}${fails.length ? ' — ' + fails.slice(0, 3).join('; ') : ''}` }];
+      return [{ name: `real recording ${w}`, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails, ok: fails.length === 0, summary: `${r.kind}: steps agreeing ${r.stepsAgree}/${r.steps.length}, app accepted ${r.logged.length}, replay ${r.replayed.length}${fails.length ? ' — ' + fails.slice(0, 3).join('; ') : ''}` }];
     });
   }
 }

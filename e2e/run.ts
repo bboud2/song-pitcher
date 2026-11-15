@@ -3,7 +3,7 @@
 // (git-ignored); pass --refresh-screenshots to write them to the tracked screenshots/ folder instead.
 //
 //   npm run e2e          (builds, serves dist/ with vite preview, runs both devices)
-//   flags: --device=iphone13|pixel7  --no-build  --skip-negatives  --refresh-screenshots
+//   flags: --device=iphone13|pixel7  --no-build  --skip-negatives  --refresh-screenshots  --recorder-only
 //
 // Uses the globally installed `playwright` package and its bundled Chromium.
 import { execSync, spawn, type ChildProcess } from 'node:child_process';
@@ -11,7 +11,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
 import { buildWavs } from './wavs.ts';
-import { decodeWav } from '../src/core/wav.ts';
+import { LOG_CHUNK, decodeWav, readWavChunk } from '../src/core/wav.ts';
 import { replayRecording } from '../scripts/replay.ts';
 
 const require = createRequire(import.meta.url);
@@ -255,12 +255,66 @@ function downloads(page: Page, n: number): Promise<any[]> {
   });
 }
 
-/** Practice recorder: a short recorded session and a sound check, saved and replayed offline. */
+/** Is each element's middle (and both sides) really on top at its position (nothing covers it)? */
+async function hitTest(page: Page, sels: string[]): Promise<Record<string, string>> {
+  return page.evaluate((ss: string[]) => {
+    const out: Record<string, string> = {};
+    for (const s of ss) {
+      const el = document.querySelector(s) as HTMLElement | null;
+      if (!el) {
+        out[s] = 'missing';
+        continue;
+      }
+      if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') {
+        out[s] = 'hidden';
+        continue;
+      }
+      el.scrollIntoView({ block: 'nearest' });
+      const r = el.getBoundingClientRect();
+      let res = 'ok';
+      for (const fx of [0.15, 0.5, 0.85]) {
+        const x = r.left + r.width * fx;
+        const y = r.top + r.height / 2;
+        if (y < 0 || y > innerHeight || x < 0 || x > innerWidth) {
+          res = `off screen (y ${Math.round(y)})`;
+          break;
+        }
+        const e = document.elementFromPoint(x, y);
+        if (!e || !(e === el || el.contains(e))) {
+          res = `covered by ${(e as HTMLElement | null)?.className || e?.tagName}`;
+          break;
+        }
+      }
+      out[s] = res;
+    }
+    return out;
+  }, sels);
+}
+
+/** Read the log the app writes inside its WAV file. */
+function embeddedLog(bytes: Uint8Array): { meta: Record<string, unknown>; events: { type: string; c?: number }[] } | null {
+  const b = readWavChunk(bytes, LOG_CHUNK);
+  if (!b) return null;
+  try {
+    return JSON.parse(new TextDecoder().decode(b));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Practice recorder: a sound check and a short recorded session, kept in this browser's storage
+ * (through a reload, and a reload in the middle of a take), listed in Settings → Recordings with
+ * Save / Delete, saved as one WAV with the log inside, and replayed offline step by step.
+ */
 async function recorderRun(wav: string): Promise<void> {
   const browser = await launch(wav);
   const ctx = await browser.newContext({ ...pw.devices['Pixel 7'], acceptDownloads: true });
   await ctx.grantPermissions(['microphone'], { origin: URL });
   const page = await ctx.newPage();
+  page.on('dialog', (d: { accept(): Promise<void> }) => void d.accept());
+  const errors: string[] = [];
+  page.on('pageerror', (e: Error) => errors.push(e.message));
   const tag = '[recorder]';
   await page.goto(URL);
   await page.evaluate(() => {
@@ -270,61 +324,170 @@ async function recorderRun(wav: string): Promise<void> {
   await page.reload();
   await page.click('[data-testid="start"]');
   await page.waitForSelector('[data-testid="begin"]:not([disabled])', { timeout: 12000 });
-  // sound check recording (a few seconds, stopped early)
+  // sound check (a few seconds, stopped early): big step number, a step naming an open string
   await page.click('[data-testid="soundcheck-start"]');
-  await page.waitForTimeout(3000);
-  check(((await page.textContent('[data-testid="soundcheck-step"]')) ?? '').includes('1/'), `${tag} sound check shows its first instruction`);
-  await page.click('[data-testid="soundcheck"] button');
-  const scSave = await page.waitForSelector('[data-testid="soundcheck"] [data-testid="save-recording"]', { timeout: 5000 }).catch(() => null);
-  check(!!scSave, `${tag} sound check offers "Save sound check" when stopped`);
-  if (scSave) {
-    const dl = downloads(page, 2);
-    await scSave.click();
-    const files = await dl;
-    const names = files.map((d: { suggestedFilename(): string }) => d.suggestedFilename());
-    check(names.some((n: string) => n.endsWith('.wav')) && names.some((n: string) => n.endsWith('.json')), `${tag} sound check saved as WAV + JSON (${names.join(', ')})`);
-  }
-  // a short recorded session: two notes
+  await page.waitForTimeout(800);
+  check(((await page.textContent('[data-testid="soundcheck-num"]')) ?? '').startsWith('1 /'), `${tag} sound check shows a large step number`);
+  check((await page.isHidden('[data-testid="begin"]')), `${tag} Begin is hidden while the sound check runs (nothing covers it)`);
+  await page.screenshot({ path: join(SHOTS, 'recorder-soundcheck.png') });
+  await page.waitForTimeout(8000);
+  check(/open .*string/i.test((await page.textContent('[data-testid="soundcheck-step"]')) ?? ''), `${tag} the second step names the open strings ("${(await page.textContent('[data-testid="soundcheck-step"]'))?.slice(0, 50)}…")`);
+  await page.click('[data-testid="soundcheck-stop"]');
+  const scBanner = await page.waitForSelector('[data-testid="unsaved-banner"]', { timeout: 5000 }).then(() => true, () => false);
+  check(scBanner, `${tag} an unsaved sound check is announced (banner with Save)`);
+
+  // a short recorded session: two notes, a mark, settings opened (the record toggle is locked)
   await page.click('[data-testid="begin"]');
   await page.waitForSelector('[data-testid="session"]');
-  check((await page.$('[data-testid="rec-badge"]')) !== null, `${tag} recording indicator shown during the session`);
+  check(await page.waitForSelector('[data-testid="rec-badge"]', { timeout: 5000 }).then(() => true, () => false), `${tag} recording indicator shown during the session`);
+  await page.click('[data-testid="mark"]');
+  check(await page.waitForSelector('[data-testid="mark-done"]', { timeout: 2000 }).then(() => true, () => false), `${tag} one tap on Mark logs a marker`);
+  await page.click('[data-testid="mark-label"]');
+  await page.click('[data-testid="open-settings"]');
+  const locked = await page.$eval('[data-setting="recordSession"]', (e: HTMLInputElement) => e.disabled && e.checked);
+  check(locked, `${tag} "Record sessions" cannot be switched during a session (shown on, locked, with the reason)`);
+  check((await page.$('[data-setting="strictCheck"]')) === null, `${tag} no strict-check switch in Settings`);
+  await page.click('[data-testid="close-settings"]');
   const twoNotes = await waitSession(page, 'index >= 2', 60000);
   check(twoNotes, `${tag} two notes done while recording`);
   await page.click('[data-testid="end"]');
   await page.waitForSelector('[data-testid="summary"]');
-  const save = await page.$('[data-testid="save-recording"]');
-  check(!!save, `${tag} summary offers "Save recording"`);
-  if (save) {
-    const dl = downloads(page, 2);
-    await save.click();
-    const files = await dl;
-    const paths: Record<string, string> = {};
-    for (const d of files) {
-      const p = join(OUT, d.suggestedFilename());
-      await d.saveAs(p);
-      paths[p.endsWith('.wav') ? 'wav' : 'json'] = p;
-    }
-    check(!!paths.wav && !!paths.json, `${tag} session saved as WAV + JSON`);
-    if (paths.wav && paths.json) {
-      const bytes = new Uint8Array(readFileSync(paths.wav));
-      const w = decodeWav(bytes);
-      let rec: { meta: Record<string, unknown>; events: { type: string }[] } | null = null;
+  await page.waitForSelector('[data-testid="unsaved-banner"]', { timeout: 5000 }).catch(() => null);
+  const top = await page.$eval('[data-testid="unsaved-banner"]', (e: HTMLElement) => e.getBoundingClientRect().top).catch(() => 9999);
+  check(top < 200, `${tag} summary shows Save at the top (banner at y ${Math.round(top)})`);
+  await page.screenshot({ path: join(SHOTS, 'recorder-summary.png') });
+  // a cancelled share sheet is not a save
+  await page.evaluate(() => {
+    const n = navigator as unknown as { canShare: unknown; share: unknown };
+    n.canShare = () => true;
+    n.share = async () => {
+      throw new DOMException('cancelled', 'AbortError');
+    };
+  });
+  await page.click('[data-testid="unsaved-banner"] [data-testid="save-recording"]');
+  await page.waitForTimeout(800);
+  const cancelMsg = (await page.textContent('[data-testid="save-msg"]').catch(() => '')) ?? '';
+  check(/not saved/i.test(cancelMsg) && (await page.$('[data-testid="unsaved-banner"]')) !== null, `${tag} cancelled share sheet: "not saved", still offered ("${cancelMsg.slice(0, 60)}")`);
+  await page.evaluate(() => {
+    const n = navigator as unknown as { canShare: unknown; share: unknown };
+    n.canShare = undefined;
+    n.share = undefined;
+  });
+  const dl = downloads(page, 1);
+  await page.click('[data-testid="unsaved-banner"] [data-testid="save-recording"]');
+  const files = await dl;
+  const name = files[0]?.suggestedFilename() ?? '';
+  const path = join(OUT, name || 'none.wav');
+  if (files[0]) await files[0].saveAs(path);
+  check(/^song-pitcher-session-\d{8}-\d{6}(-\d+)?\.wav$/.test(name), `${tag} saved as ONE file, named to the second (${name})`);
+  await page.waitForTimeout(500);
+  const savedMsg = (await page.textContent('[data-testid="save-msg"]').catch(() => '')) ?? '';
+  check(savedMsg.includes(name) && name.length > 0, `${tag} confirmation names the file ("${savedMsg.slice(0, 80)}")`);
+  if (files[0]) {
+    const bytes = new Uint8Array(readFileSync(path));
+    const w = decodeWav(bytes);
+    const rec = embeddedLog(bytes);
+    check(!!rec, `${tag} the log is inside the WAV`);
+    if (rec) {
+      check(w.samples.length === Number(rec.meta.samples) && w.sampleRate === rec.meta.sampleRate, `${tag} WAV length matches the log (${w.samples.length} samples, ${w.sampleRate} Hz)`);
+      check(rec.meta.captureMode === 'worklet' && typeof rec.meta.trackSettings === 'object' && typeof rec.meta.clock === 'object', `${tag} log has capture mode, mic settings and the sample clock`);
+      check(['start', 'step', 'listenDone', 'accept', 'mark', 'markLabel', 'end'].every((k) => rec.events.some((e) => e.type === k)) && rec.events.every((e) => typeof e.c === 'number'), `${tag} every event carries its sample index (start, step, accept, mark, end, …)`);
+      const r = replayRecording(bytes);
+      check(r.logged.length >= 3 && r.missing.length === 0 && r.extra.length === 0 && r.resyncs === 0 && r.stepsAgree === r.steps.length, `${tag} offline replay agrees step by step (${r.stepsAgree}/${r.steps.length} steps; app ${r.logged.length}, replay ${r.replayed.length})`);
+      check(r.marks.length === 1, `${tag} replay lists the mark (${r.marks.join('; ')})`);
+      if (r.missing.length || r.extra.length) for (const l of r.lines) console.log('   ', l);
+      // a truncated file or a foreign log is refused
+      const cut = bytes.slice(0, Math.floor(bytes.length / 2));
+      let refused = '';
       try {
-        rec = JSON.parse(readFileSync(paths.json, 'utf8'));
-      } catch {
-        rec = null;
+        replayRecording(cut, JSON.stringify(rec));
+      } catch (e) {
+        refused = (e as Error).message;
       }
-      check(!!rec, `${tag} event log is valid JSON`);
-      if (rec) {
-        const sec = Number(rec.meta.seconds);
-        check(Math.abs(w.samples.length / w.sampleRate - sec) < 0.01 && w.sampleRate === rec.meta.sampleRate, `${tag} WAV length matches the log (${(w.samples.length / w.sampleRate).toFixed(2)} s vs ${sec.toFixed(2)} s, ${w.sampleRate} Hz)`);
-        check(rec.meta.captureMode === 'worklet' && typeof rec.meta.trackSettings === 'object' && typeof rec.meta.userAgent === 'string', `${tag} log has capture mode, applied mic settings and user agent (${rec.meta.captureMode}, ${JSON.stringify(rec.meta.trackSettings).slice(0, 80)})`);
-        check(['start', 'step', 'listenDone', 'accept', 'end'].every((k) => rec!.events.some((e) => e.type === k)), `${tag} log has start, step, listenDone, accept and end events`);
-        const r = replayRecording(bytes, readFileSync(paths.json, 'utf8'));
-        check(r.logged.length >= 3 && r.missing.length === 0 && r.extra.length === 0, `${tag} offline replay reproduces the app's accepts (app ${r.logged.length}, replay ${r.replayed.length}, not reproduced ${r.missing.length}, extra ${r.extra.length})`);
-        if (r.missing.length || r.extra.length) for (const l of r.lines) console.log('   ', l);
-      }
+      check(/truncated/.test(refused), `${tag} replay refuses a truncated WAV ("${refused.slice(0, 70)}")`);
     }
+  }
+
+  // stored in this browser: listed after a reload, with Save / Delete
+  await page.reload();
+  await page.waitForSelector('[data-testid="home"]');
+  check((await page.$('[data-testid="unsaved-banner"]')) !== null, `${tag} after a reload the unsaved sound check is still announced`);
+  await page.click('[data-testid="open-settings"]');
+  await page.waitForSelector('[data-testid="recordings"]');
+  const takes = await page.$$eval('[data-testid="take"]', (els: HTMLElement[]) => els.map((e) => `${e.dataset.take}:${e.dataset.saved}`));
+  check(takes.length === 2 && takes.some((t: string) => t.includes('session') && t.endsWith('true')) && takes.some((t: string) => t.includes('soundcheck') && t.endsWith('false')), `${tag} Recordings lists both takes with their saved state (${takes.join(', ')})`);
+  const info = (await page.textContent('[data-testid="recordings"]')) ?? '';
+  check(/stored in this browser/.test(info) && /capture: worklet/.test(info), `${tag} Recordings says where they are kept and the capture mode`);
+  await page.screenshot({ path: join(SHOTS, 'recorder-recordings.png'), fullPage: true });
+  await page.click('[data-take*="soundcheck"] [data-testid="delete-take"]');
+  await page.waitForTimeout(300);
+  check((await page.$$('[data-testid="take"]')).length === 1, `${tag} Delete removes a take`);
+  await page.click('[data-testid="close-settings"]');
+
+  // a reload in the middle of a recorded session keeps what was recorded
+  await page.click('[data-testid="start"]');
+  await page.waitForSelector('[data-testid="begin"]:not([disabled])', { timeout: 12000 });
+  await page.click('[data-testid="begin"]');
+  await page.waitForSelector('[data-testid="session"]');
+  await page.waitForTimeout(4000);
+  await page.reload();
+  await page.waitForSelector('[data-testid="home"]');
+  await page.click('[data-testid="open-settings"]');
+  await page.waitForSelector('[data-testid="recordings"]');
+  const after = await page.$$eval('[data-testid="take"]', (els: HTMLElement[]) => els.map((e) => e.textContent ?? ''));
+  check(after.length === 2 && /0:0[3-9]|0:1\d/.test(after[0]), `${tag} a take interrupted by a reload is kept (${after[0]?.slice(0, 60)})`);
+  await page.click('[data-testid="delete-all"]');
+  await page.waitForTimeout(300);
+  check((await page.$('[data-testid="no-takes"]')) !== null, `${tag} "Delete all recordings" empties the list`);
+  check(errors.length === 0, `${tag} no page errors (${errors.join('; ')})`);
+  await browser.close();
+}
+
+/** Nothing covers the sound check, session and summary buttons on small phones. */
+async function hitRun(wav: string): Promise<void> {
+  const browser = await launch(wav);
+  for (const [w, hgt] of [[320, 568], [375, 667], [390, 664]]) {
+    const ctx = await browser.newContext({ viewport: { width: w, height: hgt }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
+    await ctx.grantPermissions(['microphone'], { origin: URL });
+    const page = await ctx.newPage();
+    const tag = `[hit ${w}x${hgt}]`;
+    await page.goto(URL);
+    await page.evaluate(() => {
+      localStorage.clear();
+      localStorage.setItem('songPitcher.v1', JSON.stringify({ settings: { recordSession: true } }));
+    });
+    await page.reload();
+    await page.click('[data-testid="start"]');
+    await page.waitForSelector('[data-testid="soundcheck-start"]');
+    let r = await hitTest(page, ['[data-testid="soundcheck-start"]', '[data-testid="skip-check"]']);
+    check(Object.values(r).every((v) => v === 'ok' || v === 'hidden'), `${tag} tuner: sound check and skip buttons uncovered (${JSON.stringify(r)})`);
+    await page.click('[data-testid="soundcheck-start"]');
+    await page.waitForTimeout(600);
+    r = await hitTest(page, ['[data-testid="soundcheck-num"]', '[data-testid="soundcheck-step"]', '[data-testid="soundcheck-stop"]']);
+    check(Object.values(r).every((v) => v === 'ok'), `${tag} sound check: number, step and Stop uncovered (${JSON.stringify(r)})`);
+    if (w === 320) await page.screenshot({ path: join(SHOTS, 'layout-se-320x568-soundcheck.png') });
+    await page.click('[data-testid="soundcheck-stop"]');
+    await page.waitForSelector('[data-testid="begin"]:not([disabled])', { timeout: 12000 });
+    r = await hitTest(page, ['[data-testid="begin"]']);
+    check(r['[data-testid="begin"]'] === 'ok', `${tag} Begin uncovered after the check (${JSON.stringify(r)})`);
+    await page.click('[data-testid="begin"]');
+    await page.waitForSelector('[data-testid="session"]');
+    await waitSession(page, `phase === 'sing'`, 10000);
+    r = await hitTest(page, ['[data-testid="replay"]', '[data-testid="key"]', '[data-testid="mark"]', '[data-testid="end"]', '[data-testid="open-settings"]']);
+    check(Object.values(r).every((v) => v === 'ok'), `${tag} session: Replay, Key, Mark, End, Settings uncovered (${JSON.stringify(r)})`);
+    if (w === 320) await page.screenshot({ path: join(SHOTS, 'layout-se-320x568-recording-session.png') });
+    await page.click('[data-testid="end"]');
+    await page.waitForSelector('[data-testid="summary"]');
+    await page.waitForSelector('[data-testid="unsaved-banner"]', { timeout: 5000 }).catch(() => null);
+    r = await hitTest(page, ['[data-testid="unsaved-banner"] [data-testid="save-recording"]', '[data-testid="again"]']);
+    check(Object.values(r).every((v) => v === 'ok'), `${tag} summary: Save and Practice again uncovered (${JSON.stringify(r)})`);
+    if (w === 320) await page.screenshot({ path: join(SHOTS, 'layout-se-320x568-summary.png') });
+    await page.click('[data-testid="open-recordings"]');
+    await page.waitForSelector('[data-testid="recordings"]');
+    if (w === 320) await page.screenshot({ path: join(SHOTS, 'layout-se-320x568-recordings.png') });
+    r = await hitTest(page, ['[data-testid="take"] [data-testid="save-recording"]', '[data-testid="take"] [data-testid="delete-take"]', '[data-testid="delete-all"]']);
+    check(Object.values(r).every((v) => v === 'ok'), `${tag} Recordings: Save, Delete, Delete all uncovered (${JSON.stringify(r)})`);
+    await ctx.close();
   }
   await browser.close();
 }
@@ -456,8 +619,9 @@ async function main(): Promise<void> {
   const only = process.argv.find((a) => a.startsWith('--device='))?.split('=')[1];
   try {
     const devs = DEVICES.filter((d) => !only || d.slug === only);
-    await Promise.all(devs.map((d) => correctRun(d, correct)));
-    if (!process.argv.includes('--skip-negatives')) {
+    const recorderOnly = process.argv.includes('--recorder-only');
+    if (!recorderOnly) await Promise.all(devs.map((d) => correctRun(d, correct)));
+    if (!recorderOnly && !process.argv.includes('--skip-negatives')) {
       // Wrong notes: never past note 1. (By default the singing step accepts any octave and does not
       // check the instrument, so the G4 pluck in the file can pass note 1's singing step; the guitar
       // step must still hold. With the strict check on it must stay in the singing step.)
@@ -474,9 +638,12 @@ async function main(): Promise<void> {
       await Promise.all(devs.map((d) => negativeRun(d, guitarOnly, 'guitar only, no singing, strict check', 'sing', { strictCheck: true })));
     }
     await recorderRun(correct);
-    await toneRun();
-    await insecureRun();
-    await layoutRun(correct);
+    await hitRun(correct);
+    if (!recorderOnly) {
+      await toneRun();
+      await insecureRun();
+      await layoutRun(correct);
+    }
   } finally {
     server.kill();
   }

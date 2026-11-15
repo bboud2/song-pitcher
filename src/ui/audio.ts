@@ -7,7 +7,7 @@
 // AnalyserNode on a timer (gap-free while the timer fires at least every ~170 ms).
 // Playback and listening never overlap: while a reference plays (plus a decay tail) frames are
 // dropped and what was heard is forgotten, and the session ignores mic input in 'listen'.
-import { FRAME_SIZE, HOP_MS, StreamAnalyzer, type AnalysisPath } from '../core/engine.ts';
+import { FRAME_SIZE, HOP_MS, StreamAnalyzer, warmAnalyzer, type AnalysisPath } from '../core/engine.ts';
 import type { PitchFrame } from '../core/matcher.ts';
 import { midiToFreq } from '../core/music.ts';
 
@@ -17,6 +17,9 @@ const TAIL_SEC = 0.3;
 type AudioSessionNav = Navigator & { audioSession?: { type: string } };
 type WakeLockSentinelLike = { release(): Promise<void>; addEventListener?: (t: string, f: () => void) => void };
 type WakeLockNav = Navigator & { wakeLock?: { request(type: 'screen'): Promise<WakeLockSentinelLike> } };
+
+/** length of the sample counter's loop (exact integers in float; ~5 s at 48 kHz) */
+const RAMP_LEN = 1 << 18;
 
 export class AudioEngine {
   ctx: AudioContext | null = null;
@@ -31,6 +34,7 @@ export class AudioEngine {
   private muteFrom = 0;
   private pollBuf: Float32Array<ArrayBuffer> | null = null;
   private pollLast = -1;
+  private rampBuf: Float32Array<ArrayBuffer> | null = null;
   private rawAnalyser: AnalyserNode | null = null;
   private specBuf: Float32Array<ArrayBuffer> | null = null;
 
@@ -120,28 +124,105 @@ export class AudioEngine {
     try {
       await ctx.audioWorklet.addModule(new URL('capture-worklet.js', document.baseURI).href);
       const node = new AudioWorkletNode(ctx, 'capture', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
-      node.port.onmessage = (e: MessageEvent<{ samples: Float32Array; frame: number }>) => this.onAudio(e.data.samples, e.data.frame / ctx.sampleRate);
+      node.port.onmessage = (e: MessageEvent<{ samples: Float32Array; frame: number }>) => this.onAudio(e.data.samples, e.data.frame / ctx.sampleRate, e.data.frame - e.data.samples.length);
       src.connect(node).connect(sink);
       this.captureMode = 'worklet';
       return;
     } catch {
       /* fall through */
     }
+    // Without a worklet nothing numbers the samples, so a sample counter rides along: a looped
+    // buffer holding 0, 1, 2, ... (exact in float) on a second channel / analyser. It tells which
+    // samples arrived, so lost or repeated blocks are logged and the sample clock stays true.
+    const ramp = ctx.createBufferSource();
+    const rb = ctx.createBuffer(1, RAMP_LEN, ctx.sampleRate);
+    const rd = rb.getChannelData(0);
+    for (let i = 0; i < RAMP_LEN; i++) rd[i] = i;
+    ramp.buffer = rb;
+    ramp.loop = true;
     try {
-      const sp = ctx.createScriptProcessor(1024, 1, 1);
-      sp.onaudioprocess = (e) => this.onAudio(new Float32Array(e.inputBuffer.getChannelData(0)), ctx.currentTime);
-      src.connect(sp).connect(sink);
+      // (a large buffer: the main thread may be busy for a while, and latency does not matter here)
+      const sp = ctx.createScriptProcessor(4096, 2, 1);
+      const merge = ctx.createChannelMerger(2);
+      src.connect(merge, 0, 0);
+      ramp.connect(merge, 0, 1);
+      sp.onaudioprocess = (e) => {
+        const ch = e.inputBuffer.getChannelData(1);
+        this.onAudio(new Float32Array(e.inputBuffer.getChannelData(0)), ctx.currentTime, this.unwrap(ch[0]));
+      };
+      merge.connect(sp).connect(sink);
+      ramp.start();
       this.captureMode = 'script';
       return;
     } catch {
       /* fall through */
     }
+    try {
+      this.rampAnalyser = ctx.createAnalyser();
+      this.rampAnalyser.fftSize = 8192;
+      ramp.connect(this.rampAnalyser);
+      ramp.start();
+    } catch {
+      this.rampAnalyser = null;
+    }
     this.captureMode = 'poll';
   }
 
-  /** Raw microphone samples as the analysis receives them (practice recorder). */
-  tap: ((samples: Float32Array, tEnd: number) => void) | null = null;
+  private rampAnalyser: AnalyserNode | null = null;
+  /** the capture's own index of the next sample expected (counter-based modes) */
+  private nextIdx: number | null = null;
+  /** A counter value (mod RAMP_LEN) as a full index, taking the one nearest to what is expected. */
+  private unwrap(v: number): number {
+    const k = Math.round(v);
+    if (this.nextIdx === null) return k;
+    const base = this.nextIdx - (((this.nextIdx % RAMP_LEN) + RAMP_LEN) % RAMP_LEN);
+    let idx = base + k;
+    if (idx - this.nextIdx > RAMP_LEN / 2) idx -= RAMP_LEN;
+    else if (this.nextIdx - idx > RAMP_LEN / 2) idx += RAMP_LEN;
+    return idx;
+  }
+
+  /**
+   * One sample clock for the analysis and the practice recorder: `received` counts every sample
+   * handed to the analysis since the microphone opened (capture index); analysis frames fall at
+   * capture indices FRAME_SIZE, FRAME_SIZE + hop, ... (every whole hop), and a frame's time is
+   * t0 + index / sampleRate.
+   */
+  received = 0;
+  /** capture index of the end of the last analysed hop */
+  captured = 0;
+  /** audio-clock time of capture index 0 */
+  t0Cap: number | null = null;
+  /** The last 60 s of input as the analysis received it (16-bit), so a recording can include
+   * what the detector heard before it started (its noise and attack history). */
+  private preroll: Int16Array | null = null;
+  private prerollFilled = 0;
+  /** Audio-clock time of capture index `c`. */
+  clockTime(c: number): number {
+    return this.t0Cap === null || !this.ctx ? this.now() : this.t0Cap + c / this.ctx.sampleRate;
+  }
+  /** The analysis frames' time base and hop, for a recording's log. */
+  clock(): { t0Cap: number | null; hop: number; frameSize: number; sampleRate: number } {
+    const sr = this.ctx?.sampleRate ?? 48000;
+    return { t0Cap: this.t0Cap, hop: Math.round((HOP_MS / 1000) * sr), frameSize: FRAME_SIZE, sampleRate: sr };
+  }
+  /** Raw microphone samples as the analysis receives them, 16-bit, with their capture index. */
+  tap: ((samples: Int16Array, cStart: number) => void) | null = null;
+  /** Samples the capture path lost or repeated: at capture index `c`, `n` samples (+ dropped, − repeated). */
+  onGap: ((c: number, n: number) => void) | null = null;
+
+  /** The pre-roll (oldest first) and the capture index of its first sample. */
+  prerollSamples(): { samples: Int16Array; cStart: number } {
+    const r = this.preroll;
+    if (!r) return { samples: new Int16Array(0), cStart: this.received };
+    const n = Math.min(this.prerollFilled, r.length);
+    const out = new Int16Array(n);
+    const end = this.received % r.length;
+    for (let i = 0; i < n; i++) out[i] = r[(end - n + i + r.length * 2) % r.length];
+    return { samples: out, cStart: this.received - n };
+  }
   /** The reference tone is playing (frames dropped) from/to these audio times (practice recorder). */
+  /** Frames from capture index `from` up to (not including) `to` were dropped while our own sound played. */
   onMute: ((from: number, to: number) => void) | null = null;
 
   /** What the browser actually applied to the microphone (echo cancellation, AGC, ...). */
@@ -154,11 +235,45 @@ export class AudioEngine {
     }
   }
 
-  /** New samples whose last one is at audio time `tEnd`: analyse every whole hop. */
-  private onAudio(samples: Float32Array, tEnd: number): void {
+  /**
+   * New samples whose last one is at audio time `tEnd`; `startIdx` numbers the first one (the
+   * capture's own sample counter), so a lost block is filled with silence of its length and a
+   * repeated one dropped, each logged: the sample clock never slips. Quantised to 16 bits (exactly
+   * what a recording keeps), then every whole hop is analysed.
+   */
+  private onAudio(raw0: Float32Array, tEnd: number, startIdx?: number): void {
     const sa = this.sa;
     if (!sa) return;
-    this.tap?.(samples, tEnd);
+    const sr = sa.sampleRate;
+    let raw = raw0;
+    if (startIdx !== undefined) {
+      if (this.nextIdx !== null && startIdx !== this.nextIdx) {
+        const d = startIdx - this.nextIdx;
+        this.onGap?.(this.received, d);
+        if (d > 0) {
+          const fill = new Float32Array(Math.min(d, sr) + raw.length);
+          fill.set(raw, fill.length - raw.length);
+          raw = fill;
+        } else raw = raw.subarray(Math.min(raw.length, -d));
+      }
+      this.nextIdx = startIdx + raw0.length;
+      if (!raw.length) return;
+    }
+    const n = raw.length;
+    const q = new Int16Array(n);
+    const samples = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const v = Math.max(-1, Math.min(1, raw[i]));
+      q[i] = Math.round(v < 0 ? v * 0x8000 : v * 0x7fff);
+      samples[i] = q[i] < 0 ? q[i] / 0x8000 : q[i] / 0x7fff;
+    }
+    if (this.t0Cap === null) this.t0Cap = tEnd - n / sr;
+    this.preroll ??= new Int16Array(Math.round(60 * sr));
+    const r = this.preroll;
+    for (let i = 0; i < n; i++) r[(this.received + i) % r.length] = q[i];
+    this.prerollFilled += n;
+    this.tap?.(q, this.received);
+    this.received += n;
     const hop = Math.round((HOP_MS / 1000) * sa.sampleRate);
     const all = new Float32Array(this.acc.length + samples.length);
     all.set(this.acc);
@@ -168,7 +283,8 @@ export class AudioEngine {
       sa.push(all.subarray(off, off + hop));
       off += hop;
       this.fed += hop;
-      const t = tEnd - (all.length - off) / sa.sampleRate;
+      this.captured = this.fed;
+      const t = this.t0Cap + this.fed / sr;
       if (this.fed >= FRAME_SIZE) this.deliver(t);
     }
     this.acc = all.slice(off);
@@ -177,14 +293,14 @@ export class AudioEngine {
   private deliver(t: number): void {
     const sa = this.sa!;
     if (this.playing || t < this.mutedUntil) {
-      if (!this.wasMuted) this.muteFrom = t;
+      if (!this.wasMuted) this.muteFrom = this.captured;
       this.wasMuted = true; // never analyse our own reference tone
       return;
     }
     if (this.wasMuted) {
       sa.attacks.clear(); // ...nor remember its attacks
       this.wasMuted = false;
-      this.onMute?.(this.muteFrom, t);
+      this.onMute?.(this.muteFrom, this.captured);
     }
     if (!this.onFrame) return;
     const path = this.pathFn();
@@ -193,6 +309,52 @@ export class AudioEngine {
     // before the first guitar step)
     for (const w of this.warm) if (w !== path) sa.frame(w, t);
     this.onFrame(f);
+  }
+
+  /**
+   * Start the analysis afresh from the last `warmSec` of input (both paths analysed every hop), so
+   * that what it knows depends only on samples a recording can include: the replay does exactly
+   * the same. Done in slices between audio callbacks (a phone needs a second or two for 6 s of
+   * audio, which must not freeze the page); it catches up with the audio still arriving and
+   * takes over from the old analysis at a hop boundary. Returns the capture index the warm-up
+   * started at and where the new analysis took over.
+   */
+  async resetAnalysis(warmSec = 6): Promise<{ cWarm: number; cEnd: number }> {
+    const ctx = this.ctx;
+    if (!ctx || !this.sa || this.t0Cap === null) return { cWarm: this.captured, cEnd: this.captured };
+    const sr = ctx.sampleRate;
+    const hop = Math.round((HOP_MS / 1000) * sr);
+    const oldest = this.received - Math.min(this.prerollFilled, this.preroll?.length ?? 0);
+    const have = Math.floor((this.captured - oldest) / hop);
+    const k = Math.max(0, Math.min(have, Math.floor((warmSec * sr) / hop)));
+    const cWarm = this.captured - k * hop;
+    const t0 = this.t0Cap;
+    const sa = new StreamAnalyzer(sr);
+    let c = cWarm;
+    let pushed = 0;
+    const t1 = performance.now();
+    for (;;) {
+      // (a slow device that cannot keep up in slices finishes the rest in one go after 2 s)
+      const upto = performance.now() - t1 > 2000 ? this.captured : Math.min(this.captured, c + 25 * hop);
+      if (upto > c) {
+        pushed = warmAnalyzer(sa, this.prerollRange(c, upto), c, t0, hop, pushed);
+        c = upto;
+      }
+      // (caught up with what the old analysis has done: take over here, between two hops)
+      if (c >= this.captured) {
+        this.sa = sa;
+        return { cWarm, cEnd: c };
+      }
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+
+  /** Samples [c0, c1) of the pre-roll (capture indices). */
+  private prerollRange(c0: number, c1: number): Int16Array {
+    const r = this.preroll!;
+    const out = new Int16Array(c1 - c0);
+    for (let i = 0; i < out.length; i++) out[i] = r[(c0 + i) % r.length];
+    return out;
   }
 
   /** Start delivering analysed frames (one per 20 ms of audio), from the path `pathFn` names. */
@@ -218,12 +380,34 @@ export class AudioEngine {
     if (!ctx) return;
     if (ctx.state !== 'running') void ctx.resume().catch(() => {});
     if (this.captureMode !== 'poll' || !this.rawAnalyser) return;
-    // Last resort: the newest samples from the analyser (8192 = ~170 ms of history).
+    // Last resort: the newest samples from the analyser (8192 = ~170 ms of history), numbered by
+    // the sample counter's analyser where there is one.
     const a = this.rawAnalyser;
     this.pollBuf ??= new Float32Array(a.fftSize);
     const now = ctx.currentTime;
-    const fresh = this.pollLast < 0 ? FRAME_SIZE : Math.min(a.fftSize, Math.round((now - this.pollLast) * ctx.sampleRate));
+    const ra = this.rampAnalyser;
+    if (ra) {
+      this.rampBuf ??= new Float32Array(ra.fftSize);
+      for (let tries = 0; tries < 3; tries++) {
+        ra.getFloatTimeDomainData(this.rampBuf);
+        const before = this.rampBuf[ra.fftSize - 1];
+        a.getFloatTimeDomainData(this.pollBuf);
+        ra.getFloatTimeDomainData(this.rampBuf);
+        if (this.rampBuf[ra.fftSize - 1] === before) break;
+      }
+      const end = this.unwrap(this.rampBuf[ra.fftSize - 1]) + 1;
+      if (this.nextIdx === null) this.nextIdx = end - FRAME_SIZE;
+      const want = end - this.nextIdx;
+      if (want <= 0) return;
+      const fresh = Math.min(a.fftSize, want);
+      this.onAudio(this.pollBuf.slice(a.fftSize - fresh), now, end - fresh);
+      return;
+    }
+    const want = this.pollLast < 0 ? FRAME_SIZE : Math.round((now - this.pollLast) * ctx.sampleRate);
+    const fresh = Math.min(a.fftSize, want);
     if (fresh <= 0) return;
+    // (a timer stall longer than the analyser's history loses audio: say so)
+    if (want > fresh) this.onGap?.(this.received, want - fresh);
     this.pollLast = now;
     a.getFloatTimeDomainData(this.pollBuf);
     this.onAudio(this.pollBuf.slice(a.fftSize - fresh), now);

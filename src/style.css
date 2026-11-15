@@ -329,3 +329,33 @@ body.flash .stage { animation: flash 0.6s ease-out; }
 .soundcheck { display: flex; flex-direction: column; gap: 8px; }
 .soundcheck-step { font-size: 1.1rem; font-weight: 700; text-align: center; }
 .soundcheck-count { text-align: center; font-variant-numeric: tabular-nums; }
+
+/* practice recorder: unsaved banner, Recordings list, mark button, sound check */
+.rec-banner { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: 12px; background: #3a2a12; color: #ffd9a0; grid-column: 1 / -1; }
+.rec-banner-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.rec-banner-actions .btn { flex: 1; min-height: 44px; }
+.warn-text { color: var(--play); }
+.rec-notice { margin: 0; padding: 6px 10px; border-radius: 8px; background: #3a2a12; color: #ffd9a0; text-align: center; }
+.recordings { display: flex; flex-direction: column; gap: 8px; }
+.take-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.take { padding: 10px; border: 1px solid var(--line); border-radius: 12px; display: flex; flex-direction: column; gap: 4px; }
+.take-title { font-weight: 700; }
+.take-name { word-break: break-all; }
+.take-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.take-actions .btn { min-height: 44px; }
+.small-btn { padding: 8px 12px; font-size: 0.95rem; }
+.mark-btn { border: 0; cursor: pointer; min-height: 32px; padding: 4px 14px; font-size: 0.85rem; }
+.mark-btn:active { background: #7a2530; }
+.mark-panel { position: fixed; left: 12px; right: 12px; top: calc(max(12px, env(safe-area-inset-top)) + 64px); z-index: 20; display: flex; flex-direction: column; gap: 8px; padding: 12px; border-radius: 14px; background: var(--card); box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5); max-width: 536px; margin: 0 auto; }
+.mark-labels { display: flex; flex-wrap: wrap; gap: 6px; }
+.mark-labels .btn { flex: 1 1 140px; min-height: 44px; }
+.soundcheck-num { font-size: 3rem; font-weight: 800; text-align: center; line-height: 1; font-variant-numeric: tabular-nums; }
+.tuner.checking .sticky-actions { display: none; }
+.tuner.checking .tuner-help { display: none; }
+.rec-banner.done { background: #173a24; color: #b6f0c8; }
+.rec-btn { color: #ff8a98; }
+.rec-btn:disabled { opacity: 0.4; }
+.soundcheck:empty { display: none; }
+@media (max-height: 700px) and (orientation: portrait) {
+  .tuner.checking .tuner-card { display: none; }
+}

@@ -53,6 +53,18 @@ export interface SessionView {
   startIndex: number;
 }
 
+export interface SyncState {
+  phase: Phase;
+  next: Phase;
+  listenKind: ListenKind;
+  index: number;
+  pos: number;
+  sungMidi: number | null;
+  stepStart: number;
+  /** the step had already begun (a replay of its reference is in progress) */
+  begun: boolean;
+}
+
 export class Session {
   readonly song: Song;
   readonly tonicMidi: number;
@@ -272,6 +284,39 @@ export class Session {
       return;
     }
     this.beginNote(this.index + 1);
+  }
+
+  /** Where the session is, for a recording's log (and for the replay to resynchronise to). */
+  syncState(): SyncState {
+    return { phase: this.phase, next: this.next, listenKind: this.listenKind, index: this.index, pos: this.reviewPos, sungMidi: this.sungMidi ?? null, stepStart: this.stepStart, begun: this.matcher !== null };
+  }
+
+  /**
+   * Replay tool: put the session where a recording's log says the app was (a fresh matcher for
+   * that step). Used only when the replay has drifted from the app.
+   */
+  syncTo(s: SyncState): void {
+    this.started = true;
+    this.index = s.index;
+    this.reviewPos = Math.max(0, s.pos);
+    this.next = s.next;
+    this.listenKind = s.listenKind;
+    this.sungMidi = s.sungMidi ?? undefined;
+    this.stepStart = s.stepStart;
+    this.recent = [];
+    this.attemptCarry = 0;
+    this.phase = s.phase;
+    this.matcher = null;
+    if (s.phase === 'review') this.startReviewMatcher();
+    else if (s.phase === 'sing' || s.phase === 'play') this.makeStepMatcher();
+    else if (s.phase === 'listen' && s.begun) {
+      // (a replay in progress: the step had begun)
+      const ph = this.phase;
+      this.phase = s.next;
+      if (s.next === 'review') this.startReviewMatcher();
+      else this.makeStepMatcher();
+      this.phase = ph;
+    }
   }
 
   /** Skip the current note (or the phrase review). Only when allowed by settings. */
