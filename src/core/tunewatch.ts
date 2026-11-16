@@ -9,10 +9,12 @@
 // the X string, far out of tune".
 import { OPEN_STRINGS, noteName } from './music.ts';
 
-export interface TuneAttack { t: number; riseDb: number; band: string }
+export interface TuneAttack { t: number; riseDb: number; band: string; riseMs?: number }
 
 interface Pluck {
   t0: number;
+  /** how fast its attack rose (ms; 0 when the caller does not say) */
+  rise: number;
   /** (open string, cents from it, level dB) per settled frame */
   readings: { open: number; cents: number; db: number; tilt: number | null }[];
 }
@@ -55,7 +57,7 @@ export class TuneWatch {
     if (fresh.length) {
       this.finish();
       this.lastAttack = Math.max(...fresh.map((a) => a.t));
-      this.pluck = { t0: this.lastAttack, readings: [] };
+      this.pluck = { t0: this.lastAttack, rise: Math.min(...fresh.map((a) => a.riseMs ?? 0)), readings: [] };
     }
     const p = this.pluck;
     if (!p) return;
@@ -81,6 +83,21 @@ export class TuneWatch {
       }
     }
     if (best) p.readings.push({ ...best, db, tilt });
+    // (while a string already warned about is being tuned, the figure follows the pluck in hand —
+    // the needle does — instead of waiting for this pluck to end: one steady reading of it is
+    // enough, as the two plucks that raised the warning already showed it is a string)
+    const w = this.warn;
+    if (w && p.readings.length >= 12) {
+      const rs = p.readings.slice(-12);
+      if (rs.every((r) => r.open === w.open)) {
+        const cs = rs.map((r) => r.cents).sort((a, b) => a - b);
+        if (cs[9] - cs[2] <= 10) {
+          const c = median(cs);
+          if (Math.abs(c) < IN_TUNE_CENTS) this.warn = null;
+          else if (Math.sign(c) === Math.sign(w.cents)) this.warn = { open: w.open, cents: c };
+        }
+      }
+    }
   }
 
   /** Measure the pluck in progress (if it holds a settled, decaying note) and update the warning. */
@@ -110,6 +127,10 @@ export class TuneWatch {
     const offSemitone = Math.abs(cents - 100 * Math.round(cents / 100));
     if (Math.abs(cents) >= FAR_CENTS && offSemitone < 30 && !(open === OPEN_STRINGS[0] && cents < 0)) {
       const note = open + Math.round(cents / 100);
+      // (said only of a note that began as sharply as a pluck — at full strength within 15 ms —
+      // or died away as fast as a string, 12 dB or more over the reading: a sung note can fall
+      // away a little and land on any semitone)
+      if (p.rise > 15 && head - tail < 12) return;
       const prev = this.offNote;
       this.offNote = { note, open, cents };
       if (prev && prev.note === note && prev.open === open) this.neutral = { note, open, cents };
@@ -130,7 +151,8 @@ export class TuneWatch {
     if (list.length === 2) {
       const [a, b] = list;
       if (Math.abs(a.cents) >= WARN_CENTS && Math.abs(b.cents) >= WARN_CENTS && Math.sign(a.cents) === Math.sign(b.cents) && Math.abs(a.cents - b.cents) <= AGREE_CENTS) {
-        this.warn = { open, cents: (a.cents + b.cents) / 2 };
+        // (the latest pluck's figure: the student may be tuning it)
+        this.warn = { open, cents: b.cents };
       }
     }
   }

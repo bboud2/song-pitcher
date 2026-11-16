@@ -8,6 +8,7 @@
 // so the reference tone can never be heard by the matcher.
 import { guitarConfig, pathForPhase, singConfig, type AnalysisPath } from './engine.ts';
 import { NoteMatcher, type MatchState, type PitchFrame } from './matcher.ts';
+import { rmsToDb } from './pitch.ts';
 import type { Settings } from './settings.ts';
 import { phraseEndingAt, transpose, type Phrase, type Song } from './songs.ts';
 
@@ -87,6 +88,8 @@ export class Session {
   private sungMidi: number | undefined;
   /** Frames of the current step (last 1.2 s). */
   private recent: PitchFrame[] = [];
+  /** level just before the latest reference (see listenDone) */
+  private preDb: number | undefined = undefined;
   /** Match state of the most recent accept (for logging). */
   lastAccepted: MatchState | null = null;
   private stats: NoteStats[];
@@ -163,6 +166,9 @@ export class Session {
   /** The reference audio for the current 'listen' phase finished playing (and its tail decayed). */
   listenDone(t: number): void {
     if (this.phase !== 'listen') return;
+    // (how loud it was just before the reference: what a string left ringing decays from)
+    const last = this.recent.slice(-10);
+    this.preDb = last.length ? Math.max(...last.map((f) => rmsToDb(f.cleanRms ?? f.rms))) : undefined;
     this.recent = [];
     this.phase = this.next;
     if (this.phase === 'review') {
@@ -188,6 +194,7 @@ export class Session {
       ignoreMidi: prev,
       carryMidi: this.phase === 'sing' ? prev : undefined,
       refMidi: this.phase === 'sing' ? target : undefined,
+      preDb: this.phase === 'sing' ? this.preDb : undefined,
       voiceMidi: this.phase === 'play' ? this.sungMidi : undefined,
     });
   }

@@ -213,6 +213,7 @@ function tunerScreen(): HTMLElement {
     // out-of-tune strings, judged on plucked strings only (two plucks must agree)
     const watch = new TuneWatch();
     const slips = new OctaveSlipFilter();
+    let offOpenNote: { name: string; t: number } | null = null;
     audio.listen((f) => {
       const db = 20 * Math.log10(Math.max(f.rms, 1e-6));
       peakDb = Math.max(db, peakDb - 1.5);
@@ -235,9 +236,13 @@ function tunerScreen(): HTMLElement {
         // (a string well out of tune comes first: on a string 40-50 c sharp the fret below sounds
         // close to the right note, and nothing in the session could tell)
         const tuneWarn = watch.message();
-        const msg = tuneWarn ?? v.messages[0] ?? '';
+        // (a note no open string plays — a fretted note, or a string a semitone or more off — gets
+        // no "Good" from the room check: it is not yet a string in tune)
+        const offOpen = offOpenNote !== null && f.t - offOpenNote.t < 1.5 ? offOpenNote.name : null;
+        const roomMsg = offOpen && v.level !== 'warn' ? `That is ${offOpen}, not an open string — pluck an open string to tune it.` : v.messages[0] ?? '';
+        const msg = tuneWarn ?? roomMsg;
         if (advice.textContent !== msg) advice.textContent = msg;
-        advice.dataset.level = tuneWarn ? 'warn' : v.level;
+        advice.dataset.level = tuneWarn ? 'warn' : offOpen && v.level !== 'warn' ? 'info' : v.level;
         advice.dataset.tune = tuneWarn ? 'off' : '';
         advice.dataset.margin = v.marginDb === null ? '' : String(Math.round(v.marginDb));
         advice.dataset.hum = v.hum === null ? '' : String(v.hum);
@@ -258,8 +263,14 @@ function tunerScreen(): HTMLElement {
       hzEl.textContent = `${hz.toFixed(1)} Hz`;
       // (the tuner tunes open strings: a centred needle on a note no open string plays would read
       // as "in tune" for a string that may be a semitone off)
-      if (OPEN_STRINGS.includes(nn.midi)) meter.set(nn.cents, 5);
-      else meter.set(null, 5, { idle: 'Not an open-string note' });
+      if (OPEN_STRINGS.includes(nn.midi)) {
+        meter.set(nn.cents, 5);
+        offOpenNote = null;
+      } else {
+        meter.set(null, 5, { idle: 'Not an open-string note' });
+        // (only after a pluck: a sung note is a fine mic check on any pitch)
+        offOpenNote = watch.plucking(f.t) ? { name: noteName(nn.midi), t: f.t } : null;
+      }
       for (const st of strings.children) (st as HTMLElement).dataset.on = String(Number((st as HTMLElement).dataset.midi) === nn.midi);
     }, () => 'guitar', ['voice']);
   }
@@ -415,6 +426,8 @@ function startRecorder(kind: 'session' | 'soundcheck', extra: Record<string, unk
   const r = new Recorder(storeRef, kind, audio.ctx.sampleRate, { ...recMeta(), ...extra }, takeName(kind, new Set(takes.map((t) => t.name))));
   rec = r;
   recActive = true;
+  // (what the last save said was about an earlier take: not to be read as this one's)
+  saveMsg = null;
   recNotice = '';
   // (the samples since `from` that the analysis already has: the warm-up of a session)
   const pre = audio.prerollSamples();
@@ -492,7 +505,8 @@ function unsavedBanner(): HTMLElement | null {
       : null;
   }
   const t = u[0];
-  // (what the last save did — for this take or another one — stays in view for a minute)
+  // (what the last save did — for this take or another one — stays in view for a minute; it is
+  // cleared when a new take starts, so it is never read as being about the new one)
   const msg = saveMsg && (saveMsg.id === t.id || saveMsg.at > Date.now() - 60_000) ? saveMsg : null;
   return h('div', { class: 'rec-banner', attrs: { 'data-testid': 'unsaved-banner', role: 'status' } },
     h('span', { text: u.length > 1 ? `${u.length} recordings not saved yet (newest ${fmtDur(t.samples / t.sampleRate)}).` : `Recording not saved yet (${t.kind === 'soundcheck' ? 'sound check, ' : ''}${fmtDur(t.samples / t.sampleRate)}).` }),
@@ -779,6 +793,7 @@ const HINT_TEXT: Record<string, Record<string, string>> = {
   sing: {
     moving: 'Settle on one steady note…',
     carryOver: 'That’s the guitar ringing — now sing it',
+    refEcho: 'That’s my note still echoing — now you sing it',
     tooShort: 'Hold the note a little longer (about half a second)',
     unclear: 'I can’t hear the pitch clearly — sing a bit louder',
     decaying: 'Strict check: that sounds like the guitar — sing it',
@@ -789,6 +804,8 @@ const HINT_TEXT: Record<string, Record<string, string>> = {
     ringing: 'That’s a note still ringing — pluck again',
     outOfTune: 'Close — this string may be out of tune (check the tuner)',
     moving: 'Stop on the note (no sliding)',
+    tooShort: 'Too short to hear — let the string ring',
+    repeatSoft: 'Same note again — pluck it once more, a little firmer',
     octaveHigh: 'Right note, one octave too high',
     octaveLow: 'Right note, one octave too low',
     sustained: 'Strict check: let the string ring freely after the pluck',
@@ -798,7 +815,7 @@ HINT_TEXT.review = HINT_TEXT.play;
 // (for the end-to-end layout test: every hint the session can show)
 (window as unknown as { __songPitcherHints: string[] }).__songPitcherHints = [...new Set(Object.values(HINT_TEXT).flatMap((m) => Object.values(m)))];
 // Hints that only appear when the pitch is (nearly) right: hidden when the meter is off.
-const PITCH_REVEALING_HINTS = new Set(['octaveHigh', 'octaveLow', 'ringing', 'outOfTune', 'carryOver']);
+const PITCH_REVEALING_HINTS = new Set(['octaveHigh', 'octaveLow', 'ringing', 'outOfTune', 'carryOver', 'refEcho', 'repeatSoft']);
 
 function targetLabel(midi: number, s: Settings, tonic: number, keyPc: number): { name: string | null; degree: string | null } {
   const off = midi - tonic;
@@ -863,7 +880,7 @@ function sessionScreen(): HTMLElement {
     if (showMeter) {
       // (in the singing step, the guitar note still ringing from before is not the student:
       // the meter waits for the voice instead of saying "too high" before anything was sung)
-      const ringingOn = effPhase === 'sing' && m?.hint === 'carryOver';
+      const ringingOn = effPhase === 'sing' && (m?.hint === 'carryOver' || m?.hint === 'refEcho');
       let label: string | undefined;
       if (!ringingOn && m?.detectedMidi != null && settings.showNoteName) label = `You: ${noteName(Math.round(m.detectedMidi), keyPc)}`;
       meter.set(ringingOn ? null : (m?.cents ?? null), tol, { label, idle: effPhase === 'sing' ? 'Sing now…' : 'Play now…', fretted: effPhase !== 'sing' });
@@ -871,7 +888,10 @@ function sessionScreen(): HTMLElement {
     let hintText = m?.hint ? HINT_TEXT[effPhase]?.[m.hint] : undefined;
     if (hintText && m?.hint && !showMeter && PITCH_REVEALING_HINTS.has(m.hint)) hintText = undefined;
     const listening = effPhase === 'sing' ? 'Listening for your voice…' : 'Listening for the guitar…';
-    status.textContent = hintText ?? (!showMeter || (!m?.voiced && !m?.stable) ? listening : m.inTolerance ? (effPhase === 'sing' ? 'Hold it…' : 'Let it ring…') : 'Listening…');
+    // (with the meter off, "heard something, still listening" — that the microphone hears the
+    // student — without a word about its pitch or direction)
+    const heard = !showMeter && m?.stable && m.detectedMidi != null ? 'Heard a note — still listening…' : null;
+    status.textContent = hintText ?? heard ?? (!showMeter || (!m?.voiced && !m?.stable) ? listening : m.inTolerance ? (effPhase === 'sing' ? 'Hold it…' : 'Let it ring…') : 'Listening…');
   };
 
   const topbar = h('header', { class: 'topbar' },

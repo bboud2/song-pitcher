@@ -256,6 +256,38 @@ function downloads(page: Page, n: number): Promise<any[]> {
 }
 
 /** Is each element's middle (and both sides) really on top at its position (nothing covers it)? */
+/**
+ * Every hint the session can show, written into the status line in turn: the controls must stay
+ * fully on screen (and, with `tap`, be what a tap at their centre hits), and the page must not
+ * scroll at all.
+ */
+async function hintSweep(page: Page, tap: boolean): Promise<{ bad: string[]; scroll: number; worst: string }> {
+  return page.evaluate((tp: boolean) => {
+    const st = document.querySelector('[data-testid="status"]') as HTMLElement | null;
+    if (!st) return { bad: ['no status line'], scroll: 0, worst: '' };
+    const bad: string[] = [];
+    let scroll = 0;
+    let worst = '';
+    for (const txt of ['Listening…', ...(window as unknown as { __songPitcherHints: string[] }).__songPitcherHints]) {
+      st.textContent = txt;
+      scrollTo(0, 0);
+      const over = document.scrollingElement!.scrollHeight - innerHeight;
+      if (over > scroll) {
+        scroll = over;
+        worst = txt;
+      }
+      for (const sel of ['[data-testid="replay"]', '[data-testid="key"]', '[data-testid="skip"]']) {
+        const el = document.querySelector(sel) as HTMLElement | null;
+        if (!el) continue;
+        const r = el.getBoundingClientRect();
+        const e = tp ? document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) : el;
+        if (r.bottom > innerHeight + 0.5 || r.top < 0 || !e || !(e === el || el.contains(e))) bad.push(`${sel} with "${txt.slice(0, 30)}"`);
+      }
+    }
+    return { bad, scroll, worst };
+  }, tap);
+}
+
 async function hitTest(page: Page, sels: string[]): Promise<Record<string, string>> {
   return page.evaluate((ss: string[]) => {
     const out: Record<string, string> = {};
@@ -482,24 +514,17 @@ async function hitRun(wav: string): Promise<void> {
       const m = document.querySelector('[data-testid="mark"]')!.getBoundingClientRect();
       return { controlsBottom: Math.round(c.bottom), h: innerHeight, markH: Math.round(m.height), markW: Math.round(m.width) };
     });
-    // every hint the session can show, in the status line: the controls stay fully on screen
-    const hintFits = await page.evaluate(() => {
-      const st = document.querySelector('[data-testid="status"]') as HTMLElement;
-      const bad: string[] = [];
-      for (const txt of (window as unknown as { __songPitcherHints: string[] }).__songPitcherHints) {
-        st.textContent = txt;
-        scrollTo(0, 0);
-        for (const sel of ['[data-testid="replay"]', '[data-testid="key"]', '[data-testid="skip"]']) {
-          const el = document.querySelector(sel) as HTMLElement | null;
-          if (!el) continue;
-          const r = el.getBoundingClientRect();
-          const e = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-          if (r.bottom > innerHeight || r.top < 0 || !e || !(e === el || el.contains(e))) bad.push(`${sel} with "${txt.slice(0, 30)}"`);
-        }
+    // every hint the session can show, in the status line, in the singing step and in the guitar
+    // step (its own hint, the meter's readout): the controls stay fully on screen, nothing scrolls
+    for (const ph of ['sing', 'play']) {
+      if (ph === 'play' && !(await waitSession(page, `phase === 'play'`, 60000))) {
+        check(false, `${tag} recording: guitar step reached for the hint check`);
+        continue;
       }
-      return bad;
-    });
-    check(hintFits.length === 0, `${tag} recording: Replay/Key/Skip fully on screen with every hint text (${hintFits.slice(0, 3).join('; ') || 'all fit'})`);
+      const sw = await hintSweep(page, true);
+      check(sw.bad.length === 0, `${tag} recording, ${ph} step: Replay/Key/Skip fully on screen and tappable with every hint text (${sw.bad.slice(0, 3).join('; ') || 'all fit'})`);
+      check(sw.scroll <= 0, `${tag} recording, ${ph} step: the page does not scroll with any hint text (${sw.scroll > 0 ? `${sw.scroll} px with "${sw.worst.slice(0, 40)}"` : 'none'})`);
+    }
     check(geo.controlsBottom <= geo.h && geo.markH >= 44, `${tag} recording: Replay/Key/Skip on screen without scrolling, Mark a 44 px target (${JSON.stringify(geo)})`);
     // browser Back mid-session ends the session in the app (summary), it does not leave it
     await page.goBack();
@@ -566,7 +591,7 @@ async function insecureRun(): Promise<void> {
 /** Extra layouts: tiny phone, landscape, tall phone; degree-only and hidden hints. */
 async function layoutRun(wav: string): Promise<void> {
   const browser = await launch(wav);
-  for (const [name, vp] of [['se-320x568', { width: 320, height: 568 }], ['se2-375x667', { width: 375, height: 667 }], ['landscape-844x390', { width: 844, height: 390 }], ['tall-430x932', { width: 430, height: 932 }]] as const) {
+  for (const [name, vp] of [['se-320x568', { width: 320, height: 568 }], ['se2-375x667', { width: 375, height: 667 }], ['short-390x664', { width: 390, height: 664 }], ['landscape-844x390', { width: 844, height: 390 }], ['tall-430x932', { width: 430, height: 932 }]] as const) {
     const ctx = await browser.newContext({ viewport: vp, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
     await ctx.grantPermissions(['microphone'], { origin: URL });
     const page = await ctx.newPage();
@@ -577,6 +602,8 @@ async function layoutRun(wav: string): Promise<void> {
     const startVisible = await page.$eval('[data-testid="start"]', (b: Element) => { const r = b.getBoundingClientRect(); return r.bottom <= window.innerHeight + 1 && r.top >= 0; });
     check(startVisible, `[layout ${name}] Start button visible without scrolling (key G with octave row)`);
     await page.screenshot({ path: join(SHOTS, `layout-${name}-home.png`) });
+    // (back to C: the fake microphone sings and plays the song in C, so the guitar step is reached)
+    await page.click('[data-key="0"]');
     // The mic check: its advice and help text must sit above the Begin button, before and after
     // a note is heard (no text hidden behind the sticky buttons).
     const clear = () => page.evaluate(() => {
@@ -608,24 +635,18 @@ async function layoutRun(wav: string): Promise<void> {
       return c.bottom <= window.innerHeight + 1 && document.documentElement.scrollWidth <= window.innerWidth + 1;
     });
     check(fits, `[layout ${name}] session controls on screen, no horizontal scroll`);
-    const hintFitsOff = await page.evaluate(() => {
-      const st = document.querySelector('[data-testid="status"]') as HTMLElement | null;
-      if (!st) return ['no status line'];
-      const bad: string[] = [];
-      for (const txt of (window as unknown as { __songPitcherHints: string[] }).__songPitcherHints) {
-        st.textContent = txt;
-        scrollTo(0, 0);
-        for (const sel of ['[data-testid="replay"]', '[data-testid="key"]', '[data-testid="skip"]']) {
-          const el = document.querySelector(sel) as HTMLElement | null;
-          if (!el) continue;
-          const r = el.getBoundingClientRect();
-          if (r.bottom > innerHeight + 0.5 || r.top < 0) bad.push(`${sel} with "${txt.slice(0, 30)}"`);
-        }
-      }
-      return bad;
-    });
-    if (!name.startsWith('landscape')) check(hintFitsOff.length === 0, `[layout ${name}] recording off: Replay/Key/Skip on screen with every hint text (${hintFitsOff.slice(0, 3).join('; ') || 'all fit'})`);
     await page.screenshot({ path: join(SHOTS, `layout-${name}-sing.png`) });
+    if (!name.startsWith('landscape')) {
+      for (const ph of ['sing', 'play']) {
+        if (ph === 'play' && !(await waitSession(page, `phase === 'play'`, 60000))) {
+          check(false, `[layout ${name}] guitar step reached for the hint check`);
+          continue;
+        }
+        const sw = await hintSweep(page, false);
+        check(sw.bad.length === 0, `[layout ${name}] recording off, ${ph} step: Replay/Key/Skip on screen with every hint text (${sw.bad.slice(0, 3).join('; ') || 'all fit'})`);
+        check(sw.scroll <= 0, `[layout ${name}] recording off, ${ph} step: the page does not scroll with any hint text (${sw.scroll > 0 ? `${sw.scroll} px with "${sw.worst.slice(0, 40)}"` : 'none'})`);
+      }
+    }
     await ctx.close();
   }
   // Hidden-hint modes on iPhone 13 size.

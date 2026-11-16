@@ -116,6 +116,9 @@ export interface MatchConfig {
   carryMidi?: number;
   /** The reference tone just played for this step: its tail in a live room is not the student. */
   refMidi?: number;
+  /** Level (dB) heard just before the reference was played — at the previous step's accept: what
+   * the previous note's string has to decay from (guards carry-over). */
+  preDb?: number;
   /** Strict mode: level slope over the hold window must be above this (dB/s). */
   minDbSlope: number;
 
@@ -241,7 +244,12 @@ export type MatchHint =
   | 'moving'
   /** singing step: the guitar note from the previous step is still ringing */
   | 'carryOver'
-  /** singing step: the note stopped before it could be judged (hold it about half a second) */
+  /** phrase review: the same note as the one before still sounds — pluck it again, firmer */
+  | 'repeatSoft'
+  /** singing step: what is heard is the note the app just played, still echoing in the room */
+  | 'refEcho'
+  /** the note stopped before it could be judged (singing: hold it about half a second; guitar: a
+   * pluck damped at once) */
   | 'tooShort'
   /** singing step: something is sounding but its pitch can't be read (too quiet for the room) */
   | 'unclear'
@@ -383,6 +391,8 @@ export class NoteMatcher {
   private sm2: { t: number; v: number }[] = [];
   private segFirstT: number | null = null;
   private segOnset = false;
+  /** the carry-over guard has held this segment back (see pushSung) */
+  private guardHeld = false;
   private tooShortUntil = -Infinity;
   private unclearUntil = -Infinity;
   private lastSungMidi: number | null = null;
@@ -544,6 +554,7 @@ export class NoteMatcher {
     this.sm1 = [];
     this.sm2 = [];
     this.segFirstT = null;
+    this.guardHeld = false;
   }
 
   private pushSung(f: PitchFrame, db: number, midi: number | null): MatchState {
@@ -584,11 +595,26 @@ export class NoteMatcher {
       while (cents > 600) cents -= 1200;
       while (cents < -600) cents += 1200;
     }
+    // (the carry-over guard was holding back a sound left over from before — the reference's
+    // tail, a string still ringing — and the level now turns up: something new has started. It
+    // is judged on its own from here, not by the old segment it landed on, whose smoothed pitch
+    // still lags at the old note for a moment)
+    // (the new segment keeps the old one's "was it already sounding" answer: what is left when
+    // the new sound stops — the string still ringing — is still the old sound)
+    let risen = false;
+    if (this.guardHeld && this.seg.length) {
+      // (louder than anything in the last few tenths of a second: not the old sound's own wobble)
+      const recent = this.hist.filter((r) => r.t < f.t - 0.05 && r.t >= f.t - 0.3);
+      if (recent.length && db - Math.max(...recent.map((r) => r.db)) >= 2) {
+        this.resetSeg();
+        risen = true;
+      }
+    }
     if (!this.seg.length) {
       this.segFirstT = f.t;
       // Did this note start with an attack inside this step, or was it already sounding?
       const prior = this.hist.filter((r) => r.t < f.t - 1e-6 && r.t >= f.t - 0.4);
-      this.segOnset = prior.length > 0 && db - Math.min(...prior.map((r) => r.db)) >= 6;
+      if (!risen) this.segOnset = prior.length > 0 && db - Math.min(...prior.map((r) => r.db)) >= 6;
     }
     this.seg.push({ t: f.t, c: cents, db: rmsToDb(f.rms) });
     const horizon = f.t - (c.holdMs + 200) / 1000;
@@ -658,16 +684,33 @@ export class NoteMatcher {
       const lastPluck = [...before].reverse().find(isPluck);
       // (a voice starting over the ringing string adds a slow rise of its own, however small)
       const voiceSince = lastPluck !== undefined && this.atk.some((a) => a.band === 'full' && a.t > lastPluck.t + 0.03 && a.riseDb >= 4 && a.riseMs >= 5 && a.riseMs <= 80 && attackKind(a, hfNear(a), midNear(a), this.midRise) !== 'pluck');
+      // (how fast the level has fallen since the step opened, over up to the last 1.5 s: a string or
+      // a room's tail keeps falling, a singer holding the note does not)
+      const sinceOpen = this.hist.filter((r) => r.t >= (this.firstT ?? f.t) - 1e-6 && r.t > f.t - 1.5);
+      const openSlope = sinceOpen.length >= 5 ? slope(sinceOpen.map((r) => r.t), sinceOpen.map((r) => r.db)) : 0;
       // (a way out, so nobody is held up for ever: a phone's hard compressor can flatten a voice's
       // onset to nothing, but a note held at a level that does not fall, with a singer's small
       // pitch wobble, for 2 s on end is not a string left ringing)
       const heldLikeVoice = f.t - segT >= 2.0 && dbSlope >= -1 && pitchSd >= 2;
-      const stringSound = lastPluck !== undefined && !voiceSince && f.t - lastPluck.t < 12 && !heldLikeVoice;
+      // (a pluck from before this step — the previous note's, remembered across the reference —
+      // says only how the sound left over from then began; a voice that started while the app was
+      // playing the reference left no attack the step could see, so here the sound itself must
+      // still behave like a string: dying away, or dead steady in pitch)
+      // ...or 20 dB or more below the level heard just before the reference: what is left of a
+      // string, not a voice begun meanwhile (one starts 5-17 dB under the pluck it follows)
+      const leftover = c.preDb !== undefined && db < c.preDb - 20;
+      const carriedOk = !lastPluck?.carried || dbSlope < -1.5 || pitchSd < 3 || openSlope < -1.5 || leftover;
+      const stringSound = lastPluck !== undefined && !voiceSince && f.t - lastPluck.t < 12 && !heldLikeVoice && carriedOk;
       // (and the same for the reference tone the app just played: in a very live room its tail
       // is still sounding, at the target's pitch, when the step opens)
       const pcRef = c.refMidi === undefined ? 99 : Math.abs(((((this.cfg.targetMidi + v2 / 100 - c.refMidi) % 12) + 18) % 12) - 6);
-      // (the reference's tail is told by its dying away: a singer holding the note does not)
-      const carry = (fromStart && ((pcDiff < 0.6 && (dbSlope < -1.5 || pitchSd < 3)) || (pcRef < 0.6 && dbSlope < -1.5))) || stringSound;
+      // (the reference's tail is told by its dying away, which a room makes fast — 10 dB/s and
+      // more, measured since the step opened; a singer fading out of a long note, or one who began
+      // with the reference and is running out of breath, falls 3-8 dB/s. In the first half second
+      // there is too little to measure: anything at the reference's pitch that is falling at all is
+      // held until then.)
+      const refTail = pcRef < 0.6 && ((f.t - (this.firstT ?? f.t) < 0.5 && dbSlope < -1.5) || openSlope < -10);
+      const carry = (fromStart && ((pcDiff < 0.6 && (dbSlope < -1.5 || pitchSd < 3)) || refTail)) || stringSound;
       let sustainedOk = true;
       if (c.strict) {
         const mid = f.t - c.holdMs / 2000;
@@ -677,8 +720,10 @@ export class NoteMatcher {
         const s2 = slope(h2.map((p) => p.t), h2.map((p) => p.db));
         sustainedOk = dbSlope >= c.minDbSlope && s1 >= 2 * c.minDbSlope && s2 >= 2 * c.minDbSlope;
       }
+      if (carry) this.guardHeld = true;
       if (!steady) hint = 'moving';
-      else if (carry) hint = 'carryOver';
+      // (only the reference's echo is holding it back: said as such, not as a guitar ringing)
+      else if (carry) hint = refTail && !stringSound && !(pcDiff < 0.6 && (dbSlope < -1.5 || pitchSd < 3)) ? 'refEcho' : 'carryOver';
       else if (!sustainedOk) hint = 'decaying';
       if (steady && !carry && sustainedOk) {
         if (inTolNow) {
@@ -1129,7 +1174,10 @@ export class NoteMatcher {
           // ("stop on the note" only for a note that is near the target and gliding — not for a
           // thump, a squeak or a spoken word, which never settle anywhere)
           const near = this.hist.slice(-3).filter((r) => r.midi !== null && Math.abs((r.midi as number) - c.targetMidi) <= 1.5).length;
-          if (cand.identity !== null || near >= 3) hint = 'moving';
+          // (and not for a note stopped short — damped or palm-muted to nothing within a few
+          // tenths of a second: it did not slide, it was too short to read)
+          if (db < cand.peakDb - 20 && t - cand.onsetT < 0.6) hint = 'tooShort';
+          else if ((cand.identity !== null || near >= 3) && t - cand.onsetT >= 0.15) hint = 'moving';
           cand.steadySince = undefined;
         }
       }
@@ -1154,6 +1202,9 @@ export class NoteMatcher {
       // (only said when the last attack heard was a string's: after an attack that could have been
       // a voice, the sound may well be the student still singing)
       else if (inTolNow && this.lastAttackWasPluck(t)) hint = 'ringing';
+      // (phrase review, the same note twice: the second pluck, a good deal softer than the first,
+      // can sink into the first's ring unnoticed — at least say what to do)
+      else if (inTolNow && c.repeatOnsets && c.ignoreMidi !== undefined && Math.abs(c.ignoreMidi - c.targetMidi) < 0.6 && t - (this.firstT ?? t) > 0.8) hint = 'repeatSoft';
     }
     // The meter shows only what was attacked in this step and has been identified: not the
     // previous note still ringing, and not the first, still-settling readings of an attack.

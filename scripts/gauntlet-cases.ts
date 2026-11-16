@@ -1012,6 +1012,113 @@ for (const name of ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']) {
   }
 }
 
+// ========================================================================== tenth review (refused honest singers, tails, hints, tuner)
+// Child processes, like the ninth review's. One job per probe; every trial of a row that should pass
+// must pass first try (none stuck, no pass before the singer starts — that is the room or the string
+// passing the step), and every row that should never pass, never does.
+{
+  const dir = new URL('./critic10/', import.meta.url).pathname;
+  const runC10 = (args: string[]): string => {
+    const env = { ...process.env };
+    delete env.BUILD_DIR;
+    const r = spawnSync(process.execPath, args, { cwd: dir, env, encoding: 'utf8', maxBuffer: 64 << 20 });
+    return `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  };
+  type Row = { first?: boolean; pre?: boolean; stuck?: boolean; bad?: boolean; lat?: number | null; setupFail?: boolean; rep?: boolean; hints?: string[] };
+  const rowsOf = (out: string): Row[] => out.split('\n').filter((l) => l.startsWith('{')).map((l) => JSON.parse(l) as Row);
+  const pct = (xs: number[], p: number) => (xs.length ? [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.floor(p * xs.length))] : NaN);
+  const judge = (label: string, rows: Row[], never: boolean): GroupResult => {
+    const rs = rows.filter((r) => !r.setupFail);
+    const n = rs.length;
+    const first = rs.filter((r) => r.first).length;
+    const pre = rs.filter((r) => r.pre).length;
+    const stuck = rs.filter((r) => r.stuck).length;
+    const bad = rs.filter((r) => r.bad).length;
+    const lat = rs.map((r) => r.lat).filter((x): x is number => typeof x === 'number');
+    const hints: Record<string, number> = {};
+    for (const r of rs) for (const h of r.hints ?? []) hints[h] = (hints[h] ?? 0) + 1;
+    const fails: string[] = [];
+    if (!n) fails.push('no trials');
+    if (never) {
+      if (bad || pre) fails.push(`passed ${bad + pre}/${n}`);
+    } else {
+      if (stuck) fails.push(`stuck ${stuck}/${n}`);
+      if (pre) fails.push(`passed before the student started ${pre}/${n}`);
+      if (first < n - pre - stuck) fails.push(`first try ${first}/${n}`);
+    }
+    const summary = `${never ? `passed ${bad + pre}/${n}` : `first try ${first}/${n}, early pass ${pre}, stuck ${stuck}, lat med ${pct(lat, 0.5)} p90 ${pct(lat, 0.9)} ms`} hints ${JSON.stringify(hints)}`;
+    return { name: label, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails, ok: fails.length === 0, summary: fails.length ? `${summary} — ${fails.join('; ')}` : summary };
+  };
+  const E1_NEVER = ['none', 'wrong2_05', 'wrong2_10', 'wrong3_02', 'wrong5_15'];
+  const E1 = ['normal', 'along', 'atRefEnd', 'preOpen', 'fade6', 'atRefEndFade3', 'atRefEndFade5', 'preOpenFade4', 'preOpenFade8', 'child', 'childPreOpen', 'quiet', 'woman', 'softOnTail', 'softOnTailFade3', 'hum', 'atRefEndLong', ...E1_NEVER];
+  for (const beh of E1) {
+    const label = `critic10 e1 sing step after the reference: ${beh}`;
+    job(label, 4, beh === 'atRefEndFade5' || beh === 'none', () => [judge(label, rowsOf(runC10(['e1.ts', 'living,garage,tiled', beh])), E1_NEVER.includes(beh))]);
+  }
+  const E2_NEVER = ['none', 'wrongM2', 'wrongm3', 'wrongP4early', 'wrongM2quiet', 'talk'];
+  const E2 = ['normal', 'short', 'early', 'atOpen', 'hardD', 'hardT', 'quiet', 'soft', 'woman', 'fade5', 'hum', 'earlyLong', 'softLong', 'hardDLong', ...E2_NEVER];
+  for (const beh of E2) {
+    const label = `critic10 e2 repeated note, string ringing, sing step: ${beh}`;
+    job(label, 10, beh === 'early', () => [judge(label, rowsOf(runC10(['e2.ts', 'dry,living,garage', beh])), E2_NEVER.includes(beh))]);
+  }
+  for (const beh of ['same', 'soft8', 'soft12', 'finger', 'thumb', 'quick', 'quickSoft', 'otherString', 'otherStringSoft', 'hammer', 'loudThenSoft', 'fingerAll', 'none']) {
+    const label = `critic10 e3 phrase review, repeated note: ${beh}`;
+    // (the repeated notes only; the rest of the phrase is the ninth review's business)
+    job(label, 8, false, () => {
+      const rows = rowsOf(runC10(['e3.ts', 'dry,living,garage', beh]));
+      return [judge(label, rows.filter((r) => r.rep || r.stuck), beh === 'none')];
+    });
+  }
+  const E5_NEVER = ['singTalk', 'playTalk', 'playHum', 'playWrong1', 'playWrongM1', 'playOct'];
+  for (const beh of ['singCons_d', 'singCons_t', 'singCons_l', 'pluck', 'pluckQuiet34', 'pluckQuiet40', 'pluckThumbQuiet', 'sustain', 'whileSinging', ...E5_NEVER]) {
+    const label = `critic10 e5 left alone: ${beh}`;
+    job(label, 4, false, () => [judge(label, rowsOf(runC10(['e5.ts', 'dry,living,garage', beh])), E5_NEVER.includes(beh))]);
+  }
+  job('critic10 e6 staccato plucks', 6, false, () => {
+    const rows = rowsOf(runC10(['e6.ts'])) as (Row & { beh: string })[];
+    return ['stacc80', 'stacc150', 'stacc250', 'wrongStacc'].map((b) => judge(`critic10 e6 staccato plucks: ${b}`, rows.filter((r) => r.beh === b), b === 'wrongStacc'));
+  });
+  // tuner: an open string 40 c or more off is named with the right string and direction, one
+  // within 20 c gets no message; fretted notes (in tune or 20 c sharp) are never warned about; sung notes
+  // get no message at all
+  for (const agc of [false, true]) {
+    const label = `critic10 e4 tuner, open strings plucked 3 times${agc ? ', phone gain control' : ''}`;
+    job(label, 3, !agc, () => {
+      const out = runC10(['e4.ts', 'open', ...(agc ? ['agc'] : [])]);
+      const fails: string[] = [];
+      const rows = out.split('\n').filter((l) => /^\s*-?\d+ c\s+\(n=/.test(l));
+      for (const l of rows) {
+        const c = Number(/^\s*(-?\d+) c/.exec(l)![1]);
+        const n = Number(/\(n=(\d+)\)/.exec(l)![1]);
+        const cnt = JSON.parse(/(\{.*?\})/.exec(l)![1]) as Record<string, number>;
+        // (the right string and direction, as a warning or as the neutral "that is X … if it was your open Y string" line)
+        const right = (cnt['warn-right'] ?? 0) + (cnt['neutral-right'] ?? 0);
+        if (Math.abs(c) >= 40 && right !== n) fails.push(`${c} c: right string and direction ${right}/${n}`);
+        if (Math.abs(c) <= 20 && (cnt.none ?? 0) !== n) fails.push(`${c} c: a message ${n - (cnt.none ?? 0)}/${n}`);
+      }
+      if (!rows.length) fails.push('no result');
+      return [{ name: label, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails, ok: fails.length === 0, summary: `${rows.length} rows${fails.length ? ' — ' + fails.join('; ') : ', all as expected'}` }];
+    });
+  }
+  job('critic10 e4 tuner, fretted notes and sung notes', 3, true, () => {
+    const fails: string[] = [];
+    const fr = runC10(['e4.ts', 'fretted']);
+    for (const l of fr.split('\n').filter((x) => x.startsWith('fretted twice'))) {
+      const c = Number(/, (\d+) c sharp/.exec(l)![1]);
+      const cnt = JSON.parse(/(\{.*?\})/.exec(l)![1]) as Record<string, number>;
+      if (c <= 20 && cnt.WARN) fails.push(`fretted ${c} c sharp: warned ${cnt.WARN}`);
+    }
+    const sg = runC10(['e4.ts', 'sung']);
+    const m = /sung twice \(n=(\d+)\) (\{.*?\})/.exec(sg);
+    if (!m) fails.push('no sung result');
+    else {
+      const cnt = JSON.parse(m[2]) as Record<string, number>;
+      if ((cnt.none ?? 0) !== Number(m[1])) fails.push(`sung: a message ${Number(m[1]) - (cnt.none ?? 0)}/${m[1]} ${m[2]}`);
+    }
+    return [{ name: 'critic10 e4 tuner, fretted notes and sung notes', kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails, ok: fails.length === 0, summary: fails.length ? fails.join('; ') : 'as expected' }];
+  });
+}
+
 // ========================================================================== real recordings
 // Practice recordings made on phones (Settings → "Record this session for testing"), dropped into
 // recordings/ as NAME.wav + NAME.json: the engine must reproduce every accept the app logged.
