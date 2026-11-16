@@ -47,8 +47,9 @@ export function createMeter(range = 100): MeterHandle {
       if (opts.fretted && !inTol) {
         // Guitar: a reading near the target fret but outside the window is an out-of-tune string,
         // not a reason to move to another fret.
-        // (four semitones or more away may well be another string: no fret advice then)
-        txt = Math.abs(cents) < 75 ? `${Math.abs(c)}¢ ${c < 0 ? 'flat' : 'sharp'} — string out of tune?` : Math.abs(cents) >= 450 ? (cents < 0 ? 'Too low — find a higher note' : 'Too high — find a lower note') : cents < 0 ? 'Too low — higher fret' : 'Too high — lower fret';
+        // (more than two semitones away may well be another string, or an open string: no fret
+        // advice then)
+        txt = Math.abs(cents) < 75 ? `${Math.abs(c)}¢ ${c < 0 ? 'flat' : 'sharp'} — string out of tune?` : Math.abs(cents) >= 250 ? (cents < 0 ? 'Too low — find a higher note' : 'Too high — find a lower note') : cents < 0 ? 'Too low — higher fret' : 'Too high — lower fret';
       } else if (Math.abs(cents) > 150) txt = cents < 0 ? 'Too low — go up' : 'Too high — go down';
       else if (inTol) txt = Math.abs(c) <= 5 ? 'In tune' : `${Math.abs(c)}¢ ${c < 0 ? 'flat' : 'sharp'} — OK`;
       else txt = `${Math.abs(c)}¢ ${c < 0 ? 'flat — go up' : 'sharp — go down'}`;

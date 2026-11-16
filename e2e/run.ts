@@ -45,9 +45,17 @@ function check(cond: boolean, msg: string): void {
 }
 
 async function startServer(): Promise<ChildProcess> {
-  const p = spawn('npx', ['vite', 'preview', '--port', String(PORT), '--strictPort', '--host'], { cwd: ROOT, stdio: 'pipe' });
+  // (a server already answering on the port was not started by this run and may serve another
+  // build: refuse it rather than test the wrong thing)
+  const busy = await fetch(URL).then(() => true, () => false);
+  if (busy) throw new Error(`port ${PORT} is already in use by a server this run did not start; stop it and run again`);
+  // (vite itself, not through npx: killing npx leaves its vite child serving the port)
+  const p = spawn(process.execPath, [join(ROOT, 'node_modules/vite/bin/vite.js'), 'preview', '--port', String(PORT), '--strictPort', '--host'], { cwd: ROOT, stdio: 'pipe' });
+  let exited = false;
+  p.on('exit', () => (exited = true));
   const deadline = Date.now() + 20000;
   while (Date.now() < deadline) {
+    if (exited) throw new Error('preview server exited before answering');
     try {
       const r = await fetch(URL);
       if (r.ok) return p;
@@ -283,6 +291,14 @@ async function hintSweep(page: Page, tap: boolean): Promise<{ bad: string[]; scr
         const e = tp ? document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) : el;
         if (r.bottom > innerHeight + 0.5 || r.top < 0 || !e || !(e === el || el.contains(e))) bad.push(`${sel} with "${txt.slice(0, 30)}"`);
       }
+    }
+    // (the meter's two-line readout must fit its box, not run into the scale or the hold bar)
+    const ro = document.querySelector('.meter-readout') as HTMLElement | null;
+    if (ro) {
+      const keep = ro.textContent;
+      ro.textContent = 'You: G♯3 · 45¢ sharp — string out of tune?';
+      if (ro.scrollHeight > ro.clientHeight + 1) bad.push(`meter readout overflows its box by ${ro.scrollHeight - ro.clientHeight} px`);
+      ro.textContent = keep;
     }
     return { bad, scroll, worst };
   }, tap);
@@ -619,6 +635,10 @@ async function layoutRun(wav: string): Promise<void> {
     await page.waitForSelector('[data-testid="begin"]:not([disabled])', { timeout: 12000 });
     await page.waitForTimeout(600);
     if (!name.startsWith('landscape')) check(await clear(), `[layout ${name}] mic check text above the Begin button after a note`);
+    if (!name.startsWith('landscape')) {
+      const tun = await page.evaluate(() => ({ scroll: document.scrollingElement!.scrollHeight - innerHeight, key: document.querySelector('[data-testid="strings-key"]')?.textContent ?? '' }));
+      check(tun.scroll <= 0 && /thickest/.test(tun.key), `[layout ${name}] mic check: no scrolling, strings key shown (${tun.scroll} px, "${tun.key}")`);
+    }
     await page.screenshot({ path: join(SHOTS, `layout-${name}-tuner.png`) });
     await page.click('[data-testid="begin"]');
     await waitSession(page, `phase === 'sing'`, 10000);

@@ -64,6 +64,8 @@ export interface PitchFrame {
   novOddDb?: number;
   /** attack shapes measured on every sample of the guitar path in the last few seconds */
   attacks?: FrameAttack[];
+  /** loudest level heard while the analysis last stopped listening (our reference tone), dB */
+  mutePeakDb?: number | null;
 }
 
 /** One attack seen by the stream analyser: when its rise started, how fast and how big it was. */
@@ -76,6 +78,8 @@ export interface FrameAttack {
   edgeDb?: number;
   /** see AttackEvent.carried */
   carried?: boolean;
+  /** see AttackEvent.muted */
+  muted?: boolean;
 }
 
 export type MatchMode = 'pitchClass' | 'exact';
@@ -248,6 +252,8 @@ export type MatchHint =
   | 'repeatSoft'
   /** singing step: what is heard is the note the app just played, still echoing in the room */
   | 'refEcho'
+  /** singing step, repeated note: the note just played still sounds (the string, or the echo) */
+  | 'stillSounding'
   /** the note stopped before it could be judged (singing: hold it about half a second; guitar: a
    * pluck damped at once) */
   | 'tooShort'
@@ -393,6 +399,14 @@ export class NoteMatcher {
   private segOnset = false;
   /** the carry-over guard has held this segment back (see pushSung) */
   private guardHeld = false;
+  /** something new began since the reference started (see pushSung) */
+  private newSound = false;
+  private onsetCut = false;
+  private levelRoseT: number | null = null;
+  private cutAt: { t: number; quiet: number } | null = null;
+  private openDb = -Infinity;
+  /** attacks heard while the reference played (see mergeAttacks) */
+  private mutedAtk: FrameAttack[] = [];
   private tooShortUntil = -Infinity;
   private unclearUntil = -Infinity;
   private lastSungMidi: number | null = null;
@@ -567,7 +581,9 @@ export class NoteMatcher {
         // fell); if the sound goes on but its pitch can't be read (a quiet voice in a noisy room),
         // say that instead. (Whatever the pitch: with the meter off this must not reveal it.)
         const len = this.segFirstT !== null ? this.lastVoicedT - this.segFirstT : 0;
-        if (this.seg.length && len >= 0.15 && len < (c.holdMs + 150) / 1000) {
+        // (not of a sound that was there before anything new began — the reference's echo, a
+        // string ringing: a student who has not sung is not told to sing longer or louder)
+        if (this.seg.length && len >= 0.15 && len < (c.holdMs + 150) / 1000 && (this.segOnset || this.newSound)) {
           const segDb = median(this.seg.map((p) => p.db));
           if (rmsToDb(f.rms) < segDb - 6) {
             this.tooShortUntil = f.t + 2;
@@ -610,6 +626,50 @@ export class NoteMatcher {
         risen = true;
       }
     }
+    // Has anything new begun since the reference started — an attack while the reference played
+    // or in this step, or the level rising well above where it has been? A sound that was already
+    // there, unchanged, when the step opened (the reference's echo, a string ringing in sympathy)
+    // is not the student starting to sing (see the carry-over guard below).
+    const t0 = this.firstT ?? f.t;
+    const stepOnsets = this.atk.filter((a) => !a.carried && a.band !== 'hf' && a.riseDb >= 6 && a.t >= t0 - 0.3);
+    const quietest = Math.min(...this.hist.filter((r) => r.t >= t0 - 1e-6).map((r) => r.db), db);
+    // (when the level first rose well above the quietest it has been since the step opened)
+    if (this.levelRoseT === null && db >= quietest + 9) this.levelRoseT = f.t;
+    // (or what is there when the step opens is nearly as loud as the reference itself was — within
+    // 20 dB: an echo 0.7 s after the reference has fallen further than that; a singer who began
+    // with it, their onset hidden under it, has not)
+    if (f.mutePeakDb != null && f.t - t0 <= 0.2) this.openDb = Math.max(this.openDb, db);
+    if (!this.newSound) {
+      this.newSound = this.mutedAtk.some((a) => a.band !== 'hf' && a.riseDb >= 3) || stepOnsets.length > 0 || db >= quietest + 9 ||
+        (f.mutePeakDb != null && this.openDb >= f.mutePeakDb - 20);
+    }
+    // (and when it begins over a sound that was already there, it is judged from its own start,
+    // not together with what it landed on, whose smoothed pitch still lags — once per step)
+    const mutedNew = this.mutedAtk.some((a) => a.band !== 'hf' && a.riseDb >= 3);
+    if (!this.segOnset && !this.onsetCut && !mutedNew && this.seg.length && this.segFirstT !== null) {
+      // (an old sound heard for a while first, and the first new thing since: a sound that began
+      // with the step, or while the reference played, is judged whole)
+      const first = stepOnsets.reduce<FrameAttack | null>((a, b) => (a === null || b.t < a.t ? b : a), null);
+      const on = first !== null && first.t > (this.segFirstT as number) + 0.25 ? first : undefined;
+      const cut = on ? on.t : this.levelRoseT !== null && this.levelRoseT > (this.segFirstT as number) + 0.25 ? this.levelRoseT : null;
+      if (cut !== null) {
+        this.onsetCut = true;
+        this.seg = this.seg.filter((p) => p.t >= cut - 1e-6);
+        this.sm1 = this.sm1.filter((p) => p.t >= cut - 1e-6);
+        this.sm2 = this.sm2.filter((p) => p.t >= cut - 1e-6);
+        this.segFirstT = this.seg.length ? this.seg[0].t : null;
+        // (a clear new start — an attack, or the level up 15 dB on what was there — is a new
+        // sound, judged as one; a smaller bump in a decaying room or string is still watched by
+        // the guards below)
+        if (on || db >= quietest + 15) this.segOnset = true;
+        else this.cutAt = { t: cut, quiet: quietest };
+        risen = true;
+      }
+    } else if (this.cutAt !== null && !this.segOnset && f.t - this.cutAt.t <= 0.3 && db >= this.cutAt.quiet + 15) {
+      // (the level went on rising after the cut: a new sound after all)
+      this.segOnset = true;
+      this.cutAt = null;
+    }
     if (!this.seg.length) {
       this.segFirstT = f.t;
       // Did this note start with an attack inside this step, or was it already sounding?
@@ -637,6 +697,7 @@ export class NoteMatcher {
     let hint: MatchHint | null = null;
     let accepted = false;
     let wrong = s.wrongAttempts;
+    let refusing = false;
     let meanAbs: number | null = null;
     if (age >= settledAge - 10) {
       const old = this.sm2.find((p) => p.t >= f.t - c.trendMs / 1000 - 1e-6);
@@ -709,7 +770,11 @@ export class NoteMatcher {
       // with the reference and is running out of breath, falls 3-8 dB/s. In the first half second
       // there is too little to measure: anything at the reference's pitch that is falling at all is
       // held until then.)
-      const refTail = pcRef < 0.6 && ((f.t - (this.firstT ?? f.t) < 0.5 && dbSlope < -1.5) || openSlope < -10);
+      // (and whatever its slope, a sound at the reference's pitch that was already there when the
+      // step opened, with nothing new begun since the reference started, is not the student)
+      // (that needs the reference to have been heard: the level it reached tells an echo from a
+      // singer whose start it hid)
+      const refTail = pcRef < 0.6 && ((f.t - (this.firstT ?? f.t) < 0.5 && dbSlope < -1.5) || openSlope < -10 || (!this.newSound && f.mutePeakDb != null));
       const carry = (fromStart && ((pcDiff < 0.6 && (dbSlope < -1.5 || pitchSd < 3)) || refTail)) || stringSound;
       let sustainedOk = true;
       if (c.strict) {
@@ -721,9 +786,13 @@ export class NoteMatcher {
         sustainedOk = dbSlope >= c.minDbSlope && s1 >= 2 * c.minDbSlope && s2 >= 2 * c.minDbSlope;
       }
       if (carry) this.guardHeld = true;
-      if (!steady) hint = 'moving';
-      // (only the reference's echo is holding it back: said as such, not as a guitar ringing)
-      else if (carry) hint = refTail && !stringSound && !(pcDiff < 0.6 && (dbSlope < -1.5 || pitchSd < 3)) ? 'refEcho' : 'carryOver';
+      refusing = carry;
+      // (what is held back is named only as far as it can be told: a string with its pluck heard
+      // and no voice since, at another pitch than the note just played, is the guitar; on the
+      // same pitch as the note just played it may be that string or the reference's echo — said
+      // neutrally; otherwise it is the echo)
+      if (!steady) hint = fromStart && !this.newSound ? null : 'moving';
+      else if (carry) hint = pcDiff < 0.6 ? 'stillSounding' : stringSound ? 'carryOver' : 'refEcho';
       else if (!sustainedOk) hint = 'decaying';
       if (steady && !carry && sustainedOk) {
         if (inTolNow) {
@@ -737,6 +806,15 @@ export class NoteMatcher {
           }
         }
       }
+    }
+    // (a sound being held back — or, before it can be judged, one that was already there with
+    // nothing new begun, at the pitch just heard — shows no needle and fills no hold bar)
+    if (!accepted && !refusing && !this.segOnset && !this.newSound && f.mutePeakDb != null) {
+      const pcOf = (m: number | undefined) => (m === undefined ? 99 : Math.abs(((((this.cfg.targetMidi + v1 / 100 - m) % 12) + 18) % 12) - 6));
+      refusing = pcOf(c.refMidi) < 0.6 || pcOf(c.carryMidi) < 0.6;
+    }
+    if (refusing && !accepted) {
+      return { voiced: true, stable: false, detectedMidi: null, cents: null, inTolerance: false, progress: 0, accepted: false, acceptedAt: null, meanAbsCents: null, wrongAttempts: wrong, hint };
     }
     const progress = Math.abs(v1) <= c.toleranceCents ? Math.min(1, age / settledAge) : 0;
     return {
@@ -1177,7 +1255,7 @@ export class NoteMatcher {
           // (and not for a note stopped short — damped or palm-muted to nothing within a few
           // tenths of a second: it did not slide, it was too short to read)
           if (db < cand.peakDb - 20 && t - cand.onsetT < 0.6) hint = 'tooShort';
-          else if ((cand.identity !== null || near >= 3) && t - cand.onsetT >= 0.15) hint = 'moving';
+          else if ((cand.identity !== null || near >= 3) && t - cand.onsetT >= 0.3) hint = 'moving';
           cand.steadySince = undefined;
         }
       }
@@ -1315,6 +1393,11 @@ export class NoteMatcher {
     // from the previous step started by a pluck? Everywhere else this step starts afresh.
     const keepOld = c.kind === 'sung' && c.carryMidi !== undefined && Math.abs(((((c.targetMidi - c.carryMidi) % 12) + 18) % 12) - 6) < 0.6;
     for (const a of f.attacks ?? []) {
+      // (heard while the reference played: only whether something new began then — see pushSung)
+      if (a.muted) {
+        if (!a.carried && !this.mutedAtk.some((b) => b.band === a.band && Math.abs(b.t - a.t) < 0.004)) this.mutedAtk.push(a);
+        continue;
+      }
       if (!keepOld && a.carried) continue;
       if (!this.atk.some((b) => b.band === a.band && Math.abs(b.t - a.t) < 0.004)) this.atk.push(a);
     }

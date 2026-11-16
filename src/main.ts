@@ -287,6 +287,8 @@ function tunerScreen(): HTMLElement {
       noteEl, hzEl, meter.el,
       h('div', { class: 'level', attrs: { 'aria-label': 'Input level' } }, level),
       strings,
+      // (which string is which on the guitar itself: the row runs from the thickest to the thinnest)
+      h('div', { class: 'strings-key', attrs: { 'data-testid': 'strings-key' } }, h('span', { text: '◀ thickest string' }), h('span', { text: 'thinnest ▶' })),
     ),
     micError
       ? h('div', { class: 'error', attrs: { role: 'alert', 'data-testid': 'mic-error' } }, micError, button('Try again', () => void enableMic(), 'btn secondary'))
@@ -294,7 +296,7 @@ function tunerScreen(): HTMLElement {
         ? h('p', { class: 'muted center' }, 'Waiting for microphone permission…')
         : h('div', { class: 'tuner-help' },
             advice,
-            h('p', { class: 'muted center' }, 'The note name should follow you. Put the phone on a stand about 50 cm from the guitar.'),
+            h('p', { class: 'muted center' }, 'The note name should follow you. Phone on a stand, about 50 cm from the guitar.'),
           ),
     check ? check.box : null,
     h('div', { class: 'actions sticky-actions' }, begin, skipCheck),
@@ -794,6 +796,7 @@ const HINT_TEXT: Record<string, Record<string, string>> = {
     moving: 'Settle on one steady note…',
     carryOver: 'That’s the guitar ringing — now sing it',
     refEcho: 'That’s my note still echoing — now you sing it',
+    stillSounding: 'That’s the last note still sounding — now you sing it',
     tooShort: 'Hold the note a little longer (about half a second)',
     unclear: 'I can’t hear the pitch clearly — sing a bit louder',
     decaying: 'Strict check: that sounds like the guitar — sing it',
@@ -813,9 +816,9 @@ const HINT_TEXT: Record<string, Record<string, string>> = {
 };
 HINT_TEXT.review = HINT_TEXT.play;
 // (for the end-to-end layout test: every hint the session can show)
-(window as unknown as { __songPitcherHints: string[] }).__songPitcherHints = [...new Set(Object.values(HINT_TEXT).flatMap((m) => Object.values(m)))];
+(window as unknown as { __songPitcherHints: string[] }).__songPitcherHints = [...new Set([...Object.values(HINT_TEXT).flatMap((m) => Object.values(m)), 'Now play the whole phrase, from its first note…', 'Heard a note — still listening…'])];
 // Hints that only appear when the pitch is (nearly) right: hidden when the meter is off.
-const PITCH_REVEALING_HINTS = new Set(['octaveHigh', 'octaveLow', 'ringing', 'outOfTune', 'carryOver', 'refEcho', 'repeatSoft']);
+const PITCH_REVEALING_HINTS = new Set(['octaveHigh', 'octaveLow', 'ringing', 'outOfTune', 'carryOver', 'refEcho', 'stillSounding', 'repeatSoft']);
 
 function targetLabel(midi: number, s: Settings, tonic: number, keyPc: number): { name: string | null; degree: string | null } {
   const off = midi - tonic;
@@ -864,6 +867,7 @@ function sessionScreen(): HTMLElement {
       }));
   }
 
+  let heardRun = 0;
   updateSession = (cur: SessionView) => {
     const m = cur.match;
     // With the meter off, nothing may reveal whether the pitch is right (no progress, neutral text).
@@ -877,10 +881,14 @@ function sessionScreen(): HTMLElement {
       status.textContent = cur.listenKind === 'phrase' ? 'Playing the phrase…' : 'Playing the note…';
       return;
     }
+    if (cur.reviewBeat) {
+      status.textContent = 'Now play the whole phrase, from its first note…';
+      return;
+    }
     if (showMeter) {
       // (in the singing step, the guitar note still ringing from before is not the student:
       // the meter waits for the voice instead of saying "too high" before anything was sung)
-      const ringingOn = effPhase === 'sing' && (m?.hint === 'carryOver' || m?.hint === 'refEcho');
+      const ringingOn = effPhase === 'sing' && (m?.hint === 'carryOver' || m?.hint === 'refEcho' || m?.hint === 'stillSounding');
       let label: string | undefined;
       if (!ringingOn && m?.detectedMidi != null && settings.showNoteName) label = `You: ${noteName(Math.round(m.detectedMidi), keyPc)}`;
       meter.set(ringingOn ? null : (m?.cents ?? null), tol, { label, idle: effPhase === 'sing' ? 'Sing now…' : 'Play now…', fretted: effPhase !== 'sing' });
@@ -890,7 +898,9 @@ function sessionScreen(): HTMLElement {
     const listening = effPhase === 'sing' ? 'Listening for your voice…' : 'Listening for the guitar…';
     // (with the meter off, "heard something, still listening" — that the microphone hears the
     // student — without a word about its pitch or direction)
-    const heard = !showMeter && m?.stable && m.detectedMidi != null ? 'Heard a note — still listening…' : null;
+    // (a pitched sound, held for a few frames: not a knock or a click)
+    heardRun = m?.voiced && m.stable && m.detectedMidi != null ? heardRun + 1 : 0;
+    const heard = !showMeter && heardRun >= 4 ? 'Heard a note — still listening…' : null;
     status.textContent = hintText ?? heard ?? (!showMeter || (!m?.voiced && !m?.stable) ? listening : m.inTolerance ? (effPhase === 'sing' ? 'Hold it…' : 'Let it ring…') : 'Listening…');
   };
 

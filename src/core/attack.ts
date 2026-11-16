@@ -32,6 +32,9 @@ export interface AttackEvent {
   edgeDb: number;
   /** heard before the last time the analysis stopped listening (kept through our own sound) */
   carried?: boolean;
+  /** heard while the analysis was not listening (our own reference tone playing, and its tail),
+   * after the reference's own start: kept only to say that something new began meanwhile */
+  muted?: boolean;
 }
 
 const BLOCK_MS = 1;
@@ -40,6 +43,8 @@ const PRE_FROM = 45;
 const PRE_TO = 5;
 const HORIZON = 120;
 const RING = 512;
+/** the reference tone's own start, right after the analysis stops listening (see clear) */
+const MUTE_SKIP_SEC = 0.25;
 
 class BandTracker {
   private blk = new Float64Array(RING); // 1 ms block energies
@@ -157,6 +162,11 @@ export class AttackTracker {
       this.accMid += md[i] * md[i];
       this.samples++;
       if (++this.inBlock === this.blockLen) {
+        // (the loudest 20 ms since the analysis last listened: while our reference plays, its level)
+        this.win20 += this.accFull - this.ring20[this.ring20i];
+        this.ring20[this.ring20i] = this.accFull;
+        this.ring20i = (this.ring20i + 1) % 20;
+        if (this.win20 > this.peakSinceMark) this.peakSinceMark = this.win20;
         this.full.block(this.accFull);
         this.hf.block(this.accHf);
         this.mid.block(this.accMid);
@@ -174,7 +184,16 @@ export class AttackTracker {
   /** The analysis read a frame now: what was heard up to here was listened to. */
   mark(): void {
     this.markSample = this.samples;
+    this.peakSinceMark = 0;
   }
+
+  private ring20 = new Float64Array(20);
+  private ring20i = 0;
+  private win20 = 0;
+  private peakSinceMark = 0;
+  /** level (dB, mean square over 20 ms) of the loudest moment while the analysis last stopped
+   * listening — our reference tone as the microphone heard it; null before any such pause */
+  mutePeakDb: number | null = null;
 
   /**
    * Forget what was heard while nobody listened — our own reference tone and its tail — but keep
@@ -182,8 +201,13 @@ export class AttackTracker {
    * left ringing into the next step must not be taken for a voice).
    */
   clear(): void {
+    this.mutePeakDb = this.peakSinceMark > 0 ? 10 * Math.log10(this.peakSinceMark / (20 * this.blockLen)) : null;
     const keep = this.events.filter((e) => e.sample <= this.markSample).map((e) => ({ ...e, carried: true }));
+    // (what began while our own sound played — a student starting to sing early — is kept, marked:
+    // not as an attack of this step, only as the fact that a new sound started. The reference's own
+    // start, in the first quarter second, is not.)
+    const muted = this.events.filter((e) => e.sample > this.markSample + MUTE_SKIP_SEC * this.sampleRate).map((e) => ({ ...e, muted: true }));
     this.events.length = 0;
-    this.events.push(...keep);
+    this.events.push(...keep, ...muted);
   }
 }

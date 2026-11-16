@@ -134,6 +134,7 @@ p { margin: 0; }
 .level-fill { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--play)); transition: width 0.08s; }
 .strings { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; width: 100%; }
 .string { text-align: center; padding: 10px 0; border-radius: 10px; background: var(--card-2); font-weight: 700; color: var(--muted); }
+.strings-key { display: flex; justify-content: space-between; width: 100%; margin-top: -4px; font-size: 1rem; color: var(--muted); }
 .string[data-on='true'] { background: var(--accent); color: var(--accent-ink); }
 .advice { text-align: center; font-size: 1.15rem; font-weight: 700; min-height: 1.4em; color: var(--text); }
 .advice[data-level='warn'] { color: var(--play); }
@@ -378,9 +379,20 @@ body.flash .stage { animation: flash 0.6s ease-out; }
   .session .hint { font-size: 1.15rem; }
   .session .target-name { font-size: min(26vw, 11vh, 120px); }
   .session .target-degree { font-size: min(9vw, 4.4vh, 40px); }
-  .session .meter-readout { height: 2.2em; }
+  .session .meter-readout { height: 2.2em; line-height: 1.05; }
 }
 @media (max-height: 600px) and (orientation: portrait) {
   .session .target-name { font-size: min(24vw, 9.5vh, 110px); }
   .session .stage { gap: 4px; padding-top: 10px; }
+}
+/* Mic check on the shortest phones (568 px): a smaller note and tighter card so the strings key,
+   the advice and the help line all stay above the Begin button without scrolling. */
+@media (max-height: 600px) and (orientation: portrait) {
+  .tuner-card { gap: 4px; padding: 8px 10px; }
+  .tuner-note { font-size: min(20vw, 9vh, 80px); }
+  .tuner .meter-track { height: 40px; }
+  .tuner .meter-readout { height: 1.6em; }
+  .tuner-help { gap: 4px; }
+  .tuner-help .muted { font-size: 0.95rem; line-height: 1.25; }
+  .tuner-help .advice { font-size: 1.05rem; }
 }

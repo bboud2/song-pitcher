@@ -107,7 +107,7 @@ export class RoomCheck {
     }
     if (floorDb !== null && floorDb > -45) {
       level = 'warn';
-      messages.push(`Noisy room (${Math.round(floorDb)} dBFS): turn off fans, music or the TV.`);
+      messages.push('The room is noisy: turn off fans, music or the TV.');
     }
     if (marginDb === null) {
       if (level === 'ok') level = 'info';
@@ -116,9 +116,9 @@ export class RoomCheck {
       // (a little hysteresis so the verdict doesn't flicker around the threshold)
       this.good = false;
       level = 'warn';
-      messages.push(`Your note is only ${Math.round(marginDb)} dB above the room: phone closer (50 cm) or play harder.`);
+      messages.push('Your note is hard to hear over the room: put the phone closer (50 cm) or play a little harder.');
     } else if ((this.good = true) && messages.length === 0) {
-      messages.push(`Good: your note is ${Math.round(marginDb)} dB above the room noise.`);
+      messages.push('Good: I can hear your note clearly.');
     }
     return { level, messages, floorDb, pluckDb, marginDb, hum };
   }

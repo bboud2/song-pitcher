@@ -9,12 +9,10 @@
 // the X string, far out of tune".
 import { OPEN_STRINGS, noteName } from './music.ts';
 
-export interface TuneAttack { t: number; riseDb: number; band: string; riseMs?: number }
+export interface TuneAttack { t: number; riseDb: number; band: string }
 
 interface Pluck {
   t0: number;
-  /** how fast its attack rose (ms; 0 when the caller does not say) */
-  rise: number;
   /** (open string, cents from it, level dB) per settled frame */
   readings: { open: number; cents: number; db: number; tilt: number | null }[];
 }
@@ -53,11 +51,23 @@ export class TuneWatch {
    * the recent attack events.
    */
   push(t: number, midi: number | null, db: number, attacks: TuneAttack[] = [], tilt: number | null = null): void {
+    // (the plain "that is X" line is about the note plucked twice: once other notes have been
+    // heard for a second and a half in all — sung or played — it no longer applies)
+    const said = this.neutral;
+    if (said && midi !== null) {
+      const dt = this.lastT === null ? 0 : Math.min(0.1, t - this.lastT);
+      if (Math.abs(midi - said.note) > 0.6) this.otherFor += dt;
+      if (this.otherFor >= 1.5) {
+        this.neutral = null;
+        this.otherFor = 0;
+      }
+    }
+    this.lastT = t;
     const fresh = attacks.filter((a) => ((a.band === 'full' && a.riseDb >= 8) || (a.band === 'hf' && a.riseDb >= 12)) && a.t > this.lastAttack + 0.2 && t - a.t < 0.5);
     if (fresh.length) {
       this.finish();
       this.lastAttack = Math.max(...fresh.map((a) => a.t));
-      this.pluck = { t0: this.lastAttack, rise: Math.min(...fresh.map((a) => a.riseMs ?? 0)), readings: [] };
+      this.pluck = { t0: this.lastAttack, readings: [] };
     }
     const p = this.pluck;
     if (!p) return;
@@ -127,13 +137,12 @@ export class TuneWatch {
     const offSemitone = Math.abs(cents - 100 * Math.round(cents / 100));
     if (Math.abs(cents) >= FAR_CENTS && offSemitone < 30 && !(open === OPEN_STRINGS[0] && cents < 0)) {
       const note = open + Math.round(cents / 100);
-      // (said only of a note that began as sharply as a pluck — at full strength within 15 ms —
-      // or died away as fast as a string, 12 dB or more over the reading: a sung note can fall
-      // away a little and land on any semitone)
-      if (p.rise > 15 && head - tail < 12) return;
       const prev = this.offNote;
       this.offNote = { note, open, cents };
-      if (prev && prev.note === note && prev.open === open) this.neutral = { note, open, cents };
+      if (prev && prev.note === note && prev.open === open) {
+        this.neutral = { note, open, cents };
+        this.otherFor = 0;
+      }
       return;
     }
     this.offNote = null;
@@ -160,6 +169,9 @@ export class TuneWatch {
   /** two plucks in a row read the same note that is not an open string's (see finish) */
   private offNote: { note: number; open: number; cents: number } | null = null;
   private neutral: { note: number; open: number; cents: number } | null = null;
+  /** how long other notes than the one named have been heard (see push) */
+  private otherFor = 0;
+  private lastT: number | null = null;
 
   /** The warning (or neutral note) to show, or null. */
   message(): string | null {

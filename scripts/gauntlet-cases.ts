@@ -1119,6 +1119,95 @@ for (const name of ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']) {
   });
 }
 
+// ========================================================================== eleventh review (sounds already there at the step, tuner, review)
+// Child processes. Sing-step trials (e1): every honest case passes first try, never stuck; every
+// accidental case never passes. Sessions (e3): none stuck, no accidental advance or wrong-pitch
+// accept, 95 % first try per step kind. Tuner (e4) and review (e5), phrase X-Y-X (e6) as printed.
+{
+  const dir = new URL('./critic11/', import.meta.url).pathname;
+  const runC11 = (args: string[]): string => {
+    const env = { ...process.env };
+    delete env.BUILD_DIR;
+    const r = spawnSync(process.execPath, args, { cwd: dir, env, encoding: 'utf8', maxBuffer: 64 << 20 });
+    return `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  };
+  const one = (name: string, fails: string[], summary: string): GroupResult => ({ name, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails, ok: fails.length === 0, summary: fails.length ? `${summary} — ${fails.join('; ')}` : summary });
+  for (const g of ['H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'H7', 'H8', 'H9', 'H10', 'H11', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8', 'A9']) {
+    job(`critic11 e1 ${g}`, 6, g === 'A4' || g === 'H4', () => {
+      const rows = runC11(['e1.ts', `^${g}( |b|c|d|r)`]).split('\n').filter((l) => l.startsWith('{')).map((l) => JSON.parse(l) as { case: string; kind: string; res: string; lat?: number });
+      const cases = [...new Set(rows.map((r) => r.case))];
+      if (!cases.length) return [one(`critic11 e1 ${g}`, ['no result'], 'no trials')];
+      return cases.map((c) => {
+        const rs = rows.filter((r) => r.case === c && r.res !== 'setup-failed');
+        const label = `critic11 e1 ${c}`;
+        if (rs[0]?.kind === 'A') {
+          const adv = rs.filter((r) => r.res === 'ADVANCED').length;
+          return one(label, adv ? [`passed with nobody singing the note ${adv}/${rs.length}`] : [], `nobody singing the note: passed ${adv}/${rs.length}`);
+        }
+        const first = rs.filter((r) => r.res === 'first').length;
+        const stuck = rs.filter((r) => r.res === 'stuck').length;
+        const fails: string[] = [];
+        if (stuck) fails.push(`stuck ${stuck}/${rs.length}`);
+        if (first < rs.length) fails.push(`first try ${first}/${rs.length}`);
+        return one(label, fails, `honest: first try ${first}/${rs.length}, stuck ${stuck}`);
+      });
+    });
+  }
+  for (const pf of ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8']) {
+    const label = `critic11 e3 session ${pf}`;
+    job(label, 10, false, () => {
+      const out = runC11(['e3.ts', pf]);
+      let d: { sing: string; play: string; review: string; accidental: string[]; wrongPitchAccepts: number };
+      try {
+        d = JSON.parse(out.slice(out.indexOf('{')));
+      } catch {
+        return [one(label, ['no result'], out.slice(0, 200))];
+      }
+      const fails: string[] = [];
+      for (const [k, v] of [['sing', d.sing], ['play', d.play], ['review', d.review]] as const) {
+        const m = /(\d+)\/(\d+) first, (\d+) stuck/.exec(v);
+        if (!m) continue;
+        if (Number(m[3])) fails.push(`${k} stuck ${m[3]}`);
+        if (Number(m[1]) < Math.ceil(0.95 * Number(m[2]))) fails.push(`${k} first try ${m[1]}/${m[2]}`);
+      }
+      if (d.accidental.length) fails.push(`${d.accidental.length} accidental advances (${d.accidental.slice(0, 2).join('; ')})`);
+      if (d.wrongPitchAccepts) fails.push(`${d.wrongPitchAccepts} wrong-pitch accepts`);
+      return [one(label, fails, `sing ${d.sing} | play ${d.play} | review ${d.review}`)];
+    });
+  }
+  for (const t of ['open', 'openagc', 'fret', 'sung']) {
+    const label = `critic11 e4 tuner ${t}`;
+    job(label, 4, t === 'sung', () => {
+      const rows = runC11(['e4.ts', t]).split('\n').filter((l) => /: \d+\/\d+$/.test(l));
+      const fails = rows.filter((l) => {
+        const m = /: (\d+)\/(\d+)$/.exec(l)!;
+        return /want 0/.test(l) ? m[1] !== '0' : m[1] !== m[2];
+      });
+      return [one(label, rows.length ? fails : ['no result'], `${rows.length} rows, ${fails.length} not as expected`)];
+    });
+  }
+  job('critic11 e5 phrase review, repeated plucks', 8, false, () => {
+    const out = runC11(['e5.ts']);
+    const fails: string[] = [];
+    const m = /stuck \(8 plucks of one note refused\) (\d+) notes passed with no pluck \(double count\) (\d+)/.exec(out);
+    if (!m) fails.push('no result');
+    else {
+      if (m[1] !== '0') fails.push(`stuck ${m[1]}`);
+      if (m[2] !== '0') fails.push(`one pluck counted as two ${m[2]}`);
+    }
+    for (const l of out.split('\n').filter((x) => /first pluck \d+\/\d+/.test(x))) {
+      const q = /first pluck (\d+)\/(\d+)/.exec(l)!;
+      if (Number(q[1]) < Math.ceil(0.98 * Number(q[2]))) fails.push(l.trim());
+    }
+    return [one('critic11 e5 phrase review, repeated plucks', fails, out.split('\n').slice(0, 4).join(' | ').replace(/\s+/g, ' '))];
+  });
+  job('critic11 e6 X-Y-X: the older same-pitch string still ringing', 6, false, () => {
+    const out = runC11(['e6.ts']);
+    const m = /all: (\d+)\/(\d+)/.exec(out);
+    return [one('critic11 e6 X-Y-X: the older same-pitch string still ringing', !m ? ['no result'] : m[1] !== '0' ? [`passed with nobody singing ${m[1]}/${m[2]}`] : [], m ? `nobody singing: passed ${m[1]}/${m[2]}` : '')];
+  });
+}
+
 // ========================================================================== real recordings
 // Practice recordings made on phones (Settings → "Record this session for testing"), dropped into
 // recordings/ as NAME.wav + NAME.json: the engine must reproduce every accept the app logged.

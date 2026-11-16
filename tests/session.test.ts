@@ -130,7 +130,8 @@ describe('session state machine', () => {
       c.t += 0.02;
       expect(s.pitch({ t: c.t, freq: midiToFreq(55), clarity: 0.97, rms: 0.05 * Math.pow(10, (-15 * k * 0.02) / 20) })).toBe(false);
     }
-    expect(s.view().match?.hint).toBe('carryOver');
+    // (a repeated note: the string just plucked, or the reference's echo — said neutrally)
+    expect(s.view().match?.hint).toBe('stillSounding');
     c.quiet(s, 150);
     expect(c.sing(s, 55, 700)).toBe(true);
   });
@@ -270,6 +271,9 @@ describe('session state machine', () => {
       c.pluck(s, s.view().targetMidi, 400);
     }
     expect(s.view().phase).toBe('review');
+    expect(s.view().reviewBeat).toBe(true);
+    c.quiet(s, 600); // (the short beat before the review listens)
+    expect(s.view().reviewBeat).toBe(false);
     // 16th-note fast: each note 180 ms, no gaps (the previous note keeps ringing, quieter)
     for (const m of [55, 52, 48, 52, 55, 60]) c.pluck(s, m, 180);
     expect(s.view().phase).toBe('listen');

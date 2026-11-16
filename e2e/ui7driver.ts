@@ -49,8 +49,11 @@ export const INIT = `(() => {
   if (window.__fakeShare) { navigator.canShare = (d) => true; navigator.share = async (d) => { for (const f of d.files) { const b = new Uint8Array(await f.arrayBuffer()); let s = ''; for (let i = 0; i < b.length; i += 32768) s += String.fromCharCode.apply(null, b.subarray(i, i + 32768)); window.__shared.push({ name: f.name, type: f.type, b64: btoa(s) }); } }; }
 })();`;
 export async function server(dir = join(HERE, '..')) {
+  // (a server already answering on the port was not started here and may serve another build: refuse it)
+  if (await fetch(URL).then(() => true, () => false)) throw new Error(`port ${PORT} is already in use by a server this run did not start; stop it and run again`);
   const p = spawn('node', [join(dir, 'node_modules/vite/bin/vite.js'), 'preview', '--port', String(PORT), '--strictPort'], { cwd: dir, stdio: 'ignore' });
-  for (let i = 0; i < 60; i++) { try { const r = await fetch(URL); if (r.ok) return p; } catch { /* */ } await sleep(200); }
+  let exited = false; p.on('exit', () => (exited = true));
+  for (let i = 0; i < 60; i++) { if (exited) throw new Error('preview server exited before answering'); try { const r = await fetch(URL); if (r.ok) return p; } catch { /* */ } await sleep(200); }
   throw new Error('server did not start');
 }
 export const b64 = (f: Float32Array) => Buffer.from(f.buffer, f.byteOffset, f.byteLength).toString('base64');

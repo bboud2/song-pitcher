@@ -12,6 +12,9 @@ import { rmsToDb } from './pitch.ts';
 import type { Settings } from './settings.ts';
 import { phraseEndingAt, transpose, type Phrase, type Song } from './songs.ts';
 
+/** pause between the last note's accept and the phrase review's listening (s) */
+const REVIEW_BEAT_SEC = 0.6;
+
 export type Phase = 'listen' | 'sing' | 'play' | 'review' | 'done';
 export type ListenKind = 'note' | 'phrase';
 
@@ -49,6 +52,8 @@ export interface SessionView {
   match: MatchState | null;
   /** Phrase review: notes, and how many have been played correctly so far. */
   review: { phrase: Phrase; notes: number[]; pos: number } | null;
+  /** Phrase review just began: a short beat before listening, to say what comes next. */
+  reviewBeat: boolean;
   stats: NoteStats[];
   reviews: ReviewStats[];
   startIndex: number;
@@ -83,6 +88,9 @@ export class Session {
   private reviewPos = 0;
   private reviewStart = 0;
   private reviewMistakes = 0;
+  private reviewBeatUntil = -Infinity;
+  /** time of the latest frame seen (for the review beat in view) */
+  private lastFrameT = -Infinity;
   private started = false;
   /** Pitch heard when the singing step was accepted (cleared when a new note starts). */
   private sungMidi: number | undefined;
@@ -232,8 +240,14 @@ export class Session {
     if (!this.started || !this.matcher || (this.phase !== 'sing' && this.phase !== 'play' && this.phase !== 'review')) {
       return false;
     }
+    this.lastFrameT = f.t;
     this.recent.push(f);
     while (this.recent.length && this.recent[0].t < f.t - 1.2) this.recent.shift();
+    if (this.phase === 'review' && f.t < this.reviewBeatUntil) {
+      // (heard, as context for the first note — not judged)
+      this.matcher.prime([f]);
+      return false;
+    }
     const s = this.matcher.push(f);
     if (!s.accepted) return false;
     this.lastAccepted = s;
@@ -288,6 +302,9 @@ export class Session {
       this.reviewMistakes = 0;
       this.reviewStart = t;
       this.attemptCarry = 0;
+      // (a short beat before the review listens: the last note was only just accepted, and the
+      // student is told to play the whole phrase now)
+      this.reviewBeatUntil = t + REVIEW_BEAT_SEC;
       this.startReviewMatcher();
       return;
     }
@@ -362,6 +379,7 @@ export class Session {
       review: p && (this.phase === 'review' || (this.phase === 'listen' && this.next === 'review'))
         ? { phrase: p, notes: reviewNotes, pos: this.reviewPos }
         : null,
+      reviewBeat: this.phase === 'review' && this.reviewPos === 0 && this.lastFrameT < this.reviewBeatUntil,
       stats: this.stats.map((s) => ({ ...s })),
       reviews: this.reviews.map((r) => ({ ...r })),
       startIndex: this.startIndex,

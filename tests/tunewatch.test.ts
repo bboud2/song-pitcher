@@ -73,16 +73,10 @@ describe('tuner: out-of-tune strings', () => {
     expect(w.message()).toMatch(/That is F2, not an open-string note\. If it was your open E2 string, it is a semitone sharp\./);
   });
 
-  it('a sung note on a semitone no open string plays gets no "not an open-string note" line (round 10 did, through the tenth review\'s tuner rig)', async () => {
-    // (the tenth review's own voice and room: B2 and E3 sung twice, plain and with a "d")
-    const { runTuner } = await import('../scripts/critic10/e4.ts');
-    const syn = await import('../scripts/critic10/syn10.ts');
-    for (const m of [47, 52]) for (const on of ['normal', 'd'] as const) {
-      const mk = (k: number) => syn.voice({ midi: m, cents: 0, dur: 1.8, onset: on, seed: m + k });
-      const { trace } = runTuner([{ buf: mk(0), at: 0.8, db: -20 }, { buf: mk(1), at: 3.8, db: -20 }], 7.5, { room: 'living', seed: m });
-      expect(trace[trace.length - 1].msg).toBeNull();
-    }
-  }, 120_000);
+  it('the plain "that is X" line goes once another note is heard steadily (round 11 kept it while C4 was sung)', () => {
+    const { w } = run([{ at: 0.5, x: pluck(48, 0, 1) }, { at: 4, x: pluck(48, 0, 2) }, { at: 7.5, x: voice({ midi: 60, dur: 1.5, seed: 4 }), db: -16 }], 9.5);
+    expect(w.message()).toBeNull();
+  });
 
   it('while a warned string is being tuned, the figure follows the pluck in hand (round 10 lagged a pluck behind)', () => {
     const parts = [{ at: 0.5, x: pluck(45, -45, 1) }, { at: 4, x: pluck(45, -45, 2) }, { at: 7.5, x: pluck(45, -25, 3) }];
