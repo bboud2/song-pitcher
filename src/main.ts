@@ -218,7 +218,7 @@ function tunerScreen(): HTMLElement {
       peakDb = Math.max(db, peakDb - 1.5);
       level.style.width = `${Math.max(0, Math.min(100, ((peakDb + 80) / 70) * 100))}%`;
       let m = stable.push(f);
-      watch.push(f.t, m, db, f.attacks ?? []);
+      watch.push(f.t, m, db, f.attacks ?? [], f.tiltDb ?? null);
       // Mains hum (50/60 Hz and its low harmonics) is not a note: never show it or count it as heard,
       // unless a string was just plucked (a D string 35 c sharp sits right on 150 Hz).
       if (m !== null && isMainsHum(440 * Math.pow(2, (m - 69) / 12)) && !watch.plucking(f.t)) m = null;
@@ -256,7 +256,10 @@ function tunerScreen(): HTMLElement {
       noteEl.textContent = noteName(nn.midi);
       noteEl.classList.remove('placeholder');
       hzEl.textContent = `${hz.toFixed(1)} Hz`;
-      meter.set(nn.cents, 5);
+      // (the tuner tunes open strings: a centred needle on a note no open string plays would read
+      // as "in tune" for a string that may be a semitone off)
+      if (OPEN_STRINGS.includes(nn.midi)) meter.set(nn.cents, 5);
+      else meter.set(null, 5, { idle: 'Not an open-string note' });
       for (const st of strings.children) (st as HTMLElement).dataset.on = String(Number((st as HTMLElement).dataset.midi) === nn.midi);
     }, () => 'guitar', ['voice']);
   }
@@ -792,6 +795,8 @@ const HINT_TEXT: Record<string, Record<string, string>> = {
   },
 };
 HINT_TEXT.review = HINT_TEXT.play;
+// (for the end-to-end layout test: every hint the session can show)
+(window as unknown as { __songPitcherHints: string[] }).__songPitcherHints = [...new Set(Object.values(HINT_TEXT).flatMap((m) => Object.values(m)))];
 // Hints that only appear when the pitch is (nearly) right: hidden when the meter is off.
 const PITCH_REVEALING_HINTS = new Set(['octaveHigh', 'octaveLow', 'ringing', 'outOfTune', 'carryOver']);
 

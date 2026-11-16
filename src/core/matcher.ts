@@ -74,6 +74,8 @@ export interface FrameAttack {
   band: 'full' | 'hf' | 'mid';
   /** see AttackEvent.edgeDb */
   edgeDb?: number;
+  /** see AttackEvent.carried */
+  carried?: boolean;
 }
 
 export type MatchMode = 'pitchClass' | 'exact';
@@ -112,6 +114,8 @@ export interface MatchConfig {
   holdMs: number;
   /** Exact pitch that may still be ringing from the previous step (guards carry-over). */
   carryMidi?: number;
+  /** The reference tone just played for this step: its tail in a live room is not the student. */
+  refMidi?: number;
   /** Strict mode: level slope over the hold window must be above this (dB/s). */
   minDbSlope: number;
 
@@ -659,7 +663,11 @@ export class NoteMatcher {
       // pitch wobble, for 2 s on end is not a string left ringing)
       const heldLikeVoice = f.t - segT >= 2.0 && dbSlope >= -1 && pitchSd >= 2;
       const stringSound = lastPluck !== undefined && !voiceSince && f.t - lastPluck.t < 12 && !heldLikeVoice;
-      const carry = (fromStart && pcDiff < 0.6 && (dbSlope < -1.5 || pitchSd < 3)) || stringSound;
+      // (and the same for the reference tone the app just played: in a very live room its tail
+      // is still sounding, at the target's pitch, when the step opens)
+      const pcRef = c.refMidi === undefined ? 99 : Math.abs(((((this.cfg.targetMidi + v2 / 100 - c.refMidi) % 12) + 18) % 12) - 6);
+      // (the reference's tail is told by its dying away: a singer holding the note does not)
+      const carry = (fromStart && ((pcDiff < 0.6 && (dbSlope < -1.5 || pitchSd < 3)) || (pcRef < 0.6 && dbSlope < -1.5))) || stringSound;
       let sustainedOk = true;
       if (c.strict) {
         const mid = f.t - c.holdMs / 2000;
@@ -991,10 +999,11 @@ export class NoteMatcher {
             cand.steadySince = undefined;
             cand.identity = wm;
             cand.lastWindowMidi = wm;
-          } else if (jump > 1.5 && flip && t - cand.onsetT <= 0.35 && cand.lastWindowMidi !== null && wm > cand.lastWindowMidi && Math.abs(this.deviation(cand.lastWindowMidi)) <= c.toleranceCents) {
+          } else if (jump > 1.5 && flip && t - cand.onsetT <= 0.35 && cand.lastWindowMidi !== null && !(c.repeatOnsets && c.ignoreMidi !== undefined && Math.abs(cand.lastWindowMidi - c.ignoreMidi) < 0.6) && wm > cand.lastWindowMidi && Math.abs(this.deviation(cand.lastWindowMidi)) <= c.toleranceCents) {
             // (...and the other way: a note already read on the target that reads an octave or
             // two higher for a moment — its upper partials while it is fresh — is still that note;
-            // this window does not count)
+            // this window does not count. Not over a note already ringing: there the flip can be
+            // the old note's misread, and keeping the candidate lets the old note pass for a pluck)
             cand.steadySince = undefined;
           } else if (jump > 1.5 && (flip || jump > 5 || t - cand.onsetT > 0.5)) {
             // the reading jumped by an octave/fifth (a dying note's misread, hum) or far, late:
@@ -1084,9 +1093,10 @@ export class NoteMatcher {
                 // (still deciding what made the attack: remember that the note was right, in case
                 // it is decided only after another string or the room has taken over the reading)
                 if (cand.source !== 'voice') cand.ready ??= wm;
-              } else if (db < cand.peakDb - 30) {
-                // (never on the last breath of a sound: 30 dB under its peak the reading is the
-                // room's noise as much as the note, and it can read an octave off)
+              } else if ((db < cand.peakDb - 30 && t - cand.onsetT > 0.4) || this.attackless(cand)) {
+                // (never on the last breath of a sound: 30 dB under its peak, late in its decay,
+                // the reading is the room's noise as much as the note and can read an octave off —
+                // a palm-muted or staccato pluck gets there fast, and still counts)
               } else if (!c.strict || cand.decay === 'confirmed') {
                 accepted = !c.neverAccept;
                 accMidi = wm;
@@ -1109,7 +1119,7 @@ export class NoteMatcher {
             }
           }
         } else if (cand.steadySince !== undefined && !c.strict && (!c.needPluck || cand.source === 'pluck') && cand.identity !== null && this.deviation(cand.identity) > -50 && t - cand.steadySince >= c.persistMs / 1000 - 1e-6 && this.dwelled(cand, t) &&
-          [nov, bl].some((k) => k.members.length >= 3 && Math.abs(this.deviation(median(k.members))) <= c.toleranceCents)) {
+          [nov, bl].some((k) => k.members.length >= 3 && Math.abs(this.deviation(median(k.members))) <= c.toleranceCents) && !this.attackless(cand)) {
           // The note read steady on the target in the previous window and still reads it in at least
           // three frames now (a fast-dying note slipping into noise): that is enough.
           accepted = !c.neverAccept;
@@ -1227,6 +1237,20 @@ export class NoteMatcher {
     return (full.length ? Math.max(...full) : 0) <= a.riseDb - 6;
   }
 
+  /**
+   * Phrase review, a repeated note: a "re-pluck" of the note already ringing that neither raised the level by 4 dB
+   * nor showed any attack (no band rose 8 dB around it) is the old note swelling — two
+   * polarisations beating — not a new pluck.
+   */
+  private attackless(cand: Candidate): boolean {
+    if (!this.cfg.repeatOnsets || !cand.preSounding) return false;
+    // (only a repeated note: the note ringing before is this one)
+    const rep = (m: number | null | undefined) => m !== null && m !== undefined && Math.abs(m - this.cfg.targetMidi) <= 0.6;
+    if (!rep(cand.preMidi) && !rep(this.cfg.ignoreMidi)) return false;
+    if (cand.peakDb - (cand.preLast ?? -Infinity) >= 4) return false;
+    return !this.atk.some((a) => a.riseDb >= 8 && a.t >= cand.onsetT - 0.15 && a.t <= cand.onsetT + 0.05);
+  }
+
   private near(a: FrameAttack, band: FrameAttack['band']): FrameAttack | undefined {
     // (the full band's start can be marked a little early by a slow body resonance or the room)
     return this.atk.find((b) => b.band === band && Math.abs(b.t - a.t) < (band === 'mid' ? 0.05 : 0.03));
@@ -1234,7 +1258,13 @@ export class NoteMatcher {
 
   /** Merge the stream analyser's attack events into the matcher's own list. */
   private mergeAttacks(f: PitchFrame): void {
+    const c = this.cfg;
+    // Attacks from before this step are remembered across the reference (see AttackTracker.clear)
+    // only for one question: in the singing step of a repeated note, was the sound still ringing
+    // from the previous step started by a pluck? Everywhere else this step starts afresh.
+    const keepOld = c.kind === 'sung' && c.carryMidi !== undefined && Math.abs(((((c.targetMidi - c.carryMidi) % 12) + 18) % 12) - 6) < 0.6;
     for (const a of f.attacks ?? []) {
+      if (!keepOld && a.carried) continue;
       if (!this.atk.some((b) => b.band === a.band && Math.abs(b.t - a.t) < 0.004)) this.atk.push(a);
     }
     while (this.atk.length && this.atk[0].t < f.t - 10) this.atk.shift();

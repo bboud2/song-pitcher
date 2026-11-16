@@ -187,6 +187,7 @@ export class Session {
       ...cfg,
       ignoreMidi: prev,
       carryMidi: this.phase === 'sing' ? prev : undefined,
+      refMidi: this.phase === 'sing' ? target : undefined,
       voiceMidi: this.phase === 'play' ? this.sungMidi : undefined,
     });
   }

@@ -960,6 +960,58 @@ for (const name of ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']) {
   }
 }
 
+// ========================================================================== ninth review (rooms by RT, phone chains, idle rooms, tuner)
+// Child processes, like the eighth review's. Sessions: none stuck, no accidental advance, at most
+// 5 % re-plucks and extra breaths. Probe rows: rows that should pass ("honest", "should be all",
+// "accepted first try") must pass every time, every other row never.
+{
+  const dir = new URL('./critic9/', import.meta.url).pathname;
+  const runC9 = (args: string[]): string => {
+    const env = { ...process.env };
+    delete env.BUILD_DIR;
+    const r = spawnSync(process.execPath, args, { cwd: dir, env, encoding: 'utf8', maxBuffer: 64 << 20 });
+    return `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  };
+  for (let k = 1; k <= 14; k++) {
+    const label = `critic9 session a${k}`;
+    job(label, 10, k === 1, () => {
+      const out = runC9(['sess9.ts', `a${k}`, '1']);
+      const first = out.split('\n')[0];
+      const m = /sing1st (\d+)\/(\d+) stuck (\d+) \| play1st (\d+)\/(\d+) stuck (\d+) \| rev1st (\d+)\/(\d+) stuck (\d+) \| bad (\d+)/.exec(first);
+      if (!m) return [{ name: label, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: ['no result'], ok: false, summary: out.slice(0, 300) }];
+      const [sf, ss, sst, pf, ps, pst, , , rst, bad] = m.slice(1).map(Number);
+      const lim = (x: number) => Math.max(1, Math.ceil(0.05 * x));
+      const problems: string[] = [];
+      if (sst + pst + rst) problems.push(`stuck on ${sst + pst + rst}`);
+      if (bad) problems.push(`${bad} accidental advances`);
+      if (ps - pf - pst > lim(ps)) problems.push(`${ps - pf - pst}/${ps} notes needed another pluck`);
+      if (ss - sf - sst > lim(ss)) problems.push(`${ss - sf - sst}/${ss} notes needed another breath`);
+      const summary = out.split('\n')[0].replace(/\s+/g, ' ');
+      return [{ name: label, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: problems, ok: problems.length === 0, summary: problems.length ? `${summary} — ${problems.join('; ')}` : summary }];
+    });
+  }
+  const rowsOf = (out: string) => out.split('\n').filter((l) => /\d+\/\d+/.test(l) && !l.startsWith(' '));
+  const shouldAll = (l: string) => /should be all|honest|accepted first try|NOT shown|no warning|warned/.test(l);
+  const probes: [string, string[]][] = [
+    ['probes9.ts', ['wrong', '-12', '12']], ['probes9.ts', ['quiet']], ['probes9.ts', ['idle']], ['probes9.ts', ['singwrong']], ['probes9.ts', ['carry']], ['probes9.ts', ['voiceplay']],
+    ['probes9b.ts', ['ownref']], ['probes9b.ts', ['repeat']], ['probes9b.ts', ['singhonest']],
+    ['tuner9.ts', ['off', '50', '-50', '75', '-75', '90', '-90', '120', '-120', '150']], ['tuner9.ts', ['fret', '0', '15', '25', '30']], ['tuner9.ts', ['intune', '0', '15', '-15']],
+  ];
+  for (const [file, args] of probes) {
+    const label = `critic9 ${file.startsWith('tuner') ? 'tuner' : 'probe'} ${args.join(' ')}`;
+    job(label, 8, false, () => {
+      const out = runC9([file, ...args]);
+      const rows = rowsOf(out);
+      const bad = rows.filter((l) => {
+        const m = /(\d+)\/(\d+)/.exec(l.slice(Math.max(0, l.indexOf(':'))));
+        if (!m) return false;
+        return shouldAll(l) ? m[1] !== m[2] : m[1] !== '0';
+      }).map((l) => l.replace(/\s+/g, ' ').slice(0, 150));
+      return [{ name: label, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails: bad, ok: rows.length > 0 && bad.length === 0, summary: `${rows.length} rows, ${bad.length} not as expected${bad.length ? ': ' + bad.slice(0, 3).join(' | ') : ''}` }];
+    });
+  }
+}
+
 // ========================================================================== real recordings
 // Practice recordings made on phones (Settings → "Record this session for testing"), dropped into
 // recordings/ as NAME.wav + NAME.json: the engine must reproduce every accept the app logged.

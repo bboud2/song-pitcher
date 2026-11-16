@@ -14,7 +14,7 @@ export interface TuneAttack { t: number; riseDb: number; band: string }
 interface Pluck {
   t0: number;
   /** (open string, cents from it, level dB) per settled frame */
-  readings: { open: number; cents: number; db: number }[];
+  readings: { open: number; cents: number; db: number; tilt: number | null }[];
 }
 
 export interface PluckResult { open: number; cents: number; t: number }
@@ -50,7 +50,7 @@ export class TuneWatch {
    * One analysed frame: `midi` is the (fractional) stable pitch or null, `db` the level, `attacks`
    * the recent attack events.
    */
-  push(t: number, midi: number | null, db: number, attacks: TuneAttack[] = []): void {
+  push(t: number, midi: number | null, db: number, attacks: TuneAttack[] = [], tilt: number | null = null): void {
     const fresh = attacks.filter((a) => ((a.band === 'full' && a.riseDb >= 8) || (a.band === 'hf' && a.riseDb >= 12)) && a.t > this.lastAttack + 0.2 && t - a.t < 0.5);
     if (fresh.length) {
       this.finish();
@@ -80,7 +80,7 @@ export class TuneWatch {
         }
       }
     }
-    if (best) p.readings.push({ ...best, db });
+    if (best) p.readings.push({ ...best, db, tilt });
   }
 
   /** Measure the pluck in progress (if it holds a settled, decaying note) and update the warning. */
@@ -98,12 +98,25 @@ export class TuneWatch {
     const k = Math.max(2, Math.floor(rs.length / 3));
     const head = median(rs.slice(0, k).map((r) => r.db));
     const tail = median(rs.slice(-k).map((r) => r.db));
-    if (head - tail < 2) return;
-    // a fretted note sits on a semitone (give or take a sharp fret's 30 c); a string that far out
-    // is not told apart from it, so it is not reported (it reads as the neighbouring note)
+    // (a phone's gain control can hold the level up: then the upper partials dying away against
+    // the fundamental still show a string — a voice keeps its colour)
+    const tl = rs.map((r) => r.tilt).filter((x): x is number => x !== null);
+    const tiltDrop = tl.length >= 2 * k ? median(tl.slice(0, k)) - median(tl.slice(-k)) : 0;
+    if (head - tail < 2 && tiltDrop < 3) return;
+    // a fretted note sits on a semitone (give or take a sharp fret's 30 c): such a reading is not
+    // reported as a string out of tune — but said plainly when two plucks agree on it (below)
+    // (a reading below E2 can only be the low E string)
     const cents = median(cs);
     const offSemitone = Math.abs(cents - 100 * Math.round(cents / 100));
-    if (Math.abs(cents) >= FAR_CENTS && offSemitone < 30) return;
+    if (Math.abs(cents) >= FAR_CENTS && offSemitone < 30 && !(open === OPEN_STRINGS[0] && cents < 0)) {
+      const note = open + Math.round(cents / 100);
+      const prev = this.offNote;
+      this.offNote = { note, open, cents };
+      if (prev && prev.note === note && prev.open === open) this.neutral = { note, open, cents };
+      return;
+    }
+    this.offNote = null;
+    this.neutral = null;
     const res = { open, cents, t: p.t0 };
     this.measured.push(res);
     const list = [...(this.byString.get(open) ?? []), res].slice(-2);
@@ -122,9 +135,19 @@ export class TuneWatch {
     }
   }
 
-  /** The warning to show, or null. */
+  /** two plucks in a row read the same note that is not an open string's (see finish) */
+  private offNote: { note: number; open: number; cents: number } | null = null;
+  private neutral: { note: number; open: number; cents: number } | null = null;
+
+  /** The warning (or neutral note) to show, or null. */
   message(): string | null {
     const w = this.warn;
+    if (!w && this.neutral) {
+      const n = this.neutral;
+      const steps = Math.round(n.cents / 100);
+      const dist = Math.abs(steps) === 1 ? 'a semitone' : `${Math.abs(steps)} semitones`;
+      return `That is ${noteName(n.note)}, not an open-string note. If it was your open ${noteName(n.open)} string, it is ${dist} ${steps > 0 ? 'sharp' : 'flat'}.`;
+    }
     if (!w) return null;
     const name = noteName(w.open);
     const dir = w.cents > 0 ? 'sharp' : 'flat';

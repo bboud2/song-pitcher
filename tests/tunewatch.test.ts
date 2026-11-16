@@ -68,10 +68,11 @@ describe('tuner: out-of-tune strings', () => {
     expect(w.message()).toBeNull();
   });
 
-  it('a fretted note a semitone from an open string does not warn as "far out of tune"', () => {
+  it('a fretted note a semitone from an open string is named plainly, not warned as "far out of tune" (round 10)', () => {
     const { w } = run([{ at: 0.5, x: pluck(41, 0, 1) }, { at: 4, x: pluck(41, 0, 2) }], 7.5);
-    expect(w.message()).toBeNull();
+    expect(w.message()).toMatch(/That is F2, not an open-string note\. If it was your open E2 string, it is a semitone sharp\./);
   });
+
 
   it('the warning clears when an in-tune pluck of that string is heard', () => {
     const { w } = run([{ at: 0.5, x: pluck(50, 40, 1) }, { at: 4, x: pluck(50, 40, 2) }, { at: 7.5, x: pluck(50, 2, 3) }], 11);

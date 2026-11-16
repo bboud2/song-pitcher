@@ -482,6 +482,24 @@ async function hitRun(wav: string): Promise<void> {
       const m = document.querySelector('[data-testid="mark"]')!.getBoundingClientRect();
       return { controlsBottom: Math.round(c.bottom), h: innerHeight, markH: Math.round(m.height), markW: Math.round(m.width) };
     });
+    // every hint the session can show, in the status line: the controls stay fully on screen
+    const hintFits = await page.evaluate(() => {
+      const st = document.querySelector('[data-testid="status"]') as HTMLElement;
+      const bad: string[] = [];
+      for (const txt of (window as unknown as { __songPitcherHints: string[] }).__songPitcherHints) {
+        st.textContent = txt;
+        scrollTo(0, 0);
+        for (const sel of ['[data-testid="replay"]', '[data-testid="key"]', '[data-testid="skip"]']) {
+          const el = document.querySelector(sel) as HTMLElement | null;
+          if (!el) continue;
+          const r = el.getBoundingClientRect();
+          const e = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+          if (r.bottom > innerHeight || r.top < 0 || !e || !(e === el || el.contains(e))) bad.push(`${sel} with "${txt.slice(0, 30)}"`);
+        }
+      }
+      return bad;
+    });
+    check(hintFits.length === 0, `${tag} recording: Replay/Key/Skip fully on screen with every hint text (${hintFits.slice(0, 3).join('; ') || 'all fit'})`);
     check(geo.controlsBottom <= geo.h && geo.markH >= 44, `${tag} recording: Replay/Key/Skip on screen without scrolling, Mark a 44 px target (${JSON.stringify(geo)})`);
     // browser Back mid-session ends the session in the app (summary), it does not leave it
     await page.goBack();
@@ -590,6 +608,23 @@ async function layoutRun(wav: string): Promise<void> {
       return c.bottom <= window.innerHeight + 1 && document.documentElement.scrollWidth <= window.innerWidth + 1;
     });
     check(fits, `[layout ${name}] session controls on screen, no horizontal scroll`);
+    const hintFitsOff = await page.evaluate(() => {
+      const st = document.querySelector('[data-testid="status"]') as HTMLElement | null;
+      if (!st) return ['no status line'];
+      const bad: string[] = [];
+      for (const txt of (window as unknown as { __songPitcherHints: string[] }).__songPitcherHints) {
+        st.textContent = txt;
+        scrollTo(0, 0);
+        for (const sel of ['[data-testid="replay"]', '[data-testid="key"]', '[data-testid="skip"]']) {
+          const el = document.querySelector(sel) as HTMLElement | null;
+          if (!el) continue;
+          const r = el.getBoundingClientRect();
+          if (r.bottom > innerHeight + 0.5 || r.top < 0) bad.push(`${sel} with "${txt.slice(0, 30)}"`);
+        }
+      }
+      return bad;
+    });
+    if (!name.startsWith('landscape')) check(hintFitsOff.length === 0, `[layout ${name}] recording off: Replay/Key/Skip on screen with every hint text (${hintFitsOff.slice(0, 3).join('; ') || 'all fit'})`);
     await page.screenshot({ path: join(SHOTS, `layout-${name}-sing.png`) });
     await ctx.close();
   }

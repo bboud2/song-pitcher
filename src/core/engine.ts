@@ -85,6 +85,7 @@ export class StreamAnalyzer {
   }
 
   frame(path: AnalysisPath, t: number): PitchFrame {
+    this.attacks.mark();
     const r = this.det[path].detect(path === 'guitar' ? this.hp : this.lp, t);
     return { t, freq: r.freq, clarity: r.clarity, rms: r.rms, upClarity: r.upClarity ?? 0, cleanRms: r.cleanRms, nsdf: r.nsdf, sr: this.sampleRate, novFreq: r.novFreq, novClarity: r.novClarity, novShare: r.novShare, hfDb: r.hfDb, tiltDb: r.tiltDb, novOddDb: r.novOddDb, attacks: this.recentAttacks(t) };
   }
@@ -95,7 +96,7 @@ export class StreamAnalyzer {
     const out: FrameAttack[] = [];
     for (const e of a.events) {
       const et = t - (a.samples - e.sample) / this.sampleRate;
-      if (t - et <= 10) out.push({ t: et, riseMs: e.riseMs, riseDb: e.riseDb, band: e.band, edgeDb: e.edgeDb });
+      if (t - et <= 10) out.push({ t: et, riseMs: e.riseMs, riseDb: e.riseDb, band: e.band, edgeDb: e.edgeDb, ...(e.carried ? { carried: true } : {}) });
     }
     return out;
   }

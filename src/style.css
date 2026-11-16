@@ -359,3 +359,12 @@ body.flash .stage { animation: flash 0.6s ease-out; }
 @media (max-height: 700px) and (orientation: portrait) {
   .tuner.checking .tuner-card { display: none; }
 }
+
+/* The session's controls stay on screen whatever the hint says (a two-line hint must not push
+   Replay/Key/Skip below the fold on a small phone): they stick to the bottom. */
+.session .controls { position: sticky; bottom: 0; z-index: 2; background: var(--bg); padding: 8px 0 max(4px, env(safe-area-inset-bottom)); }
+.session .status { overflow-wrap: anywhere; }
+@media (max-height: 700px) and (orientation: portrait) {
+  .session .status { font-size: 1.1rem; line-height: 1.25; }
+  .controls .btn.big { min-height: 56px; }
+}

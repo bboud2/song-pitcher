@@ -30,6 +30,8 @@ export interface AttackEvent {
    * of the sound arrives at once. A pluck's direct sound arrives in one go, whatever the room
    * adds afterwards; a voice builds up over several glottal cycles. */
   edgeDb: number;
+  /** heard before the last time the analysis stopped listening (kept through our own sound) */
+  carried?: boolean;
 }
 
 const BLOCK_MS = 1;
@@ -166,8 +168,22 @@ export class AttackTracker {
     }
   }
 
-  /** forget everything heard so far (e.g. our own reference tone) */
+  /** samples pushed when the analysis last read a frame (see mark) */
+  private markSample = -1;
+
+  /** The analysis read a frame now: what was heard up to here was listened to. */
+  mark(): void {
+    this.markSample = this.samples;
+  }
+
+  /**
+   * Forget what was heard while nobody listened — our own reference tone and its tail — but keep
+   * the attacks heard before it (the pluck that ended the last step is still a pluck: a string
+   * left ringing into the next step must not be taken for a voice).
+   */
   clear(): void {
+    const keep = this.events.filter((e) => e.sample <= this.markSample).map((e) => ({ ...e, carried: true }));
     this.events.length = 0;
+    this.events.push(...keep);
   }
 }
