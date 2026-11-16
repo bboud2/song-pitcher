@@ -7,6 +7,9 @@
 // fixtures2.ts (additive strings + formant voices) and fixtures3.ts (two-polarisation strings,
 // source-filter voices, rooms, phone processing), plus the review's ported conditions.
 import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { StreamAnalyzer, guitarConfig, singConfig, HOP_MS, FRAME_SIZE, type AnalysisPath } from '../src/core/engine.ts';
 import { NoteMatcher, type MatchConfig, type PitchFrame } from '../src/core/matcher.ts';
 import { noteName } from '../src/core/music.ts';
@@ -1205,6 +1208,83 @@ for (const name of ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']) {
     const out = runC11(['e6.ts']);
     const m = /all: (\d+)\/(\d+)/.exec(out);
     return [one('critic11 e6 X-Y-X: the older same-pitch string still ringing', !m ? ['no result'] : m[1] !== '0' ? [`passed with nobody singing ${m[1]}/${m[2]}`] : [], m ? `nobody singing: passed ${m[1]}/${m[2]}` : '')];
+  });
+}
+
+// ========================================================================== twelfth review (sing-along singers, nobody singing, sessions)
+// Child processes, run from a scratch directory (the review's scripts write their rows to ./out).
+// Sing-along singers pass every step first try; nobody-sings conditions never pass; sessions are
+// never stuck and have no accidental advance; wrong notes never pass.
+{
+  const dir = new URL('./critic12/', import.meta.url).pathname;
+  const runC12 = (args: string[]): { file: string; rows: Record<string, unknown>[] } => {
+    const env = { ...process.env };
+    delete env.BUILD_DIR;
+    const cwd = mkdtempSync(join(tmpdir(), 'critic12-'));
+    mkdirSync(join(cwd, 'out'));
+    const r = spawnSync(process.execPath, [join(dir, args[0]), ...args.slice(1)], { cwd, env, encoding: 'utf8', maxBuffer: 64 << 20 });
+    const rows = `${r.stdout ?? ''}`.split('\n').filter((l) => l.startsWith('{')).map((l) => JSON.parse(l) as Record<string, unknown>);
+    return { file: args[0], rows };
+  };
+  const one = (name: string, fails: string[], summary: string): GroupResult => ({ name, kind: 'S' as Kind, n: 1, acc: 0, tta: [], oct: 0, fails, ok: fails.length === 0, summary: fails.length ? `${summary} — ${fails.join('; ')}` : summary });
+  for (const room of ['dry', 'carpet', 'living', 'kitchen']) {
+    const label = `critic12 e1b sing-along singers, ${room}`;
+    job(label, 6, room === 'dry', () => {
+      const { rows } = runC12(['e1b.ts', room]);
+      if (!rows.length) return [one(label, ['no result'], '')];
+      const first = rows.reduce((a, r) => a + (r.first as number), 0);
+      const n = rows.reduce((a, r) => a + (r.n as number), 0);
+      const stuck = rows.reduce((a, r) => a + (r.stuck as number), 0);
+      const fails = [...(stuck ? [`stuck ${stuck}/${n}`] : []), ...(first < n ? [`first try ${first}/${n}`] : [])];
+      return [one(label, fails, `first try ${first}/${n}, stuck ${stuck}`)];
+    });
+  }
+  job('critic12 e1c sing-along singers holding 10 s', 3, true, () => {
+    const { rows } = runC12(['e1c.ts']);
+    const never = rows.reduce((a, r) => a + (r.neverIn10s as number), 0);
+    const waits = rows.flatMap((r) => r.passedAfterSec as number[]);
+    return [one('critic12 e1c sing-along singers holding 10 s', rows.length ? (never ? [`never let through in 10 s: ${never}`] : []) : ['no result'], `passed after ${waits.length ? Math.max(...waits) : '-'} s at most, never ${never}`)];
+  });
+  job('critic12 e2 nobody sings', 20, false, () => {
+    const { rows } = runC12(['e2.ts']);
+    if (!rows.length) return [one('critic12 e2 nobody sings', ['no result'], '')];
+    return rows.map((r) => one(`critic12 e2 nobody sings: ${r.name}`, (r.pass as number) ? [`passed ${r.pass}/${r.n}`] : [], `passed ${r.pass}/${r.n}`));
+  });
+  job('critic12 e1 honest singers at the guard\'s edges', 20, false, () => {
+    const { rows } = runC12(['e1.ts', '.', 'living,hallway']);
+    if (!rows.length) return [one('critic12 e1 honest singers at the guard\'s edges', ['no result'], '')];
+    return rows.map((r) => {
+      const [first, n, stuck] = r.sing as number[];
+      const acc = (r.acc as unknown[]).length;
+      const fails = [...(stuck ? [`sing stuck ${stuck}`] : []), ...(first < n ? [`sing first try ${first}/${n}`] : []), ...(acc ? [`${acc} accidental advances`] : [])];
+      return one(`critic12 e1 ${r.name} ${r.room}`, fails, `sing ${first}/${n}, stuck ${stuck}, play ${(r.play as number[]).join('/')}, review ${(r.rev as number[]).join('/')}`);
+    });
+  });
+  for (const ses of ['s1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9']) {
+    const label = `critic12 e3 session ${ses}`;
+    job(label, 10, false, () => {
+      const { rows } = runC12(['e3.ts', `^${ses}_`]);
+      const d = rows[0] as { name: string; sing: { first: number; n: number; stuck: number }; play: { first: number; n: number; stuck: number }; rev: { first: number; n: number; stuck: number }; acc: string[] } | undefined;
+      if (!d) return [one(label, ['no result'], '')];
+      const fails: string[] = [];
+      for (const [k, v] of [['sing', d.sing], ['play', d.play], ['review', d.rev]] as const) {
+        if (v.stuck) fails.push(`${k} stuck ${v.stuck}`);
+        if (v.first < Math.ceil(0.95 * v.n)) fails.push(`${k} first try ${v.first}/${v.n}`);
+      }
+      if (d.acc.length) fails.push(`${d.acc.length} accidental advances (${d.acc.slice(0, 3).join(', ')})`);
+      return [one(`critic12 e3 ${d.name}`, fails, `sing ${d.sing.first}/${d.sing.n} play ${d.play.first}/${d.play.n} review ${d.rev.first}/${d.rev.n} accidental ${d.acc.length}`)];
+    });
+  }
+  job('critic12 e5 wrong notes and nobody playing', 10, false, () => {
+    const { rows } = runC12(['e5.ts', 'all']);
+    if (!rows.length) return [one('critic12 e5 wrong notes and nobody playing', ['no result'], '')];
+    return rows.map((r) => {
+      const key = `${r.test} ${r.d ?? r.c ?? r.name ?? ''}`.trim();
+      // (a note 40 c off is inside the tolerance: it should pass; everything else listed never)
+      const shouldPass = /off by cents/.test(String(r.test)) && Math.abs(Number(r.c)) <= 40;
+      const ok = shouldPass ? r.pass === r.n : r.pass === 0;
+      return one(`critic12 e5 ${key}`, ok ? [] : [`passed ${r.pass}/${r.n}`], `passed ${r.pass}/${r.n}`);
+    });
   });
 }
 

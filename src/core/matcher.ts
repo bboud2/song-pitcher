@@ -774,7 +774,12 @@ export class NoteMatcher {
       // step opened, with nothing new begun since the reference started, is not the student)
       // (that needs the reference to have been heard: the level it reached tells an echo from a
       // singer whose start it hid)
-      const refTail = pcRef < 0.6 && ((f.t - (this.firstT ?? f.t) < 0.5 && dbSlope < -1.5) || openSlope < -10 || (!this.newSound && f.mutePeakDb != null));
+      // (a way out of that: a sound that has held for a second without falling, with a voice's
+      // pitch wobble, is a singer who began with the reference and is holding the note — an echo
+      // falls, and a string or a steady tone does not wobble)
+      const heldSteadyVoice = f.t - (this.firstT ?? f.t) >= 1.0 && openSlope >= -1.5 && dbSlope >= -1.5 && pitchSd >= 2;
+      const undecided = !this.newSound && f.mutePeakDb != null && !heldSteadyVoice;
+      const refTail = pcRef < 0.6 && ((f.t - (this.firstT ?? f.t) < 0.5 && dbSlope < -1.5) || openSlope < -10 || undecided);
       const carry = (fromStart && ((pcDiff < 0.6 && (dbSlope < -1.5 || pitchSd < 3)) || refTail)) || stringSound;
       let sustainedOk = true;
       if (c.strict) {
@@ -792,7 +797,9 @@ export class NoteMatcher {
       // same pitch as the note just played it may be that string or the reference's echo — said
       // neutrally; otherwise it is the echo)
       if (!steady) hint = fromStart && !this.newSound ? null : 'moving';
-      else if (carry) hint = pcDiff < 0.6 ? 'stillSounding' : stringSound ? 'carryOver' : 'refEcho';
+      // (held back only because nothing new has been heard yet: it may be a singer who began under
+      // the reference — no line that says otherwise; "Listening…" is true either way)
+      else if (carry) hint = pcDiff < 0.6 ? 'stillSounding' : stringSound ? 'carryOver' : undecided && !(f.t - (this.firstT ?? f.t) < 0.5 && dbSlope < -1.5) && !(openSlope < -10) ? null : 'refEcho';
       else if (!sustainedOk) hint = 'decaying';
       if (steady && !carry && sustainedOk) {
         if (inTolNow) {
@@ -809,7 +816,7 @@ export class NoteMatcher {
     }
     // (a sound being held back — or, before it can be judged, one that was already there with
     // nothing new begun, at the pitch just heard — shows no needle and fills no hold bar)
-    if (!accepted && !refusing && !this.segOnset && !this.newSound && f.mutePeakDb != null) {
+    if (!accepted && !refusing && age < settledAge - 10 && !this.segOnset && !this.newSound && f.mutePeakDb != null) {
       const pcOf = (m: number | undefined) => (m === undefined ? 99 : Math.abs(((((this.cfg.targetMidi + v1 / 100 - m) % 12) + 18) % 12) - 6));
       refusing = pcOf(c.refMidi) < 0.6 || pcOf(c.carryMidi) < 0.6;
     }

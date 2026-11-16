@@ -214,6 +214,7 @@ function tunerScreen(): HTMLElement {
     const watch = new TuneWatch();
     const slips = new OctaveSlipFilter();
     let offOpenNote: { name: string; t: number } | null = null;
+    let openRun: { name: string; cents: number; since: number; last: number } | null = null;
     audio.listen((f) => {
       const db = 20 * Math.log10(Math.max(f.rms, 1e-6));
       peakDb = Math.max(db, peakDb - 1.5);
@@ -239,10 +240,16 @@ function tunerScreen(): HTMLElement {
         // (a note no open string plays — a fretted note, or a string a semitone or more off — gets
         // no "Good" from the room check: it is not yet a string in tune)
         const offOpen = offOpenNote !== null && f.t - offOpenNote.t < 1.5 ? offOpenNote.name : null;
-        const roomMsg = offOpen && v.level !== 'warn' ? `That is ${offOpen}, not an open string — pluck an open string to tune it.` : v.messages[0] ?? '';
+        // (an open string read steadily for half a second after a pluck: in tune, or not yet —
+        // said instead of the room check's "Good", which is about the microphone, not the string)
+        const os = openRun !== null && f.t - openRun.last < 1.5 && openRun.last - openRun.since >= 0.5 && watch.plucking(f.t) ? openRun : null;
+        const stringMsg = offOpen ? `That is ${offOpen}, not an open string — pluck an open string to tune it.`
+          : os && Math.abs(os.cents) <= 10 ? `The ${os.name} string is in tune.`
+          : os && Math.abs(os.cents) >= 25 ? `The ${os.name} string is not in tune yet — follow the needle.` : null;
+        const roomMsg = stringMsg && v.level !== 'warn' ? stringMsg : v.messages[0] ?? '';
         const msg = tuneWarn ?? roomMsg;
         if (advice.textContent !== msg) advice.textContent = msg;
-        advice.dataset.level = tuneWarn ? 'warn' : offOpen && v.level !== 'warn' ? 'info' : v.level;
+        advice.dataset.level = tuneWarn ? 'warn' : stringMsg && v.level !== 'warn' ? (os && Math.abs(os.cents) <= 10 ? 'ok' : 'info') : v.level;
         advice.dataset.tune = tuneWarn ? 'off' : '';
         advice.dataset.margin = v.marginDb === null ? '' : String(Math.round(v.marginDb));
         advice.dataset.hum = v.hum === null ? '' : String(v.hum);
@@ -266,6 +273,9 @@ function tunerScreen(): HTMLElement {
       if (OPEN_STRINGS.includes(nn.midi)) {
         meter.set(nn.cents, 5);
         offOpenNote = null;
+        // (the same string within 10 c of where it has been reading: still the same pluck)
+        if (openRun && openRun.name === noteName(nn.midi) && Math.abs(openRun.cents - nn.cents) <= 10 && f.t - openRun.last < 0.2) openRun = { ...openRun, cents: nn.cents, last: f.t };
+        else openRun = { name: noteName(nn.midi), cents: nn.cents, since: f.t, last: f.t };
       } else {
         meter.set(null, 5, { idle: 'Not an open-string note' });
         // (only after a pluck: a sung note is a fine mic check on any pitch)
@@ -867,7 +877,9 @@ function sessionScreen(): HTMLElement {
       }));
   }
 
-  let heardRun = 0;
+  let heardSince: number | null = null;
+  // (a hint stays at least 0.6 s, so a slide does not flicker between lines)
+  let shownHint: { text: string; at: number } | null = null;
   updateSession = (cur: SessionView) => {
     const m = cur.match;
     // With the meter off, nothing may reveal whether the pitch is right (no progress, neutral text).
@@ -881,8 +893,11 @@ function sessionScreen(): HTMLElement {
       status.textContent = cur.listenKind === 'phrase' ? 'Playing the phrase…' : 'Playing the note…';
       return;
     }
-    if (cur.reviewBeat) {
-      status.textContent = 'Now play the whole phrase, from its first note…';
+    // (the review's opening line stays until the first note of the phrase is being played)
+    if (cur.phase === 'review' && cur.review?.pos === 0 && (cur.reviewBeat || !m?.stable)) {
+      status.textContent = 'Now play the whole phrase…';
+      if (showMeter) meter.set(null, tol, { idle: 'Play now…', fretted: true });
+      progress.style.width = '0%';
       return;
     }
     if (showMeter) {
@@ -895,12 +910,20 @@ function sessionScreen(): HTMLElement {
     }
     let hintText = m?.hint ? HINT_TEXT[effPhase]?.[m.hint] : undefined;
     if (hintText && m?.hint && !showMeter && PITCH_REVEALING_HINTS.has(m.hint)) hintText = undefined;
+    {
+      const nowH = performance.now();
+      if (hintText && shownHint && hintText !== shownHint.text && nowH - shownHint.at < 600) hintText = shownHint.text;
+      else if (hintText && hintText !== shownHint?.text) shownHint = { text: hintText, at: nowH };
+      else if (!hintText && shownHint && nowH - shownHint.at < 600) hintText = shownHint.text;
+      else if (!hintText) shownHint = null;
+    }
     const listening = effPhase === 'sing' ? 'Listening for your voice…' : 'Listening for the guitar…';
     // (with the meter off, "heard something, still listening" — that the microphone hears the
     // student — without a word about its pitch or direction)
     // (a pitched sound, held for a few frames: not a knock or a click)
-    heardRun = m?.voiced && m.stable && m.detectedMidi != null ? heardRun + 1 : 0;
-    const heard = !showMeter && heardRun >= 4 ? 'Heard a note — still listening…' : null;
+    const nowMs = performance.now();
+    heardSince = m?.voiced && m.stable && m.detectedMidi != null ? heardSince ?? nowMs : null;
+    const heard = !showMeter && heardSince !== null && nowMs - heardSince >= 250 ? 'Heard a note — still listening…' : null;
     status.textContent = hintText ?? heard ?? (!showMeter || (!m?.voiced && !m?.stable) ? listening : m.inTolerance ? (effPhase === 'sing' ? 'Hold it…' : 'Let it ring…') : 'Listening…');
   };
 
@@ -1036,7 +1059,7 @@ function summaryScreen(): HTMLElement {
     ),
     h('section', { class: 'card table-card' }, h('h2', { text: 'Per note' }), h('div', { class: 'table-scroll' }, table)),
     h('div', { class: 'actions' },
-      button(done ? 'Practice again' : `Continue from note ${v.index + 1}`, () => { pendingResume = done ? null : v.index; setScreen('tuner'); void enableMic(); }, 'btn primary big', { 'data-testid': 'again' }),
+      button(done ? 'Practice again' : v.phase === 'review' ? `Continue from note ${v.index + 1} (then its phrase)` : `Continue from note ${v.index + 1}`, () => { pendingResume = done ? null : v.index; setScreen('tuner'); void enableMic(); }, 'btn primary big', { 'data-testid': 'again' }),
       button('Home', () => { session = null; setScreen('home'); }, 'btn secondary big', { 'data-testid': 'home-btn' }),
     ),
   );
